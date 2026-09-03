@@ -11,6 +11,9 @@
 # registered in ecosystem.yaml, so the conformance run checks the
 # workflow once rather than once per consumer.
 #
+# Action majors match the rest of the fleet: checkout@v6, setup-uv@v7,
+# setup-node@v6, setup-python@v6.
+#
 # Usage, in a consumer's .github/workflows/ci.yml:
 #
 #   jobs:
@@ -57,7 +60,7 @@ jobs:
     name: secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -82,13 +85,17 @@ jobs:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python
         if: inputs.language == 'python'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: Set up uv
+        if: inputs.language == 'python' && inputs.package-manager == 'uv'
+        uses: astral-sh/setup-uv@v7
 
       - name: Audit Python dependencies
         if: inputs.language == 'python'
@@ -97,19 +104,63 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip pip-audit
-          if [ "${PACKAGE_MANAGER}" = "uv" ]; then
-            pip install uv
-            uv export --format requirements-txt --no-hashes --all-extras > /tmp/requirements.txt
-            pip-audit --requirement /tmp/requirements.txt --strict
-          else
-            pip-audit --strict
+
+          # No manifest means no dependency set belonging to this repo.
+          # pip-audit with no --requirement audits the *runner's* ambient
+          # environment instead, reporting whatever GitHub ships in its
+          # image — findings this repo did not cause and cannot fix.
+          # Skip loudly rather than manufacture that noise.
+          if [ ! -f pyproject.toml ] && [ ! -f requirements.txt ]; then
+            echo "No pyproject.toml or requirements.txt — this repo declares no Python dependencies, so there is nothing to audit."
+            exit 0
           fi
+
+          REQ=/tmp/audit-requirements.txt
+          if [ "${PACKAGE_MANAGER}" = "uv" ]; then
+            uv export --format requirements-txt --no-hashes --all-extras > "${REQ}"
+          elif [ -f requirements.txt ]; then
+            cp requirements.txt "${REQ}"
+          else
+            # pyproject.toml resolved by pip: install into a throwaway
+            # environment so the audit sees the versions a build would
+            # get, not the runner's preinstalled packages.
+            python -m venv /tmp/auditenv
+            /tmp/auditenv/bin/pip install --quiet --upgrade pip
+            /tmp/auditenv/bin/pip install --quiet .
+            /tmp/auditenv/bin/pip freeze --exclude-editable > "${REQ}"
+          fi
+
+          # Two kinds of line are removed before auditing, both because
+          # --strict treats "not on PyPI" as a hard error:
+          #
+          #  1. The project itself. `uv export` emits `-e .`; the project
+          #     is what is being audited, not one of its inputs.
+          #  2. Dependencies pulled from git — the fleet's own internal
+          #     libraries. They are not published to PyPI and never will
+          #     be, and they are audited in their own repos, which run
+          #     this same workflow. Auditing them here would double-count
+          #     if it worked at all.
+          #
+          # Everything dropped is printed, so the exclusion is visible in
+          # the log rather than a silent hole in the audit.
+          if grep -qE '^[[:space:]]*(-e[[:space:]]|\.[[:space:]]*$)|@[[:space:]]+(git|file|https?)\+?' "${REQ}"; then
+            echo "Excluded from the audit (not resolvable on PyPI):"
+            grep -E '^[[:space:]]*(-e[[:space:]]|\.[[:space:]]*$)|@[[:space:]]+(git|file|https?)\+?' "${REQ}" | sed 's/^/  /'
+          fi
+          sed -i -E '/^[[:space:]]*(-e[[:space:]]|\.[[:space:]]*$)/d; /@[[:space:]]+(git|file|https?)\+?/d' "${REQ}"
+
+          echo "Auditing $(grep -cvE '^[[:space:]]*(#|$)' "${REQ}") resolved dependencies."
+          pip-audit --requirement "${REQ}" --strict
 
       - name: Set up Node
         if: inputs.language == 'typescript'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "22"
+
+      - name: Set up pnpm
+        if: inputs.language == 'typescript' && inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@v5
 
       - name: Audit Node dependencies
         if: inputs.language == 'typescript'
@@ -117,8 +168,11 @@ jobs:
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
+          if [ ! -f package.json ]; then
+            echo "No package.json — this repo declares no Node dependencies, so there is nothing to audit."
+            exit 0
+          fi
           if [ "${PACKAGE_MANAGER}" = "pnpm" ]; then
-            corepack enable
             pnpm install --frozen-lockfile
             pnpm audit --audit-level moderate
           else
@@ -134,10 +188,10 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -155,7 +209,7 @@ jobs:
     runs-on: ubuntu-latest
     if: inputs.sbom
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install syft
         env:
@@ -170,7 +224,7 @@ jobs:
         run: syft dir:. -o cyclonedx-json=sbom.cyclonedx.json
 
       - name: Retain SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-${{ github.sha }}
           path: sbom.cyclonedx.json
