@@ -1,0 +1,177 @@
+# The fleet's shared security workflow.
+#
+# Every repo in mini-app-polis may either carry its own secret scan,
+# dependency audit, SAST and SBOM steps, or call this workflow and get
+# all four. Neither shape is required — ecosystem-standards SEC-002
+# through SEC-005 accept both — but calling this one means the tooling,
+# the pinned versions and the gating decisions live in one place instead
+# of being copied into every repo and drifting.
+#
+# The steps here are evaluated in their own right: this repo is
+# registered in ecosystem.yaml, so the conformance run checks the
+# workflow once rather than once per consumer.
+#
+# Usage, in a consumer's .github/workflows/ci.yml:
+#
+#   jobs:
+#     security:
+#       uses: mini-app-polis/.github/.github/workflows/security.yml@v1
+#       with:
+#         language: python
+#         package-manager: uv
+
+name: security
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "python | typescript — selects the dependency audit and SAST tooling."
+        type: string
+        default: python
+      package-manager:
+        description: "uv | pip | pnpm | npm — how dependencies are resolved before the audit."
+        type: string
+        default: uv
+      sbom:
+        description: "Generate a CycloneDX SBOM and retain it as a build artifact."
+        type: boolean
+        default: true
+      gitleaks-version:
+        description: "Pinned gitleaks release. Installed from the published binary, not an action."
+        type: string
+        default: "8.28.0"
+      syft-version:
+        description: "Pinned syft release, used only when `sbom` is true."
+        type: string
+        default: "1.29.1"
+
+permissions:
+  contents: read
+
+jobs:
+  # SEC-001 / SEC-002. Gating: a detected secret fails the build. The
+  # binary is installed from a pinned release rather than an action so
+  # the same command runs here and in the pre-commit hook.
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download"
+          curl -sSfL "${url}/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan history for secrets
+        run: gitleaks detect --source . --redact --no-banner --exit-code 1
+
+  # SEC-003. Gating: a vulnerable resolved dependency fails the build.
+  # The severity threshold is deliberately not passed here — the flag
+  # spellings differ between the tools and change between versions, and
+  # SEC-006 declares the response deadlines in the catalog instead.
+  dependency-audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Audit Python dependencies
+        if: inputs.language == 'python'
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip pip-audit
+          if [ "${PACKAGE_MANAGER}" = "uv" ]; then
+            pip install uv
+            uv export --format requirements-txt --no-hashes --all-extras > /tmp/requirements.txt
+            pip-audit --requirement /tmp/requirements.txt --strict
+          else
+            pip-audit --strict
+          fi
+
+      - name: Set up Node
+        if: inputs.language == 'typescript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Audit Node dependencies
+        if: inputs.language == 'typescript'
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          if [ "${PACKAGE_MANAGER}" = "pnpm" ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+            pnpm audit --audit-level moderate
+          else
+            npm ci
+            npm audit --audit-level moderate
+          fi
+
+  # SEC-004. Not gating, by design: SAST is noisy enough that a blocking
+  # gate on day one gets switched off rather than fixed. The findings go
+  # to the run log and the job is advisory.
+  static-analysis:
+    name: static analysis
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run semgrep
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip semgrep
+          semgrep scan --config auto --error --metrics off || true
+
+  # SEC-005. Generation and upload are in the same job on purpose:
+  # jobs do not share a filesystem, so an SBOM written in one job and an
+  # artifact uploaded in another leaves no SBOM behind.
+  sbom:
+    name: sbom
+    runs-on: ubuntu-latest
+    if: inputs.sbom
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install syft
+        env:
+          SYFT_VERSION: ${{ inputs.syft-version }}
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/anchore/syft/main/install.sh"
+          curl -sSfL "${url}" | sh -s -- -b /usr/local/bin "v${SYFT_VERSION}"
+          syft version
+
+      - name: Generate SBOM
+        run: syft dir:. -o cyclonedx-json=sbom.cyclonedx.json
+
+      - name: Retain SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cyclonedx.json
+          retention-days: 90

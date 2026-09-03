@@ -1,0 +1,20 @@
+# This repo runs the shared workflow against itself on every pull
+# request, so a change to security.yml is exercised before any consumer
+# picks it up.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    uses: ./.github/workflows/security.yml
+    with:
+      language: python
+      package-manager: pip
+      sbom: true
