@@ -3,6 +3,13 @@
 Consumers pin `@v1`, and that tag moves. This file is how they find out
 what moved. Maintained by hand — there is no release automation here.
 
+## v1 — 2026-09-03 (3)
+
+- The audit fails when the resolver returns zero dependencies from a repo
+  that has a manifest. An empty requirements file audits cleanly and
+  proves nothing; `set -e` catches a resolver that errors, not one that
+  succeeds and produces nothing.
+
 ## v1 — 2026-09-03 (2)
 
 Fixes found by the first real run.

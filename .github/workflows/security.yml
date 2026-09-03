@@ -149,7 +149,17 @@ jobs:
           fi
           sed -i -E '/^[[:space:]]*(-e[[:space:]]|\.[[:space:]]*$)/d; /@[[:space:]]+(git|file|https?)\+?/d' "${REQ}"
 
-          echo "Auditing $(grep -cvE '^[[:space:]]*(#|$)' "${REQ}") resolved dependencies."
+          COUNT=$(grep -cvE '^[[:space:]]*(#|$)' "${REQ}" || true)
+          # An empty requirements file audits cleanly and proves nothing.
+          # `set -e` catches a resolver that *fails*; this catches one that
+          # succeeds and produces nothing, which would otherwise be
+          # indistinguishable from a repo with no vulnerabilities.
+          if [ "${COUNT}" -eq 0 ]; then
+            echo "::error::Resolved 0 dependencies from a repo that has a manifest. The audit would pass vacuously; failing instead."
+            exit 1
+          fi
+
+          echo "Auditing ${COUNT} resolved dependencies."
           pip-audit --requirement "${REQ}" --strict
 
       - name: Set up Node
