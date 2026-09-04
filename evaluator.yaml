@@ -3,7 +3,10 @@
 
 # This repo holds GitHub Actions workflow definitions and nothing else: no
 # source, no runtime, no deployment. The `shared-workflows` type appears in
-# no rule's applies_to, so only the applies_to: all rules reach it — which
-# is correct, and is why there are no exemptions here. Runtime, packaging
-# and release rules are skipped by scope rather than waived by exception.
+# no rule's applies_to, so only the applies_to: all rules reach it — runtime,
+# packaging and release rules are skipped by scope rather than waived here.
 type: shared-workflows
+
+exemptions:
+  - rule: DOC-004
+    reason: "This repo contains GitHub Actions workflow definitions and nothing else — no source, no runtime, no process that reads environment variables. DOC-004's .env.example requirement presumes a deployable service. The shared workflow's own inputs are documented in README.md and declared in its workflow_call block, which is where a consumer looks for them."
