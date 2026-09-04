@@ -12,9 +12,21 @@ permissions:
   contents: read
 
 jobs:
-  security:
+  security-python:
     uses: ./.github/workflows/security.yml
     with:
       language: python
       package-manager: pip
       sbom: true
+
+  # The TypeScript branch needs exercising here too, or a change to it
+  # reaches consumers untested — which is how the osv-scanner swap in v2
+  # would otherwise have gone out. This repo carries no lockfile, so what
+  # this covers is the preflight skip path rather than a real scan. That
+  # is the case most likely to break silently, and the cheapest place to
+  # find out is here.
+  security-typescript:
+    uses: ./.github/workflows/security.yml
+    with:
+      language: typescript
+      sbom: false

@@ -33,7 +33,7 @@ on:
         type: string
         default: python
       package-manager:
-        description: "uv | pip | pnpm | npm — how dependencies are resolved before the audit."
+        description: "uv | pip — how Python dependencies are resolved before the audit. Ignored for TypeScript: osv-scanner reads the lockfile directly."
         type: string
         default: uv
       sbom:
@@ -82,7 +82,8 @@ jobs:
   # spellings differ between the tools and change between versions, and
   # SEC-006 declares the response deadlines in the catalog instead.
   dependency-audit:
-    name: dependency audit
+    name: dependency audit (python)
+    if: inputs.language == 'python'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -152,33 +153,67 @@ jobs:
           echo "Auditing $(grep -cvE '^[[:space:]]*(#|$)' "${REQ}") resolved dependencies."
           pip-audit --requirement "${REQ}" --strict
 
-      - name: Set up Node
-        if: inputs.language == 'typescript'
-        uses: actions/setup-node@v6
-        with:
-          node-version: "22"
+  # SEC-003 (TypeScript), preflight. The previous Node path skipped
+  # cleanly when a repo declared no Node dependencies. osv-scanner runs
+  # as a called workflow and cannot carry that shell guard itself, so the
+  # check lives here and gates the audit job below.
+  node-manifest:
+    name: dependency audit (node) — preflight
+    if: inputs.language == 'typescript'
+    runs-on: ubuntu-latest
+    outputs:
+      lockfile: ${{ steps.probe.outputs.lockfile }}
+    steps:
+      - uses: actions/checkout@v6
 
-      - name: Set up pnpm
-        if: inputs.language == 'typescript' && inputs.package-manager == 'pnpm'
-        uses: pnpm/action-setup@v5
-
-      - name: Audit Node dependencies
-        if: inputs.language == 'typescript'
-        env:
-          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+      - id: probe
         run: |
           set -euo pipefail
-          if [ ! -f package.json ]; then
-            echo "No package.json — this repo declares no Node dependencies, so there is nothing to audit."
-            exit 0
-          fi
-          if [ "${PACKAGE_MANAGER}" = "pnpm" ]; then
-            pnpm install --frozen-lockfile
-            pnpm audit --audit-level moderate
+          if find . -path ./node_modules -prune -o \
+                  \( -name pnpm-lock.yaml -o -name package-lock.json \
+                     -o -name npm-shrinkwrap.json -o -name yarn.lock \) -print \
+               | grep -q .; then
+            echo "lockfile=true" >> "${GITHUB_OUTPUT}"
           else
-            npm ci
-            npm audit --audit-level moderate
+            echo "No lockfile found — this repo declares no Node dependencies, so there is nothing to audit."
+            echo "lockfile=false" >> "${GITHUB_OUTPUT}"
           fi
+
+  # SEC-003 (TypeScript). `pnpm audit` and `npm audit` both POST the
+  # resolved tree to npm's advisory endpoint, which returned zero bytes
+  # across three CI runs in two repos while the registry itself served
+  # metadata in under 100ms and npm's status page reported no incident.
+  # A raw curl reproduces it with no package manager involved. A scanner
+  # that cannot reach its database cannot gate anything, and this one
+  # failed as a silent hang rather than a message.
+  #
+  # osv-scanner reads the committed lockfile and queries OSV.dev — the
+  # same shape as the Python path above. SEC-003 permits this directly:
+  # "the requirement is that the ecosystem's installed dependency graph
+  # is checked against a vulnerability database on every change, not that
+  # a particular tool does it."
+  #
+  # Reading the lockfile also means no Node toolchain and no install
+  # step: the audit no longer builds node_modules in order to inspect it.
+  #
+  # upload-sarif is off deliberately. The security-tab upload needs
+  # GitHub Advanced Security on private repos; with it on, the upload
+  # fails and takes the gate down with it.
+  dependency-audit-node:
+    name: dependency audit (node)
+    needs: node-manifest
+    if: inputs.language == 'typescript' && needs.node-manifest.outputs.lockfile == 'true'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.5.0
+    with:
+      scan-args: |-
+        --recursive
+        ./
+      upload-sarif: false
+      fail-on-vuln: true
 
   # SEC-004. Not gating, by design: SAST is noisy enough that a blocking
   # gate on day one gets switched off rather than fixed. The findings go
