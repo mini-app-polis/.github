@@ -48,6 +48,10 @@ on:
         description: "Pinned syft release, used only when `sbom` is true."
         type: string
         default: "1.29.1"
+      osv-scanner-version:
+        description: "Pinned osv-scanner release, used for the TypeScript dependency audit."
+        type: string
+        default: "2.5.1"
 
 permissions:
   contents: read
@@ -163,38 +167,12 @@ jobs:
           echo "Auditing ${COUNT} resolved dependencies."
           pip-audit --requirement "${REQ}" --strict
 
-  # SEC-003 (TypeScript), preflight. The previous Node path skipped
-  # cleanly when a repo declared no Node dependencies. osv-scanner runs
-  # as a called workflow and cannot carry that shell guard itself, so the
-  # check lives here and gates the audit job below.
-  node-manifest:
-    name: dependency audit (node) — preflight
-    if: inputs.language == 'typescript'
-    runs-on: ubuntu-latest
-    outputs:
-      lockfile: ${{ steps.probe.outputs.lockfile }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - id: probe
-        run: |
-          set -euo pipefail
-          if find . -path ./node_modules -prune -o \
-                  \( -name pnpm-lock.yaml -o -name package-lock.json \
-                     -o -name npm-shrinkwrap.json -o -name yarn.lock \) -print \
-               | grep -q .; then
-            echo "lockfile=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "No lockfile found — this repo declares no Node dependencies, so there is nothing to audit."
-            echo "lockfile=false" >> "${GITHUB_OUTPUT}"
-          fi
-
   # SEC-003 (TypeScript). `pnpm audit` and `npm audit` both POST the
   # resolved tree to npm's advisory endpoint, which returned zero bytes
   # across three CI runs in two repos while the registry itself served
   # metadata in under 100ms and npm's status page reported no incident.
   # A raw curl reproduces it with no package manager involved. A scanner
-  # that cannot reach its database cannot gate anything, and this one
+  # that cannot reach its database cannot gate anything, and that one
   # failed as a silent hang rather than a message.
   #
   # osv-scanner reads the committed lockfile and queries OSV.dev — the
@@ -203,27 +181,73 @@ jobs:
   # is checked against a vulnerability database on every change, not that
   # a particular tool does it."
   #
-  # Reading the lockfile also means no Node toolchain and no install
-  # step: the audit no longer builds node_modules in order to inspect it.
+  # Installed from the published binary rather than called as a reusable
+  # workflow, matching gitleaks and syft above. The reusable workflow
+  # declares `security-events: write` for a SARIF upload, which exceeds
+  # this workflow's `contents: read` cap — job permissions can narrow but
+  # never widen, so that form is rejected at validation before any job
+  # runs. The upload also needs Advanced Security on private repos, which
+  # the fleet does not have.
   #
-  # upload-sarif is off deliberately. The security-tab upload needs
-  # GitHub Advanced Security on private repos; with it on, the upload
-  # fails and takes the gate down with it.
+  # The asset URL is resolved from the release API rather than
+  # constructed, so a change to the naming convention fails loudly here
+  # instead of 404-ing mid-install.
   dependency-audit-node:
     name: dependency audit (node)
-    needs: node-manifest
-    if: inputs.language == 'typescript' && needs.node-manifest.outputs.lockfile == 'true'
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.5.0
-    with:
-      scan-args: |-
-        --recursive
-        ./
-      upload-sarif: false
-      fail-on-vuln: true
+    if: inputs.language == 'typescript'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install osv-scanner
+        env:
+          OSV_VERSION: ${{ inputs.osv-scanner-version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/google/osv-scanner/releases/tags/v${OSV_VERSION}"
+          url="$(curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" "${api}" \
+                 | jq -r '.assets[].browser_download_url
+                          | select(test("linux[_-]amd64([.]tar[.]gz)?$"))' \
+                 | head -1)"
+          if [ -z "${url}" ]; then
+            echo "::error::No linux/amd64 asset found for osv-scanner v${OSV_VERSION}."
+            exit 1
+          fi
+          echo "Installing ${url}"
+          case "${url}" in
+            *.tar.gz) curl -sSfL "${url}" | sudo tar -xz -C /usr/local/bin osv-scanner ;;
+            *)        sudo curl -sSfL "${url}" -o /usr/local/bin/osv-scanner ;;
+          esac
+          sudo chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      - name: Audit Node dependencies
+        run: |
+          set -euo pipefail
+
+          # The same "nothing to audit" guard the pnpm path carried: a
+          # repo with no lockfile declares no Node dependencies. Kept as
+          # a step rather than a preflight job so there is no cross-job
+          # output to thread. No pipe into `grep -q` here — under
+          # `pipefail` that races with SIGPIPE and can report absence
+          # when a lockfile is present.
+          FOUND=""
+          for name in pnpm-lock.yaml package-lock.json npm-shrinkwrap.json yarn.lock; do
+            HIT="$(find . -name node_modules -prune -o -name "${name}" -print -quit)"
+            if [ -n "${HIT}" ]; then
+              FOUND="${HIT}"
+              break
+            fi
+          done
+
+          if [ -z "${FOUND}" ]; then
+            echo "No lockfile found — this repo declares no Node dependencies, so there is nothing to audit."
+            exit 0
+          fi
+
+          echo "Found ${FOUND} — scanning."
+          osv-scanner scan --recursive ./
 
   # SEC-004. Not gating, by design: SAST is noisy enough that a blocking
   # gate on day one gets switched off rather than fixed. The findings go
