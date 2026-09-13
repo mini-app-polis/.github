@@ -1,0 +1,6 @@
+{
+  "name": "mini-app-polis-shared-workflows",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Reusable GitHub Actions workflows for the mini-app-polis fleet. Not published to any registry — package.json exists so semantic-release has a version file to write, per ecosystem-standards VER-003."
+}
