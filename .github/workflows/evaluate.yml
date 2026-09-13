@@ -147,15 +147,11 @@ jobs:
           echo "Requesting: ${what}"
 
           # A named User-Agent, not curl's default. The API sits behind
-          # Cloudflare's browser integrity check, which rejects
-          # unidentified automation with a 1010 that looks nothing like an
-          # auth failure — and the release path is the wrong place to
-          # discover that. See ecosystem-standards' publish script, which
-          # learned it the expensive way.
-          #
-          # --fail-with-body rather than --fail: a 4xx here is almost
-          # always a credential or a scope problem, and the API says which
-          # in the body. Swallowing that leaves only the status code.
+          # Cloudflare, which rejects unidentified automation — and the
+          # release path is the wrong place to discover that. See
+          # ecosystem-standards' publish script, which learned it the
+          # expensive way. The shape mirrors that client: a product name, a
+          # version, and a URL a human can follow.
           #
           # --retry can dispatch the same evaluation twice, when the first
           # attempt landed and the acknowledgement did not. That is the
@@ -164,21 +160,48 @@ jobs:
           # dropped one costs a repository's conformance record silently.
           # A server-side idempotency guard (PIPE-002) is what removes the
           # trade rather than balancing it.
+          #
+          # No --fail-with-body. The status is read from -w and branched on
+          # below, because this needs to tell three outcomes apart that curl
+          # collapses into one exit code.
           http_status=$(curl -sS \
-            --fail-with-body \
             --retry 5 --retry-connrefused --retry-delay 5 \
             --max-time 30 \
-            -A "mini-app-polis/evaluate-workflow" \
+            -A "mini-app-polis-evaluate/1 (+https://github.com/mini-app-polis/.github)" \
             -H "Authorization: Bearer ${API_KEY}" \
             -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
             -o response.json \
             -w "%{http_code}" \
             -X POST "${API_URL%/}${path}" \
             -d "${body}") || {
-              echo "FATAL: ${what} was not accepted." >&2
-              cat response.json >&2 || true
+              echo "FATAL: could not reach ${API_URL} at all." >&2
               exit 1
             }
 
-          echo "Accepted (${http_status}):"
-          jq . response.json || cat response.json
+          if [ "${http_status}" -ge 200 ] && [ "${http_status}" -lt 300 ]; then
+            echo "Accepted (${http_status}):"
+            jq . response.json || cat response.json
+            exit 0
+          fi
+
+          # An HTML body means the API never saw this request. Saying so is
+          # the whole value of this branch: a 403 from the edge and a 403
+          # from authorization are the same status code and entirely
+          # different problems, and dumping a challenge page leaves whoever
+          # reads the log to work that out themselves — which is exactly
+          # what a 1,500-character Cloudflare interstitial in a CI log is.
+          if grep -qiE 'error code: 10|<!doctype html|just a moment|cloudflare|cf_chl' response.json; then
+            echo "FATAL: ${what} was blocked at the edge with ${http_status}" >&2
+            echo "before reaching the API. An HTML challenge or block page came" >&2
+            echo "back, not JSON — so this is NOT an authentication failure and" >&2
+            echo "NOT a dispatch failure. Check the WAF and bot-protection rules" >&2
+            echo "on ${API_URL}, and the User-Agent this job sends." >&2
+            head -c 300 response.json >&2 || true
+            echo >&2
+            exit 1
+          fi
+
+          echo "FATAL: ${what} was refused with ${http_status}:" >&2
+          jq . response.json >&2 || head -c 1000 response.json >&2
+          exit 1

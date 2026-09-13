@@ -5,6 +5,19 @@ that can fail a build which previously passed cuts a new major instead.
 This file is how consumers find out what moved. Maintained by hand —
 there is no release automation here.
 
+## v2 — 2026-09-13 (2)
+
+- **`evaluate.yml` tells an edge block apart from an API refusal.** The
+  first real run came back as 1,500 characters of Cloudflare challenge
+  HTML in the CI log, under a `curl: (22) ... error 403` that reads like
+  an authentication failure. It was neither: the request never reached
+  the API. The step now branches on the status and the body shape, and
+  says which of the three it was. `publish_catalog.py` in
+  ecosystem-standards has carried the same distinction since the 1010
+  incident; this is that lesson, applied where it was missing.
+- The User-Agent now matches that script's shape — a product name, a
+  version and a URL — rather than a bare token.
+
 ## v2 — 2026-09-13
 
 Additive. Nothing about `security.yml` changed, so a consumer already on

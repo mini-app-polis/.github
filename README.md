@@ -132,6 +132,20 @@ repository's conformance record frozen at its last good state while looking
 healthy, which is the failure shape the fleet's delivery assertions exist to
 catch.
 
+It distinguishes three outcomes rather than collapsing them into one exit
+code, because they need different people to fix them:
+
+| What came back | What it means |
+|---|---|
+| 2xx | The API accepted the job. The evaluation runs after this job ends |
+| Non-2xx with an HTML body | The edge refused the request and the API never saw it. A WAF or bot-protection problem, not authentication and not dispatch |
+| Non-2xx with a JSON body | The API answered and refused. The error code says why — a missing scope, an unconfigured dispatcher, an unreachable evaluator |
+
+The middle row is the one worth spelling out. A 403 from Cloudflare and a
+403 from authorization are the same status code and entirely different
+problems, and dumping a challenge page into a CI log leaves whoever reads
+it to work that out for themselves.
+
 ## Versioning
 
 Consumers pin `@v1`. That tag moves: a backwards-compatible change is
