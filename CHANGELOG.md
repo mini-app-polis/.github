@@ -5,7 +5,7 @@ that can fail a build which previously passed cuts a new major instead.
 This file is how consumers find out what moved. Maintained by hand —
 there is no release automation here.
 
-## v2 — 2026-09-13 (2)
+## v3 — 2026-09-13 (2)
 
 - **`evaluate.yml` tells an edge block apart from an API refusal.** The
   first real run came back as 1,500 characters of Cloudflare challenge
@@ -17,11 +17,31 @@ there is no release automation here.
   incident; this is that lesson, applied where it was missing.
 - The User-Agent now matches that script's shape — a product name, a
   version and a URL — rather than a bare token.
+- **The job announces which revision of itself is running**, as
+  `evaluate.yml v3` on its first line. Callers pin a major tag, so a
+  caller resolving a stale copy produced output identical to one
+  resolving the fix — which cost two debugging rounds before anyone
+  thought to check which version had run.
 
-## v2 — 2026-09-13
+  The version is a hand-maintained literal, bumped when a major tag is
+  cut. The first attempt used `github.job_workflow_sha`, which the
+  context reference documents as the reusable workflow's commit SHA but
+  which resolves empty inside a `workflow_call` job — it reaches the
+  runner as an OIDC claim rather than a context value. That shipped and
+  printed `evaluate.yml @`, which is worse than printing nothing: a
+  diagnostic that looks broken gets read as a broken job. The SHA is
+  still appended if GitHub ever populates it.
+
+## v3 — 2026-09-13
 
 Additive. Nothing about `security.yml` changed, so a consumer already on
 `@v2` needs no action; the tag moves to pick this up.
+
+Cut as a new major rather than by moving `v2`. Nothing here breaks a
+`security.yml` consumer — that file is byte-identical to `v2` — but
+`evaluate.yml` took two fixes on the day it shipped, and a moving tag
+made a stale caller indistinguishable from a current one. A fixed tag
+makes the migration deliberate.
 
 - **New: `.github/workflows/evaluate.yml`.** Asks api-kaianolevine-com to
   evaluate a repository's conformance. Called from a release job, it POSTs

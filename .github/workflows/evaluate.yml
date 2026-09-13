@@ -111,6 +111,14 @@ jobs:
           ORG: ${{ inputs.org || github.repository_owner }}
           REF: ${{ inputs.ref || github.event.repository.default_branch }}
           REPO_ID: ${{ inputs.repo-id }}
+          # Hand-maintained, bumped when a major tag is cut. github's
+          # job_workflow_sha is documented as the reusable workflow's commit
+          # but resolves empty in a workflow_call job — it reaches this
+          # runner as an OIDC claim, not as a context value — so the line it
+          # was supposed to print came out as "evaluate.yml @" and told
+          # nobody anything. The literal is dull and it works; the SHA is
+          # appended only if GitHub ever starts populating it.
+          WORKFLOW_VERSION: v3
           JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
         run: |
           set -euo pipefail
@@ -145,13 +153,11 @@ jobs:
               ;;
           esac
 
-          # Which revision of THIS file is running. Callers pin a moving
-          # major tag, so a fix pushed to main reaches nobody until the tag
-          # is repointed — and a caller running the stale copy looks
-          # identical to one running the current one. It cost two debugging
-          # rounds to notice that; job_workflow_sha makes it a line in the
-          # log instead of an inference from which error message appeared.
-          echo "evaluate.yml @ ${JOB_WORKFLOW_SHA:0:7}"
+          # Which revision of THIS file is running. Callers pin a major
+          # tag, so a caller resolving a stale copy looks identical to one
+          # resolving the current file — which cost two debugging rounds
+          # before anyone thought to check which version had run.
+          echo "evaluate.yml ${WORKFLOW_VERSION}${JOB_WORKFLOW_SHA:+ @ ${JOB_WORKFLOW_SHA:0:7}}"
           echo "Requesting: ${what}"
 
           # A named User-Agent, not curl's default. The API sits behind

@@ -23,7 +23,7 @@ Add one job to an existing workflow that triggers on `pull_request`:
 ```yaml
 jobs:
   security:
-    uses: mini-app-polis/.github/.github/workflows/security.yml@v1
+    uses: mini-app-polis/.github/.github/workflows/security.yml@v2
     with:
       language: python
       package-manager: uv
@@ -79,7 +79,7 @@ jobs:
   evaluate:
     needs: release
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    uses: mini-app-polis/.github/.github/workflows/evaluate.yml@v2
+    uses: mini-app-polis/.github/.github/workflows/evaluate.yml@v3
     secrets:
       api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
 ```
@@ -148,10 +148,32 @@ it to work that out for themselves.
 
 ## Versioning
 
-Consumers pin `@v1`. That tag moves: a backwards-compatible change is
-published by retagging `v1` at the new commit. Anything that would break a
-consumer — an input removed or renamed, a job made gating that was not —
-gets a new major tag (`v2`) instead, and consumers migrate deliberately.
+Consumers pin a major tag. Three exist:
+
+| Tag | Contains |
+|---|---|
+| `v1` | `security.yml` only, before the osv-scanner swap |
+| `v2` | `security.yml` as the fleet calls it today |
+| `v3` | the same `security.yml`, plus `evaluate.yml` |
+
+A backwards-compatible change is normally published by retagging the
+major at the new commit, and anything that would break a consumer — an
+input removed or renamed, a job made gating that was not — gets a new
+major instead.
+
+`evaluate.yml` arrived on `v2` and then needed two fixes in the same
+afternoon. Both were additive, so both were eligible for a retag, and
+both were missed: the callers kept resolving the stale file, and a caller
+running it was indistinguishable from one running the fix. `v3` cuts that
+knot — a fixed tag that has to be moved to deliberately. It is also why
+the job's first log line names its own version: whichever way the policy
+goes, the running revision has to be visible from the log rather than
+inferred from which error message appeared.
+
+`security.yml` is byte-identical across `v2` and `v3`, so a repo calling
+it may pin either. The fleet pins `@v2` and there is no reason to churn
+that; a repo calling both workflows pinning two different majors is
+correct, not a mistake.
 
 `CHANGELOG.md` is how a consumer finds out what moved under them. It is
 maintained by hand; there is no release automation in this repo.
