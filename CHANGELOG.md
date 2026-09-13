@@ -5,6 +5,29 @@ that can fail a build which previously passed cuts a new major instead.
 This file is how consumers find out what moved. Maintained by hand —
 there is no release automation here.
 
+## v2 — 2026-09-13
+
+Additive. Nothing about `security.yml` changed, so a consumer already on
+`@v2` needs no action; the tag moves to pick this up.
+
+- **New: `.github/workflows/evaluate.yml`.** Asks api-kaianolevine-com to
+  evaluate a repository's conformance. Called from a release job, it POSTs
+  to `/v1/evaluations/runs` (or `/v1/evaluations/sweeps` with
+  `scope: fleet`) and fails when the request is rejected or the API is
+  unreachable. The evaluation itself runs afterwards; nothing here waits
+  for findings.
+
+  This replaces evaluator-cog's daily 09:00 cron over the whole fleet,
+  which graded a release up to a day late and re-graded twelve
+  repositories that had not changed. `scope: fleet` exists for the two
+  releases that genuinely do invalidate everything — a new rule catalog
+  and a new evaluator — and belongs to ecosystem-standards and
+  evaluator-cog only.
+
+  Requires the organisation secret `CI_VALIDATOR_API_KEY`, the
+  `ci-validator` machine key. One scope, `evaluations.runs.create`: it can
+  ask for work to happen and cannot write a finding.
+
 ## v2 — 2026-09-04
 
 BREAKING for TypeScript consumers. Python consumers are unaffected — the

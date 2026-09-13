@@ -1,0 +1,184 @@
+# The fleet's shared conformance-evaluation trigger.
+#
+# A repository's conformance changes when that repository changes, so the
+# event that should evaluate it is its own release. This workflow is how a
+# release job says so: it POSTs to api-kaianolevine-com, which hands the
+# job to evaluator-cog and acknowledges. Nothing here waits for findings.
+#
+# Two scopes, and the difference is which release you are reacting to:
+#
+#   scope: repo   (default)  — evaluate the calling repository. This is
+#                              what a release means for every repo whose
+#                              own code just changed.
+#   scope: fleet             — evaluate every repository in the registry,
+#                              plus the checks that scope to none of them.
+#                              For ecosystem-standards and evaluator-cog
+#                              only: a new rule catalog or a new evaluator
+#                              invalidates every repository's last result
+#                              at once, and re-running each repo
+#                              individually would be the same work reached
+#                              by a worse trigger.
+#
+# **Fire and forget, but not fire and hope.** The evaluation itself runs
+# after this job is gone, so nothing here can report on it. What this job
+# can report on is whether the request landed, and it fails when it did
+# not. A silently dropped trigger leaves a repository's conformance record
+# frozen at its last good state while looking perfectly healthy — which is
+# the exact failure shape the fleet's delivery assertions exist to catch,
+# and it would be careless to reintroduce it here.
+#
+# Action majors match the rest of the fleet.
+#
+# Usage, at the end of a consumer's release job:
+#
+#   jobs:
+#     release:
+#       ...
+#     evaluate:
+#       needs: release
+#       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+#       uses: mini-app-polis/.github/.github/workflows/evaluate.yml@v2
+#       secrets:
+#         api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
+
+name: evaluate
+
+on:
+  workflow_call:
+    inputs:
+      scope:
+        description: "repo | fleet — evaluate the calling repository, or every repository in the registry. Only ecosystem-standards and evaluator-cog have cause for fleet."
+        type: string
+        default: repo
+      ref:
+        description: "Branch or tag to evaluate. Defaults to the repository's default branch, which after a release is the released tree."
+        type: string
+        default: ""
+      repo:
+        description: "Repository name, without the org. Defaults to the calling repository."
+        type: string
+        default: ""
+      org:
+        description: "Owning GitHub org. Defaults to the calling repository's owner."
+        type: string
+        default: ""
+      repo-id:
+        description: "The id findings are filed under. Set this only for a monorepo app, where it differs from the repository name."
+        type: string
+        default: ""
+      mode:
+        description: "deterministic | llm. Deterministic is the release default: no token cost, and nothing in CI is waiting on it."
+        type: string
+        default: deterministic
+      api-url:
+        description: "Base URL of api-kaianolevine-com. A plain input rather than a secret — it is the public address of a public API, and hiding it would only make it harder to see which environment a run asked."
+        type: string
+        default: https://api.kaianolevine.com
+      wait-seconds:
+        description: "Pause before asking. For a repository whose own release redeploys a service the evaluation depends on — evaluator-cog above all, which is the thing being asked. Zero everywhere else."
+        type: number
+        default: 0
+    secrets:
+      api-key:
+        description: "The ci-validator machine key, an organisation-level secret. It holds one scope, evaluations.runs.create, and cannot write a finding — a leaked CI key can cause work to happen, but cannot forge the result of that work."
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      # evaluator-cog's release redeploys the evaluator itself, and Railway
+      # takes longer to swap a container than curl's retries cover. Asking
+      # into that window reaches a process that is going away, or nothing at
+      # all. Every other repository passes zero and skips this.
+      - name: Wait for the deploy this release triggered
+        if: ${{ inputs.wait-seconds > 0 }}
+        run: sleep ${{ inputs.wait-seconds }}
+
+      # No checkout. Everything this needs is in the event context or the
+      # inputs, and cloning a repository to send four fields about it is
+      # the kind of cost that gets copied into thirteen repos.
+      - name: Ask for an evaluation
+        env:
+          API_URL: ${{ inputs.api-url }}
+          API_KEY: ${{ secrets.api-key }}
+          SCOPE: ${{ inputs.scope }}
+          MODE: ${{ inputs.mode }}
+          REPO: ${{ inputs.repo || github.event.repository.name }}
+          ORG: ${{ inputs.org || github.repository_owner }}
+          REF: ${{ inputs.ref || github.event.repository.default_branch }}
+          REPO_ID: ${{ inputs.repo-id }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${API_KEY}" ]; then
+            echo "FATAL: no api-key was passed. Set the organisation secret" >&2
+            echo "CI_VALIDATOR_API_KEY and forward it as 'secrets: api-key'." >&2
+            exit 1
+          fi
+
+          case "${SCOPE}" in
+            repo)
+              path="/v1/evaluations/runs"
+              body=$(jq -nc \
+                --arg repo "${REPO}" \
+                --arg ref "${REF}" \
+                --arg org "${ORG}" \
+                --arg mode "${MODE}" \
+                --arg repo_id "${REPO_ID}" \
+                '{repo: $repo, ref: $ref, org: $org, mode: $mode}
+                 + (if $repo_id == "" then {} else {repo_id: $repo_id} end)')
+              what="${ORG}/${REPO}@${REF}"
+              ;;
+            fleet)
+              path="/v1/evaluations/sweeps"
+              body=$(jq -nc --arg mode "${MODE}" '{mode: $mode}')
+              what="a fleet sweep (${MODE})"
+              ;;
+            *)
+              echo "FATAL: scope must be 'repo' or 'fleet', got '${SCOPE}'." >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Requesting: ${what}"
+
+          # A named User-Agent, not curl's default. The API sits behind
+          # Cloudflare's browser integrity check, which rejects
+          # unidentified automation with a 1010 that looks nothing like an
+          # auth failure — and the release path is the wrong place to
+          # discover that. See ecosystem-standards' publish script, which
+          # learned it the expensive way.
+          #
+          # --fail-with-body rather than --fail: a 4xx here is almost
+          # always a credential or a scope problem, and the API says which
+          # in the body. Swallowing that leaves only the status code.
+          #
+          # --retry can dispatch the same evaluation twice, when the first
+          # attempt landed and the acknowledgement did not. That is the
+          # right way round: a duplicate evaluation costs a second run and
+          # findings the API's deduplication mostly absorbs, while a
+          # dropped one costs a repository's conformance record silently.
+          # A server-side idempotency guard (PIPE-002) is what removes the
+          # trade rather than balancing it.
+          http_status=$(curl -sS \
+            --fail-with-body \
+            --retry 5 --retry-connrefused --retry-delay 5 \
+            --max-time 30 \
+            -A "mini-app-polis/evaluate-workflow" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            -o response.json \
+            -w "%{http_code}" \
+            -X POST "${API_URL%/}${path}" \
+            -d "${body}") || {
+              echo "FATAL: ${what} was not accepted." >&2
+              cat response.json >&2 || true
+              exit 1
+            }
+
+          echo "Accepted (${http_status}):"
+          jq . response.json || cat response.json

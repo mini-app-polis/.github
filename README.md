@@ -1,7 +1,8 @@
 # .github
 
-Org-wide GitHub configuration for **mini-app-polis**. Today that means one
-thing: the fleet's shared security workflow.
+Org-wide GitHub configuration for **mini-app-polis**. Two reusable
+workflows: the fleet's shared security controls, and the trigger that asks
+for a repository to be evaluated when it releases.
 
 ## Shared security workflow
 
@@ -55,6 +56,81 @@ drifting; it is not a mandate.
 The workflow covers CI. SEC-001 asks for the same gitleaks in a local
 pre-commit hook, which each repo must add for itself — a hook in this
 repo does not run in yours. Copy `.pre-commit-config.yaml` from here.
+
+## Shared evaluation trigger
+
+`.github/workflows/evaluate.yml` asks api-kaianolevine-com to evaluate a
+repository's conformance. The API hands the job to evaluator-cog and
+acknowledges; the evaluation runs after the calling job is gone.
+
+A repository's conformance changes when that repository changes, so its own
+release is the event that should evaluate it. Before this, a daily cron
+swept the whole fleet at 09:00 — which graded a release up to a day late and
+re-graded twelve repositories that had not changed.
+
+### Using it
+
+Add one job that runs after your release job:
+
+```yaml
+jobs:
+  release:
+    ...
+  evaluate:
+    needs: release
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    uses: mini-app-polis/.github/.github/workflows/evaluate.yml@v2
+    secrets:
+      api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
+```
+
+### Inputs
+
+| Input | Default | Meaning |
+|---|---|---|
+| `scope` | `repo` | `repo` evaluates the calling repository; `fleet` evaluates every repository in the registry |
+| `ref` | the default branch | Branch or tag to evaluate |
+| `repo` | the calling repository | Repository name, without the org |
+| `org` | the calling owner | Owning GitHub org |
+| `repo-id` | *(none)* | The id findings are filed under. Monorepo apps only |
+| `mode` | `deterministic` | `deterministic` or `llm` |
+| `api-url` | `https://api.kaianolevine.com` | Base URL of api-kaianolevine-com |
+| `wait-seconds` | `0` | Pause before asking. For a repo whose release redeploys a service the evaluation needs |
+
+`secrets.api-key` is required: the `ci-validator` machine key, held as an
+organisation secret. It carries one scope, `evaluations.runs.create`, and
+cannot write a finding — a leaked CI key can cause work to happen, but
+cannot forge the result of that work.
+
+### Two repos sweep, the rest do not
+
+`scope: fleet` belongs to **ecosystem-standards** and **evaluator-cog**, and
+to nothing else. A new rule catalog or a new evaluator invalidates every
+repository's last result at once; every other release invalidates one. The
+sweep also carries the three checks that scope to no repository at all
+(EVAL-003, MONO-003, EVAL-007), which is why it is not merely a loop over
+the single-repository path.
+
+Nothing in the credential enforces that split — every repo's CI holds the
+same key. What enforces it is which workflows pass `scope: fleet`, which is
+a property of this file and its callers rather than of a secret.
+
+### `wait-seconds` exists for exactly one repo
+
+evaluator-cog's release redeploys the evaluator — the thing being asked.
+Railway takes longer to swap a container than curl's retries cover, so a
+request sent immediately reaches a process that is going away, or nothing.
+That repo passes `wait-seconds: 120`. Everywhere else the default of zero
+is correct and the step is skipped.
+
+### It fails when the request does
+
+The evaluation itself runs after this job ends, so the job cannot report on
+it. What it does report is whether the request landed, and a rejected or
+unreachable API fails the step. A silently dropped trigger leaves a
+repository's conformance record frozen at its last good state while looking
+healthy, which is the failure shape the fleet's delivery assertions exist to
+catch.
 
 ## Versioning
 
