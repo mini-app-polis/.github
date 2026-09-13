@@ -1,3 +1,10 @@
+# [3.1.0](https://github.com/mini-app-polis/.github/compare/v3.0.0...v3.1.0) (2026-09-13)
+
+
+### Features
+
+* release this repo instead of remembering to ([8aff18d](https://github.com/mini-app-polis/.github/commit/8aff18da126085fcc5d8b9ce0724d178fc18a037))
+
 # Changelog
 
 Consumers pin a major tag, and that tag moves within its major. A change
