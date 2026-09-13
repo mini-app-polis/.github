@@ -72,3 +72,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx semantic-release
+
+  # This repo asks for its own conformance evaluation like any other, and
+  # like the security jobs above it calls the local file rather than the
+  # published tag. A change to evaluate.yml is therefore exercised against
+  # the real API here — after the release, so it cannot hold a bad version
+  # back, but before anyone reports it as a mystery failure in their own
+  # pipeline. That is the same reason the security self-calls exist.
+  evaluate:
+    needs: release
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    uses: ./.github/workflows/evaluate.yml
+    secrets:
+      api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
