@@ -37,7 +37,7 @@
 #     evaluate:
 #       needs: release
 #       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-#       uses: mini-app-polis/.github/.github/workflows/evaluate.yml@v2
+#       uses: mini-app-polis/.github/.github/workflows/evaluate.yml@v3
 #       secrets:
 #         api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
 
@@ -47,7 +47,7 @@ on:
   workflow_call:
     inputs:
       scope:
-        description: "repo | fleet — evaluate the calling repository, or every repository in the registry. Only ecosystem-standards and evaluator-cog have cause for fleet."
+        description: "repo | fleet — evaluate the calling repository, or every repository in the registry. Only ecosystem-standards and evaluator-cog have cause for fleet. fleet fans out to one job per repository; the API answers with what landed."
         type: string
         default: repo
       ref:
@@ -143,9 +143,21 @@ jobs:
               what="${ORG}/${REPO}@${REF}"
               ;;
             fleet)
-              path="/v1/evaluations/sweeps"
+              # Fan-out, not a sweep. The API turns this into one queue
+              # message per repository rather than handing the evaluator a
+              # single pass to work through: a failure retries one
+              # repository instead of redelivering the whole fleet, the
+              # work runs as wide as the consumers allow, and no single
+              # message has to finish inside one visibility timeout —
+              # which becomes Lambda's fifteen-minute ceiling.
+              #
+              # /v1/evaluations/sweeps still exists and still works. It is
+              # the fallback if this path has to be backed out: revert this
+              # block, retag, and the fleet is on the proven route again
+              # without touching either service.
+              path="/v1/evaluations/fleet"
               body=$(jq -nc --arg mode "${MODE}" '{mode: $mode}')
-              what="a fleet sweep (${MODE})"
+              what="a fleet pass (${MODE})"
               ;;
             *)
               echo "FATAL: scope must be 'repo' or 'fleet', got '${SCOPE}'." >&2
@@ -196,6 +208,22 @@ jobs:
           if [ "${http_status}" -ge 200 ] && [ "${http_status}" -lt 300 ]; then
             echo "Accepted (${http_status}):"
             jq . response.json || cat response.json
+
+            # A fan-out can land partially, and 202 does not say so. The
+            # body names the repositories that did not reach the queue —
+            # so read it, because a job that reports success over a fleet
+            # pass missing three repositories is the silent-gap failure
+            # this whole workflow exists to prevent.
+            #
+            # Not fatal. The repositories that did land are already being
+            # evaluated, and failing here would say the pass did not
+            # happen when most of it did. Annotated instead, so it is
+            # visible in the run without being a lie in either direction.
+            missing=$(jq -r '.data.failed // [] | join(", ")' response.json 2>/dev/null || echo "")
+            if [ -n "${missing}" ]; then
+              echo "::warning title=Fleet pass incomplete::did not reach the queue: ${missing}"
+            fi
+
             exit 0
           fi
 
