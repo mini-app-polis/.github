@@ -1,3 +1,10 @@
+# [3.2.0](https://github.com/mini-app-polis/.github/compare/v3.1.0...v3.2.0) (2026-09-16)
+
+
+### Features
+
+* **evaluate:** route fleet scope to the fan-out endpoint ([57e9e33](https://github.com/mini-app-polis/.github/commit/57e9e337b35c9991d1c52b7e6f535df3df1d9cae))
+
 # [3.1.0](https://github.com/mini-app-polis/.github/compare/v3.0.0...v3.1.0) (2026-09-13)
 
 
