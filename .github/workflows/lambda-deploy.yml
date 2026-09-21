@@ -1,0 +1,271 @@
+# The fleet's shared Lambda deploy: build a cog's zip from its lockfile, prove
+# it starts in Lambda's own runtime, upload it, and prove what AWS holds is
+# what this run built.
+#
+# Terraform owns the function's configuration and is applied from a
+# workstation (each cog's infra/). This owns the code only. The deploy role
+# a cog passes can call UpdateFunctionCode and GetFunction(Configuration)
+# and nothing else.
+#
+# **Why this is shared.** It was a file copied from evaluator-cog into
+# deejay-cog, and the copy carried a flaw: wheels were chosen for the
+# GitHub runner rather than for Lambda, and the import guard ran on the
+# runner too, so it passed. deejay-cog's first deploy shipped cryptography
+# built against glibc 2.34 to a runtime with 2.26 and failed at import.
+# evaluator-cog had the same flaw for longer and had not tripped it: it ships
+# x86_64 builds of pydantic-core, cryptography and rpds-py to an arm64
+# function, and works only because nothing it runs imports them. One file
+# means that class of bug is fixed once.
+#
+# Three guards, in the order they fail cheapest:
+#   1. Wheels are chosen for the target (--python-platform), never the runner.
+#   2. No compiled library may need a newer glibc than the runtime has.
+#   3. Every module imports, and the handler answers a probe, inside
+#      public.ecr.aws/lambda/python:<version> for the target architecture.
+#      A pass here means the function will start; an import check on the
+#      runner does not.
+#
+# Usage, from a cog's ci.yml. Call it as a job after `release`, not with
+# `on: release`: semantic-release publishes with GITHUB_TOKEN and GitHub
+# starts no workflows from that token's events.
+#
+#   deploy:
+#     needs: release
+#     if: needs.release.outputs.tag != ''
+#     permissions:
+#       id-token: write
+#       contents: read
+#     uses: mini-app-polis/.github/.github/workflows/lambda-deploy.yml@v3
+#     with:
+#       ref: ${{ needs.release.outputs.tag }}
+#       handler: deejay_cog.worker.lambda_handler
+#       architecture: x86_64
+#       role-arn: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+#       region: ${{ vars.AWS_REGION }}
+#       function-name: ${{ vars.AWS_FUNCTION_NAME }}
+
+name: lambda-deploy
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "The ref to build — the release tag when called from ci.yml."
+        type: string
+        required: true
+      handler:
+        description: "module.path.function, exactly as infra/worker.tf's `handler`. The module must be importable from the zip root."
+        type: string
+        required: true
+      architecture:
+        description: "x86_64 | arm64 — must match `architectures` in the cog's infra/worker.tf."
+        type: string
+        required: true
+      python-version:
+        description: "The Lambda runtime's Python, as in `runtime = \"python<version>\"`."
+        type: string
+        default: "3.11"
+      strip:
+        description: "Space-separated top-level paths to remove from the zip, for dependencies the cog never imports. Guard 3 fails the build if one is in fact imported. boto3 and its stack are always removed; the runtime provides them."
+        type: string
+        default: ""
+      role-arn:
+        description: "The cog's CI deploy role (terraform output deploy_role_arn)."
+        type: string
+        required: true
+      region:
+        type: string
+        required: true
+      function-name:
+        type: string
+        required: true
+
+permissions:
+  id-token: write # for OIDC; this is what replaces a long-lived key
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: lambda-deploy-${{ inputs.function-name }}
+      cancel-in-progress: false
+    env:
+      HANDLER: ${{ inputs.handler }}
+      ARCH: ${{ inputs.architecture }}
+      PY: ${{ inputs.python-version }}
+      STRIP: ${{ inputs.strip }}
+      # Hand-maintained, bumped when a major tag is cut — see evaluate.yml
+      # for why github.job_workflow_sha cannot stand in for it.
+      WORKFLOW_VERSION: v3
+    steps:
+      - name: Resolve the target
+        run: |
+          set -euo pipefail
+          echo "lambda-deploy.yml ${WORKFLOW_VERSION}: ${HANDLER} on python${PY}/${ARCH}"
+
+          case "$ARCH" in
+            x86_64) echo "WHEEL_ARCH=x86_64"  >> "$GITHUB_ENV"; echo "DOCKER_PLATFORM=linux/amd64" >> "$GITHUB_ENV" ;;
+            arm64)  echo "WHEEL_ARCH=aarch64" >> "$GITHUB_ENV"; echo "DOCKER_PLATFORM=linux/arm64" >> "$GITHUB_ENV" ;;
+            *) echo "::error::architecture must be x86_64 or arm64, got '$ARCH'"; exit 1 ;;
+          esac
+
+          # The runtime's glibc, by Python version. python3.8–3.11 run on
+          # Amazon Linux 2 (glibc 2.26); 3.12 onward on Amazon Linux 2023
+          # (glibc 2.34). Wheels are chosen at the matching manylinux tag.
+          case "$PY" in
+            3.8|3.9|3.10|3.11) echo "GLIBC_MINOR=26" >> "$GITHUB_ENV"; echo "MANYLINUX=manylinux_2_17" >> "$GITHUB_ENV" ;;
+            3.12|3.13)         echo "GLIBC_MINOR=34" >> "$GITHUB_ENV"; echo "MANYLINUX=manylinux_2_28" >> "$GITHUB_ENV" ;;
+            *) echo "::error::no known Lambda runtime for python ${PY}"; exit 1 ;;
+          esac
+
+          module="${HANDLER%.*}"
+          echo "MODULE=${module}"             >> "$GITHUB_ENV"
+          echo "FUNC=${HANDLER##*.}"          >> "$GITHUB_ENV"
+          echo "MODULE_PATH=${module//.//}.py" >> "$GITHUB_ENV"
+          echo "PACKAGE=${module%%.*}"        >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build the zip
+        run: |
+          set -euo pipefail
+          uv python install "$PY"
+
+          # From the lockfile, not a fresh resolve: the zip carries exactly
+          # the versions the test job ran against (CD-020).
+          uv export --frozen --no-dev --no-emit-project --no-hashes \
+            --format requirements-txt -o requirements.lock.txt
+
+          # Guard 1. Left to itself uv picks the newest wheel the *runner*
+          # can load, for the runner's architecture.
+          uv pip install --python "$PY" \
+            --python-platform "${WHEEL_ARCH}-${MANYLINUX}" \
+            --target build/ -r requirements.lock.txt --quiet
+          uv pip install --python "$PY" --target build/ --no-deps . --quiet
+
+          rm -rf build/boto3 build/botocore build/s3transfer build/jmespath
+          for path in $STRIP; do rm -rf "build/$path"; done
+          rm -rf build/*.dist-info build/__pycache__
+
+          test -f "build/${MODULE_PATH}" || {
+            echo "::error::${MODULE_PATH} is not at the zip root; the handler cannot resolve"
+            exit 1
+          }
+
+      - name: "Guard 2: glibc"
+        run: |
+          set -euo pipefail
+          worst=$(find build -name '*.so*' -type f -exec readelf -V {} + 2>/dev/null \
+            | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n -u | tail -1 || true)
+          echo "newest glibc symbol required: ${worst:-none}; runtime has GLIBC_2.${GLIBC_MINOR}"
+          if [ -n "$worst" ] && [ "${worst#GLIBC_2.}" -gt "$GLIBC_MINOR" ]; then
+            echo "::error::the zip needs $worst; the runtime has GLIBC_2.${GLIBC_MINOR}"
+            find build -name '*.so*' -type f | while read -r f; do
+              readelf -V "$f" 2>/dev/null | grep -q "$worst" && echo "  $f"
+            done
+            exit 1
+          fi
+
+      # An arm64 image on an x86_64 runner needs emulation. Slow, but only
+      # for an import walk and one handler call.
+      - name: Set up QEMU
+        if: inputs.architecture == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: "Guard 3: start in Lambda's own image"
+        run: |
+          set -euo pipefail
+          docker run --rm -i --platform "$DOCKER_PLATFORM" \
+            -v "$PWD/build:/var/task:ro" -e PYTHONPATH=/var/task \
+            -e PACKAGE -e MODULE -e FUNC \
+            --entrypoint /var/lang/bin/python3 \
+            "public.ecr.aws/lambda/python:${PY}" - <<'PROBE'
+          import importlib, os, pkgutil, platform, sys
+
+          print(f"runtime: python {platform.python_version()} on {platform.machine()}")
+          package = importlib.import_module(os.environ["PACKAGE"])
+          failed = []
+          for m in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
+              try:
+                  importlib.import_module(m.name)
+              except Exception as exc:
+                  failed.append(f"{m.name}: {type(exc).__name__}: {exc}")
+          if failed:
+              print("::error::the package does not import in the Lambda runtime")
+              for line in failed:
+                  print(f"  {line}")
+              sys.exit(1)
+
+          # The probe from each cog's infra runbook, without AWS: a
+          # malformed record must come back as a reported failure — the
+          # batchItemFailures shape the event source mapping acts on — and
+          # not as an exception, which would fail the whole batch.
+          handler = getattr(importlib.import_module(os.environ["MODULE"]), os.environ["FUNC"])
+          record = {"messageId": "probe-1", "body": "not json", "attributes": {}}
+          result = handler({"Records": [record]}, None)
+          expected = {"batchItemFailures": [{"itemIdentifier": "probe-1"}]}
+          if result != expected:
+              print(f"::error::probe returned {result!r}, expected {expected!r}")
+              sys.exit(1)
+          print("every module imports, and the handler answers, in the Lambda runtime")
+          PROBE
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd build
+          zip -qr "$GITHUB_WORKSPACE/worker.zip" .
+          cd "$GITHUB_WORKSPACE"
+          size=$(stat -c%s worker.zip)
+          echo "zip is $((size / 1024 / 1024)) MB of the 50 MB direct-upload limit"
+          if [ "$size" -gt 47000000 ]; then
+            echo "::error::the zip is within 3 MB of the 50 MB limit"
+            exit 1
+          fi
+          echo "LOCAL_SHA=$(openssl dgst -sha256 -binary worker.zip | base64)" >> "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Deploy
+        env:
+          FUNCTION: ${{ inputs.function-name }}
+        run: |
+          set -euo pipefail
+          # The function's architecture is Terraform's, not this input's.
+          # Refuse a mismatch rather than upload binaries it cannot load.
+          deployed_arch=$(aws lambda get-function-configuration --function-name "$FUNCTION" \
+            --query 'Architectures[0]' --output text)
+          if [ "$deployed_arch" != "$ARCH" ]; then
+            echo "::error::${FUNCTION} is ${deployed_arch}; this build is ${ARCH}"
+            exit 1
+          fi
+          aws lambda update-function-code --function-name "$FUNCTION" \
+            --zip-file fileb://worker.zip --publish >/dev/null
+          aws lambda wait function-updated --function-name "$FUNCTION"
+
+      # The checksum AWS reports must be the one this run built, so a green
+      # run is evidence rather than an assumption.
+      - name: Confirm what is deployed
+        env:
+          FUNCTION: ${{ inputs.function-name }}
+        run: |
+          set -euo pipefail
+          REMOTE_SHA=$(aws lambda get-function --function-name "$FUNCTION" \
+            --query 'Configuration.CodeSha256' --output text)
+          echo "built:    $LOCAL_SHA"
+          echo "deployed: $REMOTE_SHA"
+          if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+            echo "::error::the deployed checksum is not the one this run built"
+            exit 1
+          fi

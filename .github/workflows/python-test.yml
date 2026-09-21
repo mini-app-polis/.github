@@ -1,0 +1,64 @@
+# The fleet's shared `test` stage for a uv-managed Python repo.
+#
+# The union of what the cogs ran inline, so that no caller loses a check by
+# adopting it: the lock agrees with pyproject (CD-020), lint, format, and the
+# suite with coverage. evaluator-cog checked formatting and deejay-cog did
+# not; deejay-cog checked the lock with a full clone and evaluator-cog did
+# not need one. One file stops that drift.
+#
+# Usage, as the `test` job in a repo's ci.yml (CD-026):
+#
+#   test:
+#     uses: mini-app-polis/.github/.github/workflows/python-test.yml@v3
+
+name: python-test
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Match the runtime the repo deploys to — for a Lambda cog, infra/worker.tf's `runtime`."
+        type: string
+        default: "3.11"
+      pytest-args:
+        description: "Appended to the pytest command."
+        type: string
+        default: "--cov=src --cov-report=term-missing"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      WORKFLOW_VERSION: v3
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: |
+          echo "python-test.yml ${WORKFLOW_VERSION}: python ${{ inputs.python-version }}"
+          uv python install "${{ inputs.python-version }}"
+
+      # CD-020. `uv sync` without --locked silently re-resolves when the
+      # lockfile and pyproject.toml disagree, so a stale lock passes CI and
+      # then ships something else. Checked here because this is where the
+      # failure is cheap to fix — and the deploy builds from this same lock.
+      - name: Verify the lockfile matches pyproject
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --python "${{ inputs.python-version }}"
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Format
+        run: uv run ruff format --check
+
+      - name: Test
+        run: uv run pytest ${{ inputs.pytest-args }}

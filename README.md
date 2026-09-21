@@ -1,8 +1,14 @@
 # .github
 
-Org-wide GitHub configuration for **mini-app-polis**. Two reusable
-workflows: the fleet's shared security controls, and the trigger that asks
-for a repository to be evaluated when it releases.
+Org-wide GitHub configuration for **mini-app-polis**. Four reusable
+workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
+
+| Stage | Workflow |
+|---|---|
+| `security` | `security.yml` — the fleet's shared security controls |
+| `test` | `python-test.yml` — lock check, lint, format and tests for a uv repo |
+| `deploy` | `lambda-deploy.yml` — build, prove and upload a cog's Lambda zip |
+| `evaluate` | `evaluate.yml` — ask for the repository to be evaluated |
 
 ## Shared security workflow
 
@@ -146,6 +152,81 @@ The middle row is the one worth spelling out. A 403 from Cloudflare and a
 problems, and dumping a challenge page into a CI log leaves whoever reads
 it to work that out for themselves.
 
+## Shared test stage
+
+`.github/workflows/python-test.yml` is the `test` job for a uv-managed
+Python repo: `uv lock --check` (CD-020), `uv sync --locked`, `ruff check`,
+`ruff format --check`, then pytest. It is the union of what the cogs ran
+inline, so adopting it removes no check a caller had.
+
+```yaml
+jobs:
+  test:
+    uses: mini-app-polis/.github/.github/workflows/python-test.yml@v3
+```
+
+| Input | Default | Meaning |
+|---|---|---|
+| `python-version` | `3.11` | Match the runtime the repo deploys to |
+| `pytest-args` | `--cov=src --cov-report=term-missing` | Appended to pytest |
+
+## Shared Lambda deploy
+
+`.github/workflows/lambda-deploy.yml` builds a cog's function zip from its
+lockfile, proves it starts in Lambda's own runtime, uploads it, and fails
+unless the checksum AWS reports is the one it built. Each cog's `infra/`
+owns the function's configuration; this owns only its code.
+
+```yaml
+jobs:
+  deploy:
+    needs: release
+    if: needs.release.outputs.tag != ''
+    permissions:
+      id-token: write
+      contents: read
+    uses: mini-app-polis/.github/.github/workflows/lambda-deploy.yml@v3
+    with:
+      ref: ${{ needs.release.outputs.tag }}
+      handler: deejay_cog.worker.lambda_handler
+      architecture: x86_64
+      role-arn: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+      region: ${{ vars.AWS_REGION }}
+      function-name: ${{ vars.AWS_FUNCTION_NAME }}
+```
+
+Called as a job after `release`, never `on: release` — semantic-release
+publishes with `GITHUB_TOKEN`, and GitHub starts no workflows from that
+token's events. A job that must run on the new code (evaluator-cog's fleet
+sweep) `needs: deploy`.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `ref` | *(required)* | The release tag to build |
+| `handler` | *(required)* | `module.function`, as `handler` in the cog's `infra/worker.tf` |
+| `architecture` | *(required)* | `x86_64` or `arm64`, as `architectures` in `infra/worker.tf`. The deploy refuses a function whose architecture differs |
+| `python-version` | `3.11` | As `runtime` in `infra/worker.tf` |
+| `strip` | *(none)* | Top-level paths to drop from the zip because the cog never imports them. boto3 is always dropped |
+| `role-arn`, `region`, `function-name` | *(required)* | From the cog's `terraform output` |
+
+### Three guards, because one was not enough
+
+1. **Wheels are chosen for the target, not the runner** —
+   `--python-platform <arch>-manylinux_2_17` for the Amazon Linux 2
+   runtimes. Left to itself uv picks what the Ubuntu runner can load.
+2. **No compiled library may need a newer glibc than the runtime has.**
+   Names the offending file.
+3. **Every module imports, and the handler answers a probe record, inside
+   `public.ecr.aws/lambda/python:<version>`** for the target architecture
+   (arm64 under QEMU). A pass means the function will start.
+
+Each exists because of the one before it failing. The deploy these replace
+chose wheels for the runner and checked imports on the runner: deejay-cog's
+first deploy passed that check and failed at import on Lambda (cryptography
+needing GLIBC_2.28, runtime has 2.26), and evaluator-cog had been shipping
+x86_64 builds of pydantic-core and cryptography to an arm64 function
+without tripping it only because nothing it ran imported them.
+
 ## Versioning
 
 Consumers pin a major — `evaluate.yml@v3`, `security.yml@v2` — and that tag
@@ -158,7 +239,7 @@ tag correctly stays put.
 |---|---|
 | `v1` | `security.yml` only, before the osv-scanner swap |
 | `v2` | `security.yml` as most of the fleet calls it today |
-| `v3` | the same `security.yml`, plus `evaluate.yml`. Moves with each release |
+| `v3` | the same `security.yml`, plus `evaluate.yml`, `python-test.yml` and `lambda-deploy.yml`. Moves with each release |
 
 `security.yml` is byte-identical across `v2` and `v3`, so a repo calling it
 may pin either. A repo pinning two different majors is correct, not a
