@@ -1,3 +1,10 @@
+# [3.3.0](https://github.com/mini-app-polis/.github/compare/v3.2.0...v3.3.0) (2026-09-21)
+
+
+### Features
+
+* shared python-test and lambda-deploy workflows ([e9c3573](https://github.com/mini-app-polis/.github/commit/e9c3573d15c033e5ba1c0dbda2ba1e7634a69ac3))
+
 # [3.2.0](https://github.com/mini-app-polis/.github/compare/v3.1.0...v3.2.0) (2026-09-16)
 
 
