@@ -1,3 +1,10 @@
+## [3.3.1](https://github.com/mini-app-polis/.github/compare/v3.3.0...v3.3.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **lambda-deploy:** keep dist-info in the Lambda zip ([b775f2b](https://github.com/mini-app-polis/.github/commit/b775f2b1ea72fd444c5b3f1d3a68707c1e47d375))
+
 # [3.3.0](https://github.com/mini-app-polis/.github/compare/v3.2.0...v3.3.0) (2026-09-21)
 
 
