@@ -165,7 +165,19 @@ jobs:
           fi
 
           echo "Auditing ${COUNT} resolved dependencies."
-          pip-audit --requirement "${REQ}" --strict
+          # One request per dependency to PyPI's JSON API, each with a
+          # 15-second default read timeout; one slow response failed the
+          # whole audit with a traceback and no finding. A longer timeout,
+          # and up to three attempts. A real vulnerability fails every
+          # attempt the same way, so retrying cannot let one through.
+          for attempt in 1 2 3; do
+            if pip-audit --requirement "${REQ}" --strict --timeout 60; then
+              exit 0
+            fi
+            echo "pip-audit attempt ${attempt} failed."
+            [ "${attempt}" -lt 3 ] && sleep 20
+          done
+          exit 1
 
   # SEC-003 (TypeScript). `pnpm audit` and `npm audit` both POST the
   # resolved tree to npm's advisory endpoint, which returned zero bytes
