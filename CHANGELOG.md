@@ -1,3 +1,15 @@
+# [3.4.0](https://github.com/mini-app-polis/.github/compare/v3.3.1...v3.4.0) (2026-09-22)
+
+
+### Bug Fixes
+
+* **lambda-deploy:** move to the Node 24 action majors ([ea04c8a](https://github.com/mini-app-polis/.github/commit/ea04c8a94648734a971afb3369506a26b62fadc2))
+
+
+### Features
+
+* **python-test:** optional typecheck step ([8911df2](https://github.com/mini-app-polis/.github/commit/8911df2276b92ff956551e064b46d1fac4f85f98))
+
 ## [3.3.1](https://github.com/mini-app-polis/.github/compare/v3.3.0...v3.3.1) (2026-09-22)
 
 
