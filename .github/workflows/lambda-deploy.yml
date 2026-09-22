@@ -151,7 +151,12 @@ jobs:
 
           rm -rf build/boto3 build/botocore build/s3transfer build/jmespath
           for path in $STRIP; do rm -rf "build/$path"; done
-          rm -rf build/*.dist-info build/__pycache__
+          # dist-info stays. It is metadata, not dead weight: packages read
+          # their own version from it at import — httpx2, under anthropic and
+          # openai, does `importlib.metadata.version("httpx2")` and fails to
+          # import without it — and the run-report library stamps each
+          # report with the cog's version the same way.
+          rm -rf build/__pycache__
 
           test -f "build/${MODULE_PATH}" || {
             echo "::error::${MODULE_PATH} is not at the zip root; the handler cannot resolve"
