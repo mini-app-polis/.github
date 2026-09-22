@@ -181,7 +181,7 @@ jobs:
       # for an import walk and one handler call.
       - name: Set up QEMU
         if: inputs.architecture == 'arm64'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
 
@@ -237,7 +237,7 @@ jobs:
           fi
           echo "LOCAL_SHA=$(openssl dgst -sha256 -binary worker.zip | base64)" >> "$GITHUB_ENV"
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ inputs.role-arn }}
           aws-region: ${{ inputs.region }}
