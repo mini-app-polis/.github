@@ -1,3 +1,10 @@
+## [3.4.1](https://github.com/mini-app-polis/.github/compare/v3.4.0...v3.4.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **security:** retry pip-audit and lengthen its timeout ([9646257](https://github.com/mini-app-polis/.github/commit/96462572dc224f0e9518f8b667c9c5a2950f7957))
+
 # [3.4.0](https://github.com/mini-app-polis/.github/compare/v3.3.1...v3.4.0) (2026-09-22)
 
 
