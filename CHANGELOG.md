@@ -1,3 +1,10 @@
+# [3.5.0](https://github.com/mini-app-polis/.github/compare/v3.4.1...v3.5.0) (2026-09-22)
+
+
+### Features
+
+* **python-test:** terraform fmt and validate for a Lambda cog's infra ([234f1ad](https://github.com/mini-app-polis/.github/commit/234f1adf0fcb58478e188437bf6b5894c5b1e80d))
+
 ## [3.4.1](https://github.com/mini-app-polis/.github/compare/v3.4.0...v3.4.1) (2026-09-22)
 
 
