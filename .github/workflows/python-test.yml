@@ -24,6 +24,13 @@ on:
         description: "Appended to the pytest command."
         type: string
         default: "--cov=src --cov-report=term-missing"
+      typecheck:
+        description: >-
+          A type-check command, e.g. "uv run mypy src/". Empty skips the step.
+          TEST-012 requires one in CI for a repo that declares [tool.mypy];
+          a repo that does not declare it has nothing to run.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -59,6 +66,10 @@ jobs:
 
       - name: Format
         run: uv run ruff format --check
+
+      - name: Type check
+        if: inputs.typecheck != ''
+        run: ${{ inputs.typecheck }}
 
       - name: Test
         run: uv run pytest ${{ inputs.pytest-args }}
