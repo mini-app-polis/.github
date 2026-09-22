@@ -93,8 +93,15 @@ jobs:
           terraform_wrapper: false
 
       # -backend=false: validate needs the providers' schemas, not state. The
-      # committed .terraform.lock.hcl pins them, with checksums for every
-      # platform, so this installs what the workstation applies with.
+      # committed .terraform.lock.hcl pins the versions, so this installs what
+      # the workstation applies with.
+      #
+      # Not -lockfile=readonly. The lock is written on a Mac and holds that
+      # platform's h1: hash plus the registry's zh: hashes. init verifies the
+      # Linux download against zh:, then validate checks the unpacked plugin
+      # against h1: — which readonly had stopped init recording — and fails.
+      # Letting init add the Linux hash to the runner's copy changes no
+      # version; the versions are still the lock's.
       - name: Terraform fmt and validate
         if: inputs.terraform-dir != ''
         env:
@@ -102,7 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           terraform -chdir="$TF_DIR" fmt -check -recursive -diff
-          terraform -chdir="$TF_DIR" init -backend=false -input=false -lockfile=readonly
+          terraform -chdir="$TF_DIR" init -backend=false -input=false
           terraform -chdir="$TF_DIR" validate
 
       - name: Test
