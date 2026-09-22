@@ -31,6 +31,18 @@ on:
           a repo that does not declare it has nothing to run.
         type: string
         default: ""
+      terraform-dir:
+        description: >-
+          A Lambda cog's Terraform directory, e.g. "infra". Set, it is checked
+          with `terraform fmt -check` and `terraform validate` — no state, no
+          credentials, no plan. Empty skips both. Applying stays on a
+          workstation; see each cog's infra/README.md.
+        type: string
+        default: ""
+      terraform-version:
+        description: "Match what applies it from the workstation, so fmt agrees."
+        type: string
+        default: "1.16.2"
 
 permissions:
   contents: read
@@ -70,6 +82,28 @@ jobs:
       - name: Type check
         if: inputs.typecheck != ''
         run: ${{ inputs.typecheck }}
+
+      - name: Set up Terraform
+        if: inputs.terraform-dir != ''
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          # Plain terraform output; the wrapper only matters for steps that
+          # read stdout as outputs, and none here do.
+          terraform_wrapper: false
+
+      # -backend=false: validate needs the providers' schemas, not state. The
+      # committed .terraform.lock.hcl pins them, with checksums for every
+      # platform, so this installs what the workstation applies with.
+      - name: Terraform fmt and validate
+        if: inputs.terraform-dir != ''
+        env:
+          TF_DIR: ${{ inputs.terraform-dir }}
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_DIR" fmt -check -recursive -diff
+          terraform -chdir="$TF_DIR" init -backend=false -input=false -lockfile=readonly
+          terraform -chdir="$TF_DIR" validate
 
       - name: Test
         run: uv run pytest ${{ inputs.pytest-args }}
