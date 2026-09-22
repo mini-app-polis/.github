@@ -1,3 +1,10 @@
+## [3.5.1](https://github.com/mini-app-polis/.github/compare/v3.5.0...v3.5.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **python-test:** let terraform init record the runner's provider hash ([2d97f8d](https://github.com/mini-app-polis/.github/commit/2d97f8dd45797a9cc0aea87347db2476fa79e464))
+
 # [3.5.0](https://github.com/mini-app-polis/.github/compare/v3.4.1...v3.5.0) (2026-09-22)
 
 
