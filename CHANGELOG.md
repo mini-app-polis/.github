@@ -1,3 +1,10 @@
+# [3.6.0](https://github.com/mini-app-polis/.github/compare/v3.5.2...v3.6.0) (2026-09-23)
+
+
+### Features
+
+* **python-test:** warn when no typecheck input is passed ([cf16699](https://github.com/mini-app-polis/.github/commit/cf16699e788e5238c4838e39bb4142e7e5bbc880))
+
 ## [3.5.2](https://github.com/mini-app-polis/.github/compare/v3.5.1...v3.5.2) (2026-09-23)
 
 
