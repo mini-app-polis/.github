@@ -62,10 +62,6 @@ on:
         description: "Owning GitHub org. Defaults to the calling repository's owner."
         type: string
         default: ""
-      repo-id:
-        description: "The id findings are filed under. Set this only for a monorepo app, where it differs from the repository name."
-        type: string
-        default: ""
       mode:
         description: "deterministic | llm. Deterministic is the release default: no token cost, and nothing in CI is waiting on it."
         type: string
@@ -110,7 +106,6 @@ jobs:
           REPO: ${{ inputs.repo || github.event.repository.name }}
           ORG: ${{ inputs.org || github.repository_owner }}
           REF: ${{ inputs.ref || github.event.repository.default_branch }}
-          REPO_ID: ${{ inputs.repo-id }}
           # Hand-maintained, bumped when a major tag is cut. github's
           # job_workflow_sha is documented as the reusable workflow's commit
           # but resolves empty in a workflow_call job — it reaches this
@@ -137,9 +132,7 @@ jobs:
                 --arg ref "${REF}" \
                 --arg org "${ORG}" \
                 --arg mode "${MODE}" \
-                --arg repo_id "${REPO_ID}" \
-                '{repo: $repo, ref: $ref, org: $org, mode: $mode}
-                 + (if $repo_id == "" then {} else {repo_id: $repo_id} end)')
+                '{repo: $repo, ref: $ref, org: $org, mode: $mode}')
               what="${ORG}/${REPO}@${REF}"
               ;;
             fleet)

@@ -98,7 +98,6 @@ jobs:
 | `ref` | the default branch | Branch or tag to evaluate |
 | `repo` | the calling repository | Repository name, without the org |
 | `org` | the calling owner | Owning GitHub org |
-| `repo-id` | *(none)* | The id findings are filed under. Monorepo apps only |
 | `mode` | `deterministic` | `deterministic` or `llm` |
 | `api-url` | `https://api.kaianolevine.com` | Base URL of api-kaianolevine-com |
 | `wait-seconds` | `0` | Pause before asking. For a repo whose release redeploys a service the evaluation needs |
