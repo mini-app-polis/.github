@@ -1,3 +1,10 @@
+## [3.5.2](https://github.com/mini-app-polis/.github/compare/v3.5.1...v3.5.2) (2026-09-23)
+
+
+### Bug Fixes
+
+* **evaluate:** drop the monorepo-only repo-id input ([e89a372](https://github.com/mini-app-polis/.github/commit/e89a37275f71f41461529160306836544e0fc969))
+
 ## [3.5.1](https://github.com/mini-app-polis/.github/compare/v3.5.0...v3.5.1) (2026-09-22)
 
 
