@@ -26,9 +26,11 @@ on:
         default: "--cov=src --cov-report=term-missing"
       typecheck:
         description: >-
-          A type-check command, e.g. "uv run mypy src/". Empty skips the step.
-          TEST-012 requires one in CI for a repo that declares [tool.mypy];
-          a repo that does not declare it has nothing to run.
+          A type-check command, e.g. "uv run mypy src/". TEST-012 requires
+          one for every Python repo in scope, with [tool.mypy] declared in
+          pyproject.toml. Empty skips the step and raises a warning saying so
+          — it used to skip in silence, which is how a repo that adopted this
+          workflow went untyped with nothing to show for it.
         type: string
         default: ""
       terraform-dir:
@@ -82,6 +84,10 @@ jobs:
       - name: Type check
         if: inputs.typecheck != ''
         run: ${{ inputs.typecheck }}
+
+      - name: Type check not configured
+        if: inputs.typecheck == ''
+        run: echo "::warning title=TEST-012::No typecheck input was passed, so nothing typechecked this run."
 
       - name: Set up Terraform
         if: inputs.terraform-dir != ''
