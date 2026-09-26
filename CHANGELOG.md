@@ -1,3 +1,10 @@
+# [3.7.0](https://github.com/mini-app-polis/.github/compare/v3.6.0...v3.7.0) (2026-09-26)
+
+
+### Features
+
+* **lambda-deploy:** add a trigger input for scheduled functions ([bd682b5](https://github.com/mini-app-polis/.github/commit/bd682b5b4c7f1e3c0f97bd1c86c224993a039820))
+
 # [3.6.0](https://github.com/mini-app-polis/.github/compare/v3.5.2...v3.6.0) (2026-09-23)
 
 
