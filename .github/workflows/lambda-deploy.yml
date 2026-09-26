@@ -23,7 +23,11 @@
 #   3. Every module imports, and the handler answers a probe, inside
 #      public.ecr.aws/lambda/python:<version> for the target architecture.
 #      A pass here means the function will start; an import check on the
-#      runner does not.
+#      runner does not. The probe is a malformed SQS record, so it applies
+#      only to a queue consumer (`trigger: sqs`, the default). A function
+#      invoked on a schedule (`trigger: schedule`) takes no event worth
+#      probing, and invoking it would run its real work, so it gets the
+#      import check alone.
 #
 # Usage, from a cog's ci.yml. Call it as a job after `release`, not with
 # `on: release`: semantic-release publishes with GITHUB_TOKEN and GitHub
@@ -61,6 +65,10 @@ on:
         description: "x86_64 | arm64 — must match `architectures` in the cog's infra/worker.tf."
         type: string
         required: true
+      trigger:
+        description: "sqs | schedule — what invokes the function. sqs (a worker behind a queue) gets Guard 3's malformed-record probe; schedule (an EventBridge rule, e.g. watcher-cog) gets the import check only."
+        type: string
+        default: "sqs"
       python-version:
         description: "The Lambda runtime's Python, as in `runtime = \"python<version>\"`."
         type: string
@@ -95,6 +103,7 @@ jobs:
       ARCH: ${{ inputs.architecture }}
       PY: ${{ inputs.python-version }}
       STRIP: ${{ inputs.strip }}
+      TRIGGER: ${{ inputs.trigger }}
       # Hand-maintained, bumped when a major tag is cut — see evaluate.yml
       # for why github.job_workflow_sha cannot stand in for it.
       WORKFLOW_VERSION: v3
@@ -108,6 +117,11 @@ jobs:
             x86_64) echo "WHEEL_ARCH=x86_64"  >> "$GITHUB_ENV"; echo "DOCKER_PLATFORM=linux/amd64" >> "$GITHUB_ENV" ;;
             arm64)  echo "WHEEL_ARCH=aarch64" >> "$GITHUB_ENV"; echo "DOCKER_PLATFORM=linux/arm64" >> "$GITHUB_ENV" ;;
             *) echo "::error::architecture must be x86_64 or arm64, got '$ARCH'"; exit 1 ;;
+          esac
+
+          case "$TRIGGER" in
+            sqs|schedule) ;;
+            *) echo "::error::trigger must be sqs or schedule, got '$TRIGGER'"; exit 1 ;;
           esac
 
           # The runtime's glibc, by Python version. python3.8–3.11 run on
@@ -190,7 +204,7 @@ jobs:
           set -euo pipefail
           docker run --rm -i --platform "$DOCKER_PLATFORM" \
             -v "$PWD/build:/var/task:ro" -e PYTHONPATH=/var/task \
-            -e PACKAGE -e MODULE -e FUNC \
+            -e PACKAGE -e MODULE -e FUNC -e TRIGGER \
             --entrypoint /var/lang/bin/python3 \
             "public.ecr.aws/lambda/python:${PY}" - <<'PROBE'
           import importlib, os, pkgutil, platform, sys
@@ -209,11 +223,21 @@ jobs:
                   print(f"  {line}")
               sys.exit(1)
 
+          handler = getattr(importlib.import_module(os.environ["MODULE"]), os.environ["FUNC"])
+          if not callable(handler):
+              print(f"::error::{os.environ['MODULE']}.{os.environ['FUNC']} is not callable")
+              sys.exit(1)
+
+          # A scheduled function's event carries nothing to probe, and
+          # calling it would run a real tick with no configuration.
+          if os.environ["TRIGGER"] == "schedule":
+              print("every module imports, and the handler resolves, in the Lambda runtime")
+              sys.exit(0)
+
           # The probe from each cog's infra runbook, without AWS: a
           # malformed record must come back as a reported failure — the
           # batchItemFailures shape the event source mapping acts on — and
           # not as an exception, which would fail the whole batch.
-          handler = getattr(importlib.import_module(os.environ["MODULE"]), os.environ["FUNC"])
           record = {"messageId": "probe-1", "body": "not json", "attributes": {}}
           result = handler({"Records": [record]}, None)
           expected = {"batchItemFailures": [{"itemIdentifier": "probe-1"}]}
