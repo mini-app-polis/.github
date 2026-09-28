@@ -1,3 +1,10 @@
+# [3.8.0](https://github.com/mini-app-polis/.github/compare/v3.7.0...v3.8.0) (2026-09-28)
+
+
+### Features
+
+* **promote:** open a dev to main pull request on every push to dev ([f4c0efa](https://github.com/mini-app-polis/.github/commit/f4c0efa73439e21d87ea136a3a704f25105f56f4))
+
 # [3.7.0](https://github.com/mini-app-polis/.github/compare/v3.6.0...v3.7.0) (2026-09-26)
 
 
