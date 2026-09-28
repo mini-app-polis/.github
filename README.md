@@ -10,6 +10,9 @@ workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 | `deploy` | `lambda-deploy.yml` — build, prove and upload a cog's Lambda zip |
 | `evaluate` | `evaluate.yml` — ask for the repository to be evaluated |
 
+One more sits outside the pipeline: `promote.yml` keeps a `dev` → `main`
+pull request open whenever `dev` has something to release.
+
 ## Shared security workflow
 
 `.github/workflows/security.yml` is a reusable workflow that runs four
@@ -225,6 +228,36 @@ first deploy passed that check and failed at import on Lambda (cryptography
 needing GLIBC_2.28, runtime has 2.26), and evaluator-cog had been shipping
 x86_64 builds of pydantic-core and cryptography to an arm64 function
 without tripping it only because nothing it ran imported them.
+
+## Shared dev → main promotion
+
+`.github/workflows/promote.yml` runs on every push to `dev`. When `dev` has
+commits `main` lacks (merge commits aside), it opens a `chore: promote dev
+to main` pull request, or rewrites the open one's description to list what
+the next release will contain. It never merges.
+
+```yaml
+name: promote
+on:
+  push:
+    branches: [dev]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  promote:
+    uses: mini-app-polis/.github/.github/workflows/promote.yml@v3
+```
+
+Two things to know:
+
+- **The repository must allow it.** Settings → Actions → General → "Allow
+  GitHub Actions to create and approve pull requests". Without it the
+  create step fails with a 403.
+- **`pull_request` workflows do not run on it** when it is opened with the
+  default `GITHUB_TOKEN`. The push to `dev` already ran CI on the same
+  commit, and those checks show on the pull request. Pass a `token` secret
+  only if a repository needs CI against the merge result too.
 
 ## Versioning
 
