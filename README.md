@@ -243,21 +243,18 @@ on:
     branches: [dev]
 permissions:
   contents: read
-  pull-requests: write
 jobs:
   promote:
     uses: mini-app-polis/.github/.github/workflows/promote.yml@v3
+    secrets: inherit
 ```
 
-Two things to know:
-
-- **The repository must allow it.** Settings → Actions → General → "Allow
-  GitHub Actions to create and approve pull requests". Without it the
-  create step fails with a 403.
-- **`pull_request` workflows do not run on it** when it is opened with the
-  default `GITHUB_TOKEN`. The push to `dev` already ran CI on the same
-  commit, and those checks show on the pull request. Pass a `token` secret
-  only if a repository needs CI against the merge result too.
+It opens the pull request as a GitHub App rather than as
+`github-actions[bot]`, because GitHub holds every `pull_request` run on a
+bot-opened pull request for manual approval. The App needs Pull requests:
+write and Contents: read, is installed on the org, and is configured
+through two org secrets, `PROMOTE_APP_CLIENT_ID` and
+`PROMOTE_APP_PRIVATE_KEY`. Without them the job fails and names them.
 
 ## Versioning
 

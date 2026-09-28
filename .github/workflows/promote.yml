@@ -12,19 +12,19 @@
 # back-merge of `main`, say — has nothing to release, so no pull request is
 # opened for it.
 #
-# Checks on the pull request. A pull request opened with the default
-# GITHUB_TOKEN does not start `pull_request` workflows (GitHub's guard
-# against workflows triggering workflows). That costs nothing here: the
-# pull request's head is the `dev` commit the push already ran CI on, and
-# those check runs attach to the commit, so they show on the pull request
-# and satisfy required checks. Pass a `token` secret (a GitHub App or
-# fine-grained token with pull-requests: write) only if a repository needs
-# its `pull_request` workflows to run against the merge result as well.
+# **It opens the pull request as a GitHub App, not as GITHUB_TOKEN.** A pull
+# request opened by `github-actions[bot]` does get its `pull_request`
+# workflows queued, but GitHub holds every one of them at "action required"
+# until a person approves the run — on every promotion, in every repository.
+# A pull request opened by an installed App runs CI like any other. The App
+# needs only Pull requests: write and Contents: read, is installed on the
+# org, and its credentials are two org secrets:
 #
-# The repository (or the org) must allow it: Settings → Actions → General →
-# "Allow GitHub Actions to create and approve pull requests". Without that
-# the create step fails with a 403, loudly, rather than silently doing
-# nothing.
+#   PROMOTE_APP_CLIENT_ID    — the App's client ID
+#   PROMOTE_APP_PRIVATE_KEY  — a private key generated for the App
+#
+# Without them the job fails and says so, rather than falling back to
+# GITHUB_TOKEN and quietly bringing the approvals back.
 #
 # Usage, as its own workflow in the consumer:
 #
@@ -34,10 +34,10 @@
 #       branches: [dev]
 #   permissions:
 #     contents: read
-#     pull-requests: write
 #   jobs:
 #     promote:
 #       uses: mini-app-polis/.github/.github/workflows/promote.yml@v3
+#       secrets: inherit
 
 name: promote
 
@@ -52,9 +52,15 @@ on:
         description: "Branch that releases (the pull request's base)."
         type: string
         default: main
+    # Optional in the declaration so a missing secret reaches the explicit
+    # check below, with a message that says what to set, instead of a bare
+    # workflow-validation error.
     secrets:
-      token:
-        description: "Optional token to open the pull request with, so pull_request workflows run on it. Defaults to GITHUB_TOKEN."
+      PROMOTE_APP_CLIENT_ID:
+        description: "Client ID of the GitHub App that opens the pull request."
+        required: false
+      PROMOTE_APP_PRIVATE_KEY:
+        description: "Private key of that GitHub App."
         required: false
 
 jobs:
@@ -62,12 +68,32 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     # Two quick pushes to dev must not race to open two pull requests.
     concurrency:
       group: promote-${{ github.repository }}-${{ inputs.from }}-${{ inputs.to }}
       cancel-in-progress: false
     steps:
+      - name: Require the promote App's credentials
+        env:
+          CLIENT_ID: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+            echo "::error::PROMOTE_APP_CLIENT_ID and PROMOTE_APP_PRIVATE_KEY must be set (org secrets) and passed with 'secrets: inherit'."
+            exit 1
+          fi
+
+      # Scoped to this repository (the action's default when no owner is
+      # given) and to the two permissions the job uses.
+      - name: Mint an App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+
       - uses: actions/checkout@v7
         with:
           # Both branches' history, to count what dev has that main lacks.
@@ -75,7 +101,7 @@ jobs:
 
       - name: Open or refresh the promotion pull request
         env:
-          GH_TOKEN: ${{ secrets.token || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           FROM: ${{ inputs.from }}
           TO: ${{ inputs.to }}
         run: |
@@ -92,7 +118,9 @@ jobs:
           {
             echo "Promotes \`${FROM}\` to \`${TO}\`. Merging releases these ${waiting} commit(s):"
             echo
-            git log --no-merges --format='- %s (%h)' "$range" | head -n 100
+            # -n rather than `| head`: under pipefail, head closing the pipe
+            # early would kill git with SIGPIPE and fail the job.
+            git log --no-merges -n 100 --format='- %s (%h)' "$range"
             if [ "$waiting" -gt 100 ]; then echo "- …and $((waiting - 100)) more"; fi
             echo
             echo "_Opened and kept current by the fleet's promote workflow on every push to \`${FROM}\`._"
