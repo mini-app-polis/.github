@@ -1,0 +1,168 @@
+# The fleet's shared auto-merge into `dev`.
+#
+# A pull request into `dev` whose checks are all green merges itself; what
+# reaches `main` is still merged by a person, through the promotion pull
+# request (promote.yml). `dev` is where changes get exercised — it deploys
+# to the preview and development environments — so anything that passes CI
+# belongs there, majors included: a major big enough to matter usually
+# fails the tests, and one that does not gets its real-world trial on `dev`
+# before the manual merge to `main`. In practice the pull requests this
+# lands are Dependabot's, since people push to `dev` directly.
+#
+# It runs when a pull request's CI finishes (the consumer triggers it on
+# `workflow_run` for each of its pull_request workflows) and merges only
+# when every check on the pull request's head commit has finished and none
+# failed or was cancelled. Another workflow still running means "not yet":
+# its own completion triggers this again, and the last one to finish is the
+# one that merges. `--match-head-commit` pins the merge to the commit that
+# was checked, so a push that lands mid-run is never merged untested.
+#
+# Not merged: drafts, anything not based on `dev`, and any head branch
+# matching the `skip-branch-pattern` input (empty by default; set it to
+# "/majors-" to hold Dependabot's majors group for review in one repo).
+#
+# **It merges as the promote GitHub App**, not as GITHUB_TOKEN. A merge made
+# with GITHUB_TOKEN starts no workflows, so the push to `dev` would run no CI
+# and would not refresh the promotion pull request. The App token here is
+# minted with Contents: write and Pull requests: write, which means the App
+# itself needs Contents: read and write. promote.yml keeps minting its own
+# token read-only, so the promotion job still cannot merge anything.
+#
+# Secrets: the same two org secrets as promote.yml. Add them to the org's
+# Dependabot secrets as well as its Actions secrets — runs that stem from a
+# Dependabot pull request only see Dependabot secrets.
+#
+# Takes effect from `main`: GitHub only runs `workflow_run` workflows from
+# the default branch's copy of the consumer's file.
+#
+# Usage, as its own workflow in the consumer:
+#
+#   name: automerge
+#   on:
+#     workflow_run:
+#       workflows: [CI]          # every workflow that runs on pull_request
+#       types: [completed]
+#   permissions:
+#     contents: read
+#     pull-requests: read
+#     checks: read
+#     statuses: read
+#   jobs:
+#     automerge:
+#       uses: mini-app-polis/.github/.github/workflows/automerge.yml@v3
+#       secrets: inherit
+
+name: automerge
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: "Branch that pull requests are auto-merged into."
+        type: string
+        default: dev
+      skip-branch-pattern:
+        description: "Extended regex; pull requests whose head branch matches are never auto-merged. Empty (the default) merges every green pull request."
+        type: string
+        default: ""
+    secrets:
+      PROMOTE_APP_CLIENT_ID:
+        required: false
+      PROMOTE_APP_PRIVATE_KEY:
+        required: false
+
+jobs:
+  automerge:
+    # Only a pull request's CI, and only a successful one, can lead to a
+    # merge. Anything else has nothing to do and exits before a runner does
+    # real work.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    concurrency:
+      group: automerge-${{ github.repository }}-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    steps:
+      - name: Find the pull request and decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ inputs.base }}
+          SKIP: ${{ inputs.skip-branch-pattern }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          merge=false
+
+          pr=$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")
+          if [ -z "$pr" ]; then
+            echo "No pull request on this run."; echo "merge=$merge" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          info=$(gh pr view "$pr" -R "$GITHUB_REPOSITORY" \
+            --json state,isDraft,baseRefName,headRefName,headRefOid)
+          state=$(jq -r .state <<<"$info");       draft=$(jq -r .isDraft <<<"$info")
+          base=$(jq -r .baseRefName <<<"$info");  head=$(jq -r .headRefName <<<"$info")
+          oid=$(jq -r .headRefOid <<<"$info")
+
+          reason=""
+          if   [ "$state" != OPEN ];  then reason="not open ($state)"
+          elif [ "$draft" = true ];   then reason="draft"
+          elif [ "$base" != "$BASE" ]; then reason="based on $base, not $BASE"
+          elif [ "$oid" != "$SHA" ];  then reason="head moved on since this run"
+          elif [ -n "$SKIP" ] && grep -Eq -- "$SKIP" <<<"$head"; then reason="$head is excluded"
+          fi
+
+          if [ -z "$reason" ]; then
+            # gh exits non-zero while checks are pending or failing; the
+            # buckets are what decide, so its status is ignored here.
+            buckets=$(gh pr checks "$pr" -R "$GITHUB_REPOSITORY" --json bucket --jq '.[].bucket' || true)
+            if   [ -z "$buckets" ];                          then reason="no checks reported yet"
+            elif grep -Eq '^(fail|cancel)$' <<<"$buckets";   then reason="a check failed or was cancelled"
+            elif grep -q '^pending$' <<<"$buckets";          then reason="checks still running; a later run will merge"
+            fi
+          fi
+
+          if [ -n "$reason" ]; then
+            echo "Not merging #$pr: $reason."
+          else
+            merge=true
+            echo "#$pr is green on $SHA; merging."
+          fi
+          echo "merge=$merge" >> "$GITHUB_OUTPUT"
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Require the promote App's credentials
+        if: steps.decide.outputs.merge == 'true'
+        env:
+          CLIENT_ID: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+            echo "::error::PROMOTE_APP_CLIENT_ID and PROMOTE_APP_PRIVATE_KEY must be set as org Actions and Dependabot secrets and passed with 'secrets: inherit'."
+            exit 1
+          fi
+
+      - name: Mint an App token
+        if: steps.decide.outputs.merge == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Merge
+        if: steps.decide.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.decide.outputs.pr }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: gh pr merge "$PR" -R "$GITHUB_REPOSITORY" --merge --match-head-commit "$SHA"

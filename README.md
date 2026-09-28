@@ -10,8 +10,9 @@ workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 | `deploy` | `lambda-deploy.yml` — build, prove and upload a cog's Lambda zip |
 | `evaluate` | `evaluate.yml` — ask for the repository to be evaluated |
 
-One more sits outside the pipeline: `promote.yml` keeps a `dev` → `main`
-pull request open whenever `dev` has something to release.
+Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
+pull request open whenever `dev` has something to release, and
+`automerge.yml` merges a pull request into `dev` once all its checks pass.
 
 ## Shared security workflow
 
@@ -255,6 +256,41 @@ bot-opened pull request for manual approval. The App needs Pull requests:
 write and Contents: read, is installed on the org, and is configured
 through two org secrets, `PROMOTE_APP_CLIENT_ID` and
 `PROMOTE_APP_PRIVATE_KEY`. Without them the job fails and names them.
+
+## Shared auto-merge into dev
+
+`.github/workflows/automerge.yml` merges a pull request into `dev` when
+every check on its head commit has passed. Merging into `main` stays
+manual, through the promotion pull request.
+
+```yaml
+name: automerge
+on:
+  workflow_run:
+    workflows: [CI]   # every workflow that runs on pull_request
+    types: [completed]
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+jobs:
+  automerge:
+    uses: mini-app-polis/.github/.github/workflows/automerge.yml@v3
+    secrets: inherit
+```
+
+- **Majors included.** `dev` is where changes get exercised; the manual
+  merge to `main` is the gate. Drafts and anything not based on `dev` are
+  not merged, and a repository can hold back branches by pattern with the
+  `skip-branch-pattern` input (e.g. `"/majors-"`).
+- **Merges as the promote App**, so the push to `dev` runs CI and refreshes
+  the promotion pull request. The App needs Contents: read and write for
+  this; `promote.yml` still mints a read-only token.
+- **Secrets** go in the org's Dependabot secrets as well as its Actions
+  secrets.
+- **Runs from `main`'s copy** of the consumer's file, like every
+  `workflow_run` workflow, so it starts working after the first promotion.
 
 ## Versioning
 
