@@ -1,3 +1,10 @@
+# [3.9.0](https://github.com/mini-app-polis/.github/compare/v3.8.1...v3.9.0) (2026-09-28)
+
+
+### Features
+
+* **automerge:** merge pull requests into dev once every check passes ([110994c](https://github.com/mini-app-polis/.github/commit/110994c7ed634524c4c4db15680006e18726f584))
+
 ## [3.8.1](https://github.com/mini-app-polis/.github/compare/v3.8.0...v3.8.1) (2026-09-28)
 
 
