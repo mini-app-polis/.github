@@ -1,3 +1,10 @@
+## [3.8.1](https://github.com/mini-app-polis/.github/compare/v3.8.0...v3.8.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **promote:** open the pull request as a GitHub App so its CI runs without approval ([7bf4dba](https://github.com/mini-app-polis/.github/commit/7bf4dba3611ac0ff6fe74092ebec6e14e2a54b49))
+
 # [3.8.0](https://github.com/mini-app-polis/.github/compare/v3.7.0...v3.8.0) (2026-09-28)
 
 
