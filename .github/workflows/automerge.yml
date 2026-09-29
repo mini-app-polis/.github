@@ -42,6 +42,7 @@
 #     workflow_run:
 #       workflows: [CI]          # every workflow that runs on pull_request
 #       types: [completed]
+#       branches-ignore: [main, dev]   # runs there can never merge (CD-035)
 #   permissions:
 #     contents: read
 #     pull-requests: read
