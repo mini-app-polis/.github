@@ -1,0 +1,226 @@
+# Clears the fleet's dependency-audit findings without anyone touching them.
+#
+# security.yml (SEC-003) fails a build when a resolved dependency has a
+# published advisory. It finds; it never fixes. The fix is nearly always a
+# re-lock of one transitive package, and it is needed in every repo on that
+# package at once — on 2026-09-30 urllib3 and virtualenv were bumped by hand
+# in api-kaianolevine-com, and every other uv repo carried the same two.
+#
+# Neither existing mechanism covers it. Dependabot security updates act on
+# GitHub's advisory database, which lags the PyPA advisories pip-audit reads
+# (and may never carry some), and they always open against the default
+# branch, where automerge does not merge. Raising a floor in
+# common-python-utils only reaches a repo after a release and a commons bump
+# in each consumer, and is not needed: a library's lock never reaches its
+# consumers, so each repo can re-lock the transitive package itself, within
+# the ranges the library declares.
+#
+# So this runs from here, over the whole fleet, on a schedule:
+#
+#   1. discover — every repository the promote App is installed on, not
+#      archived, with a uv.lock on `dev`. A new repo is covered the day the
+#      App is installed on it; nothing is added to the repo itself.
+#   2. fix, per repository — check out `dev`, run the same audit
+#      security.yml runs, re-lock each flagged package at the smallest
+#      version that clears it (scripts/fix-vulnerable-deps.py), re-audit,
+#      and open or refresh one `fix(deps)` pull request into `dev` from the
+#      `security-fix/deps` branch. automerge.yml merges it once CI is green;
+#      it reaches `main` through the promotion pull request like anything
+#      else.
+#
+# A job fails, and says why in its summary, only when an advisory is left
+# that re-locking cannot clear: no fixed version is published yet, or a
+# declared range keeps the lock below it. That is the case that needs a
+# person, and the red job is how it gets one.
+#
+# When `dev` is already clean the job opens nothing, and closes a leftover
+# pull request from an earlier run. When the branch already holds the same
+# fix on top of the current `dev`, it is left alone rather than re-pushed,
+# so an unmerged fix does not restart CI every four hours.
+#
+# Runs as the promote App (the org secrets promote.yml and automerge.yml
+# use), for two reasons: GITHUB_TOKEN cannot reach other repositories, and a
+# push made with it starts no workflows, so the pull request would never get
+# the CI run automerge waits for. The App needs Contents and Pull requests
+# read and write on every fleet repository, and the two org secrets must be
+# visible to this repository.
+
+name: dependency-fix
+
+on:
+  schedule:
+    - cron: "23 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Only this repository (name, without the org). Empty runs the whole fleet."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-fix
+  cancel-in-progress: false
+
+env:
+  ORG: mini-app-polis
+  BRANCH: security-fix/deps
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.list.outputs.repos }}
+    steps:
+      - name: Require the promote App's credentials
+        env:
+          CLIENT_ID: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+            echo "::error::PROMOTE_APP_CLIENT_ID and PROMOTE_APP_PRIVATE_KEY must be org secrets visible to this repository."
+            exit 1
+          fi
+
+      # No `repositories` list: the token covers every repository the App
+      # is installed on, which is exactly the set it could fix.
+      - name: Mint an App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+          permission-contents: read
+
+      - name: List repositories with a uv.lock on dev
+        id: list
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ONLY: ${{ inputs.repository }}
+        run: |
+          set -euo pipefail
+          repos=()
+          while read -r name; do
+            [ -n "$ONLY" ] && [ "$name" != "$ONLY" ] && continue
+            if gh api "repos/${ORG}/${name}/contents/uv.lock?ref=dev" --silent 2>/dev/null; then
+              repos+=("$name")
+            fi
+          done < <(gh api --paginate /installation/repositories \
+                     --jq '.repositories[] | select(.archived | not) | .name')
+          echo "Fleet: ${repos[*]:-none}"
+          if [ -n "$ONLY" ] && [ "${#repos[@]}" -eq 0 ]; then
+            echo "::error::${ORG}/${ONLY} has no uv.lock on dev, or the App is not installed on it."
+            exit 1
+          fi
+          printf '%s\n' "${repos[@]}" | jq -Rnc '[inputs | select(length > 0)]' > repos.json
+          echo "repos=$(cat repos.json)" >> "$GITHUB_OUTPUT"
+
+  fix:
+    needs: discover
+    if: needs.discover.outputs.repos != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        repo: ${{ fromJSON(needs.discover.outputs.repos) }}
+    steps:
+      # This repository, for the script.
+      - uses: actions/checkout@v7
+        with:
+          path: fleet
+
+      - name: Mint an App token for ${{ matrix.repo }}
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ORG }}/${{ matrix.repo }}
+          ref: dev
+          token: ${{ steps.app-token.outputs.token }}
+          path: target
+
+      # The same Python and tooling as security.yml's dependency audit.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Re-lock vulnerable dependencies
+        id: fix
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip pip-audit
+          python fleet/scripts/fix-vulnerable-deps.py target
+          cat fix-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or refresh the pull request
+        if: steps.fix.outputs.changed == 'true'
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPO: ${{ env.ORG }}/${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          subject=$(cat ../fix-subject.txt)
+
+          # The branch is always one commit on top of dev. If it already is
+          # that commit, with this lock, there is nothing to push.
+          if git fetch --depth=2 origin "$BRANCH" 2>/dev/null \
+             && [ "$(git rev-parse FETCH_HEAD~1)" = "$(git rev-parse HEAD)" ] \
+             && git diff --quiet FETCH_HEAD -- uv.lock; then
+            echo "$BRANCH already carries this fix on top of dev; leaving it."
+          else
+            id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+            git config user.name "${SLUG}[bot]"
+            git config user.email "${id}+${SLUG}[bot]@users.noreply.github.com"
+            git switch -c "$BRANCH"
+            git add uv.lock
+            { echo "$subject"; echo; cat ../fix-body.md; } > ../commit-msg.txt
+            git commit -q -F ../commit-msg.txt
+            git push --force origin "$BRANCH"
+          fi
+
+          pr=$(gh pr list -R "$REPO" --head "$BRANCH" --base dev --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" -R "$REPO" --title "$subject" --body-file ../fix-body.md
+            echo "Refreshed #$pr."
+          else
+            gh pr create -R "$REPO" --base dev --head "$BRANCH" --title "$subject" --body-file ../fix-body.md
+          fi
+
+      - name: Close a pull request dev no longer needs
+        if: steps.fix.outputs.changed != 'true' && steps.fix.outputs.remaining == '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ env.ORG }}/${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list -R "$REPO" --head "$BRANCH" --base dev --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr close "$pr" -R "$REPO" --delete-branch \
+              --comment "dev's dependency audit is clean without this; closing."
+          fi
+
+      - name: Fail on advisories re-locking could not clear
+        if: steps.fix.outputs.remaining != '0'
+        env:
+          REMAINING: ${{ steps.fix.outputs.remaining }}
+        run: |
+          echo "::error::${REMAINING} advisory(ies) in ${{ matrix.repo }} could not be cleared by re-locking; see the job summary."
+          exit 1
