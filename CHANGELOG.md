@@ -1,3 +1,10 @@
+# [3.10.0](https://github.com/mini-app-polis/.github/compare/v3.9.0...v3.10.0) (2026-09-30)
+
+
+### Features
+
+* **dependency-fix:** re-lock vulnerable dependencies across the fleet ([e4fe4fb](https://github.com/mini-app-polis/.github/commit/e4fe4fb3aaaebef8261f4596a9809742c6336b02))
+
 # [3.9.0](https://github.com/mini-app-polis/.github/compare/v3.8.1...v3.9.0) (2026-09-28)
 
 
