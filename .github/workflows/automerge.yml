@@ -166,4 +166,4 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR: ${{ steps.decide.outputs.pr }}
           SHA: ${{ github.event.workflow_run.head_sha }}
-        run: gh pr merge "$PR" -R "$GITHUB_REPOSITORY" --merge --match-head-commit "$SHA"
+        run: gh pr merge "$PR" -R "$GITHUB_REPOSITORY" --merge --match-head-commit "$SHA" --delete-branch
