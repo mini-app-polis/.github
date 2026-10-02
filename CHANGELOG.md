@@ -1,3 +1,10 @@
+## [3.10.1](https://github.com/mini-app-polis/.github/compare/v3.10.0...v3.10.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* deleting branches from automerge into dev ([fd97927](https://github.com/mini-app-polis/.github/commit/fd97927143022e901ed7d3e09d1978dd94713e01))
+
 # [3.10.0](https://github.com/mini-app-polis/.github/compare/v3.9.0...v3.10.0) (2026-09-30)
 
 
