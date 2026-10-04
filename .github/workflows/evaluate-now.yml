@@ -1,0 +1,67 @@
+# Ask for an evaluation by hand: the whole fleet, one repository, or an LLM
+# pass. Run it from the Actions tab (Run workflow).
+#
+# Evaluation is release-triggered (evaluate.yml), which is right for the
+# normal case and leaves three gaps this closes:
+#   - a change that does not cut a release (a `test:` or `docs:` commit)
+#     never gets evaluated, so its findings stay stale on Pipeline Health;
+#   - there was no way to re-grade everything except releasing
+#     ecosystem-standards or evaluator-cog;
+#   - the LLM pass only runs when something asks for mode=llm, and no
+#     release does — it is the expensive engine, never a release default.
+#
+# No request of its own: it calls evaluate.yml, the one sanctioned call from
+# a workflow to the evaluation routes (ecosystem-standards CD-006), so the
+# User-Agent, retries and partial-fan-out reporting are the same code.
+# Deliberately not scheduled: a scheduled run starting work is what CD-006
+# forbids, and a timed LLM pass is a spending decision, not a default.
+#
+# Needs the organisation secret CI_VALIDATOR_API_KEY to be available to this
+# repository, as it is to every repository that calls evaluate.yml.
+
+name: evaluate-now
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "fleet — every repository plus the fleet-wide checks; repo — the one named below"
+        type: choice
+        options: [fleet, repo]
+        default: fleet
+      repo:
+        description: "Repository name, without the org (scope: repo only)"
+        type: string
+        default: ""
+      mode:
+        description: "deterministic — free, the release default; llm — the judged rules, costs tokens"
+        type: choice
+        options: [deterministic, llm]
+        default: deterministic
+
+permissions:
+  contents: read
+
+jobs:
+  # Without a repo, evaluate.yml would default to the calling repository —
+  # this one — and quietly grade .github instead of failing.
+  check-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: A repo scope names a repository
+        if: ${{ inputs.scope == 'repo' && inputs.repo == '' }}
+        run: |
+          echo "FATAL: scope is 'repo' but no repository was named." >&2
+          exit 1
+      - run: echo "Requesting ${{ inputs.scope }}${{ inputs.repo && format(' {0}', inputs.repo) || '' }} (${{ inputs.mode }})"
+
+  evaluate:
+    needs: check-inputs
+    uses: ./.github/workflows/evaluate.yml
+    with:
+      scope: ${{ inputs.scope }}
+      repo: ${{ inputs.repo }}
+      ref: main
+      mode: ${{ inputs.mode }}
+    secrets:
+      api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}

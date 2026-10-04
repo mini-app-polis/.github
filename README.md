@@ -14,6 +14,11 @@ Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
 pull request open whenever `dev` has something to release, and
 `automerge.yml` merges a pull request into `dev` once all its checks pass.
 
+`evaluate-now.yml` is run by hand from the Actions tab: a fleet pass, one
+repository, or an LLM pass, for changes that do not cut a release and for
+re-grading everything at once. It calls `evaluate.yml`, so it sends the same
+request a release would.
+
 ## Shared security workflow
 
 `.github/workflows/security.yml` is a reusable workflow that runs four
