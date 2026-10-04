@@ -1,3 +1,10 @@
+# [3.11.0](https://github.com/mini-app-polis/.github/compare/v3.10.1...v3.11.0) (2026-10-04)
+
+
+### Features
+
+* evaluate-now workflow for hand-triggered fleet, repo and LLM passes ([44d4864](https://github.com/mini-app-polis/.github/commit/44d486410d1c065a38573db105ad1ba007da5ddf))
+
 ## [3.10.1](https://github.com/mini-app-polis/.github/compare/v3.10.0...v3.10.1) (2026-10-02)
 
 
