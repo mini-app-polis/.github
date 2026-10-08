@@ -1,3 +1,11 @@
+# [3.12.0](https://github.com/mini-app-polis/.github/compare/v3.11.0...v3.12.0) (2026-10-08)
+
+
+### Features
+
+* **commons-update:** bump fleet consumers when a commons library is released ([e05e46b](https://github.com/mini-app-polis/.github/commit/e05e46bc6099aaeb6b8d5bdf77449933813804b0))
+* **commons-update:** bump fleet consumers when a commons library is released ([41a9310](https://github.com/mini-app-polis/.github/commit/41a9310a6623727a03b68c765252bf71b8b64ee9))
+
 # [3.11.0](https://github.com/mini-app-polis/.github/compare/v3.10.1...v3.11.0) (2026-10-04)
 
 
