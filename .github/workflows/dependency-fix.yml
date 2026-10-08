@@ -168,6 +168,9 @@ jobs:
           python fleet/scripts/fix-vulnerable-deps.py target
           cat fix-report.md >> "$GITHUB_STEP_SUMMARY"
 
+      # The branch is always one commit on top of dev; if it already is that
+      # commit, with this lock, nothing is pushed. Shared with
+      # commons-update.yml.
       - name: Open or refresh the pull request
         if: steps.fix.outputs.changed == 'true'
         working-directory: target
@@ -175,34 +178,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SLUG: ${{ steps.app-token.outputs.app-slug }}
           REPO: ${{ env.ORG }}/${{ matrix.repo }}
-        run: |
-          set -euo pipefail
-          subject=$(cat ../fix-subject.txt)
-
-          # The branch is always one commit on top of dev. If it already is
-          # that commit, with this lock, there is nothing to push.
-          if git fetch --depth=2 origin "$BRANCH" 2>/dev/null \
-             && [ "$(git rev-parse FETCH_HEAD~1)" = "$(git rev-parse HEAD)" ] \
-             && git diff --quiet FETCH_HEAD -- uv.lock; then
-            echo "$BRANCH already carries this fix on top of dev; leaving it."
-          else
-            id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
-            git config user.name "${SLUG}[bot]"
-            git config user.email "${id}+${SLUG}[bot]@users.noreply.github.com"
-            git switch -c "$BRANCH"
-            git add uv.lock
-            { echo "$subject"; echo; cat ../fix-body.md; } > ../commit-msg.txt
-            git commit -q -F ../commit-msg.txt
-            git push --force origin "$BRANCH"
-          fi
-
-          pr=$(gh pr list -R "$REPO" --head "$BRANCH" --base dev --state open --json number --jq '.[0].number // empty')
-          if [ -n "$pr" ]; then
-            gh pr edit "$pr" -R "$REPO" --title "$subject" --body-file ../fix-body.md
-            echo "Refreshed #$pr."
-          else
-            gh pr create -R "$REPO" --base dev --head "$BRANCH" --title "$subject" --body-file ../fix-body.md
-          fi
+        run: bash ../fleet/scripts/open-lock-pr.sh "$REPO" "$BRANCH" ../fix-subject.txt ../fix-body.md
 
       - name: Close a pull request dev no longer needs
         if: steps.fix.outputs.changed != 'true' && steps.fix.outputs.remaining == '0'

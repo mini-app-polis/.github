@@ -1,0 +1,285 @@
+# Moves the fleet onto a new release of its own libraries the day it ships.
+#
+# common-python-utils (miniapppolis-common-utils) and identity
+# (miniapppolis-identity) publish to PyPI from their release jobs. Every
+# consumer declares a range — `miniapppolis-common-utils>=5,<6` — and its
+# uv.lock decides which release it actually runs, so a new release reaches
+# nobody until each consumer re-locks. Dependabot did that on a daily
+# schedule: up to a day late, and on days with no release it only spent a
+# run finding nothing. The release itself is the event that matters, so the
+# release says so instead.
+#
+#   1. trigger — the library's release job, once semantic-release has
+#      published a new version in that run, sends a `commons-released`
+#      repository_dispatch here with the package and version. By hand, run it
+#      from the Actions tab with a package, and optionally a version (empty
+#      means PyPI's latest) and one repository.
+#   2. wait — `uv publish` returns when PyPI accepts the upload, and the
+#      simple index uv reads can lag it. Re-locking inside that window
+#      resolves the previous release and quietly does nothing, so discovery
+#      first polls the index until it lists a file for the version (15
+#      minutes at most, then the run fails and says so).
+#   3. discover — as dependency-fix.yml does: every repository the promote
+#      App is installed on, not archived, with a uv.lock on `dev`, kept only
+#      if that lock resolves the package from PyPI. The library's own repo
+#      locks itself as an editable source, so it is never its own consumer.
+#   4. bump, per repository — check out `dev`, run
+#      `uv lock --upgrade-package <package>==<version>` (that one package
+#      only), and refuse the result if uv rewrote anything beyond it: the
+#      lock's header, or another package's markers or sources at an
+#      unchanged version, which a different uv can do. Packages the new
+#      release adds, drops or moves within its own ranges are expected, and
+#      listed in the pull request. Then `uv lock --check`, and one
+#      `fix(deps): bump <package> to <version>` pull request into `dev` from
+#      `commons-update/<package>` — `fix(deps)`, as Dependabot used, so the
+#      consumer cuts a patch release once it reaches `main`. automerge.yml
+#      merges it once CI is green.
+#
+# Nothing happens in a repository already at the version or past it, and a
+# leftover pull request from an older release is closed there. A slow run
+# for an older release never overwrites a branch that already carries a
+# newer one; one concurrency group per package and repository keeps two
+# quick releases from racing on the same branch.
+#
+# A release outside a consumer's declared range — a new major — does not
+# resolve, and is not something a re-lock can fix: the job warns and opens
+# nothing, and the range is a person's to widen. A job fails only when the
+# index never served the version, or uv rewrote more than the package.
+#
+# Event-driven only. There is deliberately no schedule: a day with no release
+# has nothing to do. A release whose dispatch did not land is recovered by
+# running this by hand with that package and version.
+#
+# Runs as the promote App (the org secrets dependency-fix, promote and
+# automerge use): GITHUB_TOKEN cannot reach other repositories, and a push
+# made with it starts no workflows, so the pull request would never get the
+# CI run automerge waits for. The App needs Contents and Pull requests read
+# and write on every fleet repository, and the two org secrets must be
+# visible to this repository. The libraries' release jobs mint a token from
+# the same App for this repository (Contents: write, which
+# repository_dispatch requires), so the App must be installed on .github too.
+
+name: commons-update
+run-name: commons-update ${{ github.event.client_payload.package || inputs.package }} ${{ github.event.client_payload.version || inputs.version || 'latest' }}
+
+on:
+  repository_dispatch:
+    types: [commons-released]
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "The library whose release to roll out."
+        type: choice
+        options: [miniapppolis-common-utils, miniapppolis-identity]
+        default: miniapppolis-common-utils
+      version:
+        description: "Version to move to. Empty takes PyPI's latest."
+        type: string
+        default: ""
+      repository:
+        description: "Only this repository (name, without the org). Empty runs every consumer."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  ORG: mini-app-polis
+  # The libraries this may roll out. A dispatch naming anything else fails.
+  PACKAGES: miniapppolis-common-utils miniapppolis-identity
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      package: ${{ steps.resolve.outputs.package }}
+      version: ${{ steps.resolve.outputs.version }}
+      trigger: ${{ steps.trigger.outputs.trigger }}
+      repos: ${{ steps.list.outputs.repos }}
+    steps:
+      # This repository, for the script.
+      - uses: actions/checkout@v7
+        with:
+          path: fleet
+
+      - name: Check the package
+        env:
+          PKG: ${{ github.event.client_payload.package || inputs.package }}
+        run: |
+          case " $PACKAGES " in
+            *" $PKG "*) echo "Rolling out $PKG." ;;
+            *) echo "::error::'$PKG' is not one of this fleet's libraries ($PACKAGES)."; exit 1 ;;
+          esac
+
+      - name: Wait for PyPI to serve the release
+        id: resolve
+        env:
+          PKG: ${{ github.event.client_payload.package || inputs.package }}
+          VERSION: ${{ github.event.client_payload.version || inputs.version }}
+        run: python3 fleet/scripts/commons-update.py resolve "$PKG" "$VERSION"
+
+      # What the pull request says started it. The payload comes from a
+      # library's release job, but it is still checked before it is quoted.
+      - name: Describe the trigger
+        id: trigger
+        env:
+          PKG: ${{ steps.resolve.outputs.package }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SOURCE: ${{ github.event.client_payload.repository }}
+          SOURCE_RUN: ${{ github.event.client_payload.run_url }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ] \
+             && [[ "$SOURCE" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+             && [[ "$SOURCE_RUN" =~ ^https://github\.com/[A-Za-z0-9._/-]+$ ]]; then
+            trigger="the release of ${PKG} ${VERSION} by ${SOURCE} (${SOURCE_RUN}), rolled out by ${RUN}"
+          elif [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
+            trigger="a commons-released dispatch for ${PKG} ${VERSION}, rolled out by ${RUN}"
+          else
+            trigger="a manual run by ${GITHUB_ACTOR} for ${PKG} ${VERSION} (${RUN})"
+          fi
+          echo "trigger=$trigger" >> "$GITHUB_OUTPUT"
+          { echo "## commons-update: ${PKG} ${VERSION}"; echo; echo "Triggered by ${trigger}."; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require the promote App's credentials
+        env:
+          CLIENT_ID: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+            echo "::error::PROMOTE_APP_CLIENT_ID and PROMOTE_APP_PRIVATE_KEY must be org secrets visible to this repository."
+            exit 1
+          fi
+
+      # No `repositories` list: the token covers every repository the App
+      # is installed on, which is exactly the set it could update.
+      - name: Mint an App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+          permission-contents: read
+
+      - name: List repositories whose dev lock uses the package
+        id: list
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PKG: ${{ steps.resolve.outputs.package }}
+          ONLY: ${{ inputs.repository }}
+        run: |
+          set -euo pipefail
+          repos=()
+          while read -r name; do
+            [ -n "$ONLY" ] && [ "$name" != "$ONLY" ] && continue
+            if gh api -H "Accept: application/vnd.github.raw+json" \
+                 "repos/${ORG}/${name}/contents/uv.lock?ref=dev" 2>/dev/null \
+               | python3 fleet/scripts/commons-update.py consumes "$PKG" -; then
+              repos+=("$name")
+            fi
+          done < <(gh api --paginate /installation/repositories \
+                     --jq '.repositories[] | select(.archived | not) | .name')
+          echo "Consumers of ${PKG}: ${repos[*]:-none}"
+          { echo; echo "Consumers: ${repos[*]:-none}"; } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$ONLY" ] && [ "${#repos[@]}" -eq 0 ]; then
+            echo "::error::${ORG}/${ONLY} has no uv.lock on dev that resolves ${PKG} from PyPI, or the App is not installed on it."
+            exit 1
+          fi
+          printf '%s\n' "${repos[@]}" | jq -Rnc '[inputs | select(length > 0)]' > repos.json
+          echo "repos=$(cat repos.json)" >> "$GITHUB_OUTPUT"
+
+  bump:
+    needs: discover
+    if: needs.discover.outputs.repos != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Two quick releases of one package must not race on one branch. The
+    # later run waits; the bump itself refuses to replace a newer version
+    # already on the branch, whichever run gets there first.
+    concurrency:
+      group: commons-update-${{ needs.discover.outputs.package }}-${{ matrix.repo }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        repo: ${{ fromJSON(needs.discover.outputs.repos) }}
+    env:
+      PKG: ${{ needs.discover.outputs.package }}
+      VERSION: ${{ needs.discover.outputs.version }}
+      BRANCH: commons-update/${{ needs.discover.outputs.package }}
+    steps:
+      # This repository, for the scripts.
+      - uses: actions/checkout@v7
+        with:
+          path: fleet
+
+      - name: Mint an App token for ${{ matrix.repo }}
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ORG }}/${{ matrix.repo }}
+          ref: dev
+          token: ${{ steps.app-token.outputs.token }}
+          path: target
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Re-lock ${{ needs.discover.outputs.package }}
+        id: bump
+        env:
+          TRIGGER: ${{ needs.discover.outputs.trigger }}
+        run: |
+          set -euo pipefail
+          # The update branch's lock, if there is one, so an older release
+          # never replaces a newer one already waiting there.
+          rm -f branch-uv.lock
+          if git -C target fetch --depth=1 origin "$BRANCH" 2>/dev/null; then
+            git -C target show FETCH_HEAD:uv.lock > branch-uv.lock 2>/dev/null || rm -f branch-uv.lock
+          fi
+          rc=0
+          python fleet/scripts/commons-update.py bump target "$PKG" "$VERSION" \
+            --branch-lock branch-uv.lock || rc=$?
+          cat commons-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Open or refresh the pull request
+        if: steps.bump.outputs.changed == 'true'
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPO: ${{ env.ORG }}/${{ matrix.repo }}
+        run: bash ../fleet/scripts/open-lock-pr.sh "$REPO" "$BRANCH" ../commons-subject.txt ../commons-body.md
+
+      - name: Close a pull request dev no longer needs
+        if: steps.bump.outputs.close_stale == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ env.ORG }}/${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list -R "$REPO" --head "$BRANCH" --base dev --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr close "$pr" -R "$REPO" --delete-branch \
+              --comment "dev already has ${PKG} ${VERSION} or newer; closing."
+          fi

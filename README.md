@@ -14,6 +14,11 @@ Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
 pull request open whenever `dev` has something to release, and
 `automerge.yml` merges a pull request into `dev` once all its checks pass.
 
+Two run from here over the whole fleet and open pull requests into other
+repositories' `dev`: `dependency-fix.yml` re-locks packages the dependency
+audit flags, and `commons-update.yml` re-locks a consumer onto a new
+release of the fleet's own libraries the day it is published.
+
 `evaluate-now.yml` is run by hand from the Actions tab: a fleet pass, one
 repository, or an LLM pass, for changes that do not cut a release and for
 re-grading everything at once. It calls `evaluate.yml`, so it sends the same
@@ -296,6 +301,83 @@ jobs:
   secrets.
 - **Runs from `main`'s copy** of the consumer's file, like every
   `workflow_run` workflow, so it starts working after the first promotion.
+
+## Fleet-wide re-locks
+
+Two workflows here are not called by anything. They run in this repository,
+find every repository the promote App is installed on that has a `uv.lock`
+on `dev`, and re-lock each one, opening one `fix(deps)` pull request into
+`dev` per repository. `automerge.yml` merges it once CI is green, and it
+reaches `main` through the promotion pull request like anything else.
+Both open or refresh their pull request with `scripts/open-lock-pr.sh`: the
+branch is one commit on top of `dev`, and is left alone, not re-pushed, when
+it already carries the same lock on the current `dev`.
+
+| Workflow | Trigger | Re-locks | Branch |
+|---|---|---|---|
+| `dependency-fix.yml` | every four hours, or by hand | each package the dependency audit (SEC-003) flags, to the smallest version that clears it | `security-fix/deps` |
+| `commons-update.yml` | a `commons-released` repository_dispatch from a library's release job, or by hand | one fleet library, to the version just released | `commons-update/<package>` |
+
+### commons-update
+
+common-python-utils (`miniapppolis-common-utils`) and identity
+(`miniapppolis-identity`) dispatch `commons-released` from their release jobs
+once semantic-release has published a new version in that run — a
+semantic-release tag on the release commit, after a release step that only
+succeeds once `uv publish` has. The payload is the package, the version, the
+releasing repository and its run URL. There is no schedule: Dependabot's
+daily check for these two packages is what this replaces.
+
+For that package and version it:
+
+1. **Waits for PyPI.** `uv publish` returns when the upload is accepted;
+   the simple index uv reads can lag it. The run polls the index until it
+   lists a file for the version, for up to 15 minutes, and fails if it never
+   does. Without a version (by hand), it takes PyPI's latest.
+2. **Finds the consumers**: repositories whose `dev` uv.lock resolves the
+   package from PyPI. A library locks itself as an editable source, so it is
+   never its own consumer.
+3. **Bumps each one** with `uv lock --upgrade-package <package>==<version>`
+   — that package only — then `uv lock --check`. The pull request is
+   `fix(deps): bump <package> to <version>`, so the consumer cuts a patch
+   release, as it did under Dependabot.
+
+What it will not do, by design:
+
+- **Propose a lock uv rewrote beyond the package.** Packages the new release
+  adds, drops or moves within its own ranges are expected and listed in the
+  pull request. A change to the lock's header, or to another package's
+  markers or sources at an unchanged version, fails the job instead. That is
+  a different uv writing the lock differently, and belongs in its own
+  commit, not inside a dependency bump.
+- **Cross a declared range.** A release a consumer's ranges exclude — a new
+  major against `<6` — does not resolve. The job warns and opens nothing;
+  widening the range is a person's change.
+- **Go backwards.** A repository already at the version or past it gets
+  nothing, and a leftover pull request from an older release is closed. A
+  run for an older release never overwrites a branch that already carries a
+  newer one, and one concurrency group per package and repository keeps two
+  quick releases from racing on the same branch.
+
+By hand, from the Actions tab: pick the package, and optionally a version
+and one repository. This is also how a release whose dispatch failed is
+finished — the library's release job says so, with the version, when it
+cannot send the dispatch.
+
+### What both need
+
+- The **promote App**, installed on every fleet repository with Contents
+  and Pull requests read and write. The pull requests are opened and
+  pushed as the App because a push made with `GITHUB_TOKEN` starts no
+  workflows, so the pull request would never get the CI automerge waits on.
+- For `commons-update`, the App also installed on **this** repository with
+  Contents: write: the libraries' release jobs mint a token for `.github`
+  to send the dispatch, and `repository_dispatch` requires Contents: write.
+- The org secrets `PROMOTE_APP_CLIENT_ID` and `PROMOTE_APP_PRIVATE_KEY`,
+  visible to this repository and to common-python-utils and identity.
+
+A new consumer needs nothing added to it: it is covered once the App is
+installed on it and its `dev` lock resolves the package.
 
 ## Versioning
 
