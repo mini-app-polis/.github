@@ -315,7 +315,7 @@ it already carries the same lock on the current `dev`.
 
 | Workflow | Trigger | Re-locks | Branch |
 |---|---|---|---|
-| `dependency-fix.yml` | every four hours, or by hand | each package the dependency audit (SEC-003) flags, to the smallest version that clears it | `security-fix/deps` |
+| `dependency-fix.yml` | once a day (10:23 UTC), or by hand | each package the dependency audit (SEC-003) flags, to the smallest version that clears it | `security-fix/deps` |
 | `commons-update.yml` | a `commons-released` repository_dispatch from a library's release job, or by hand | one fleet library, to the version just released | `commons-update/<package>` |
 
 ### commons-update

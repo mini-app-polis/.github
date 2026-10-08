@@ -36,7 +36,7 @@
 # When `dev` is already clean the job opens nothing, and closes a leftover
 # pull request from an earlier run. When the branch already holds the same
 # fix on top of the current `dev`, it is left alone rather than re-pushed,
-# so an unmerged fix does not restart CI every four hours.
+# so an unmerged fix does not restart CI every day.
 #
 # Runs as the promote App (the org secrets promote.yml and automerge.yml
 # use), for two reasons: GITHUB_TOKEN cannot reach other repositories, and a
@@ -49,7 +49,8 @@ name: dependency-fix
 
 on:
   schedule:
-    - cron: "23 */4 * * *"
+    # Once a day, 10:23 UTC (early morning in Chicago).
+    - cron: "23 10 * * *"
   workflow_dispatch:
     inputs:
       repository:
