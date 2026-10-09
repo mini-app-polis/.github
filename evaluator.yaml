@@ -8,5 +8,7 @@
 type: shared-workflows
 
 exemptions:
+  - rule: CD-034
+    reason: "This repo is where promote.yml and automerge.yml are defined, and it has no dev branch to promote from. It has no deploy and no release train, only workflow definitions that consumers pin, so changes go to main by pull request, where ci.yml runs. A dev branch here would be one only to exercise the pattern, not because anything is promoted."
   - rule: DOC-004
     reason: "This repo contains GitHub Actions workflow definitions and nothing else — no source, no runtime, no process that reads environment variables. DOC-004's .env.example requirement presumes a deployable service. The shared workflow's own inputs are documented in README.md and declared in its workflow_call block, which is where a consumer looks for them."
