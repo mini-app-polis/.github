@@ -160,6 +160,12 @@ jobs:
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
+        with:
+          # The target's own `[tool.uv] required-version`, so the re-lock is
+          # written by the uv its lock is pinned to. setup-uv looks in the
+          # workspace root by default, and nothing is checked out there:
+          # this repository is at fleet/ and the target at target/.
+          version-file: target/pyproject.toml
 
       - name: Re-lock vulnerable dependencies
         id: fix

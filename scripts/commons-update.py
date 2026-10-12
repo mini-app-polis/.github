@@ -231,11 +231,46 @@ def lock_changes(
     return effects, problems
 
 
-def uv(args: list[str], repo: Path) -> subprocess.CompletedProcess[str]:
+def uv(
+    args: list[str], repo: Path, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
     print("+ uv " + " ".join(args), file=sys.stderr)
     return subprocess.run(
-        ["uv", *args], cwd=repo, text=True, capture_output=True, check=False
+        ["uv", *args],
+        cwd=repo,
+        input=stdin,
+        text=True,
+        capture_output=True,
+        check=False,
     )
+
+
+def uv_serves(pin: str, package: str, repo: Path) -> bool:
+    """True when uv itself can find exactly this pin on the index.
+
+    A failed re-lock only names a missing version as "no version of <pin>"
+    when the project depends on the package plainly. With an extra
+    (`miniapppolis-common-utils[llm]`) uv reports the same miss as a
+    conflict between the declared range and the pin, which reads exactly
+    like a range that excludes the release. So the error text cannot tell a
+    stale CDN edge from a real block; this asks the question on its own,
+    through the same client and index, without the project's ranges.
+    """
+    proc = uv(
+        [
+            "pip",
+            "compile",
+            "-",
+            "--no-deps",
+            "--quiet",
+            "--no-header",
+            "--refresh-package",
+            package,
+        ],
+        repo,
+        stdin=pin + "\n",
+    )
+    return proc.returncode == 0
 
 
 def cmd_bump(args: argparse.Namespace) -> int:
@@ -283,12 +318,15 @@ def cmd_bump(args: argparse.Namespace) -> int:
             )
         else:
             pin = f"{package}=={version}"
+            unserved = False
             for attempt in range(1, args.attempts + 1):
                 proc = uv(["lock", "--upgrade-package", pin], repo)
-                # uv wraps its messages to the terminal width.
-                unserved = f"no version of {pin}" in " ".join(proc.stderr.split())
                 if proc.returncode == 0:
                     break
+                # uv wraps its messages to the terminal width.
+                unserved = f"no version of {pin}" in " ".join(
+                    proc.stderr.split()
+                ) or not uv_serves(pin, package, repo)
                 # The index was confirmed before this job started, but each
                 # runner reaches PyPI's CDN on its own; give a stale edge a
                 # moment. Any other resolution failure will not improve.
@@ -353,8 +391,10 @@ def cmd_bump(args: argparse.Namespace) -> int:
                         "",
                         (
                             "This is usually a uv version that writes the lock "
-                            "differently from the one that last wrote it. "
-                            "Re-lock `dev` with the current uv on its own first."
+                            "differently from the one that last wrote it: the "
+                            "lock was written by a uv other than the one "
+                            "`[tool.uv] required-version` pins. Re-lock `dev` "
+                            "with the pinned uv on its own first."
                         ),
                     ]
                     print(
