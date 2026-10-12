@@ -1,3 +1,10 @@
+## [3.12.1](https://github.com/mini-app-polis/.github/compare/v3.12.0...v3.12.1) (2026-10-12)
+
+
+### Bug Fixes
+
+* **commons-update:** use each repo's pinned uv and retry unpublished versions whatever the extras ([b7c7903](https://github.com/mini-app-polis/.github/commit/b7c7903d397d8d0a4f7cdc184ac896dabd8332f9))
+
 # [3.12.0](https://github.com/mini-app-polis/.github/compare/v3.11.0...v3.12.0) (2026-10-08)
 
 
