@@ -5,11 +5,16 @@ commons-update.yml runs this in three places:
 
   resolve <package> [<version>]
       Before anything is checked out. Without a version, takes the latest
-      PyPI reports. Then waits until PyPI's simple index — the API uv reads
-      — lists a file for that version. `uv publish` returns when the upload
-      is accepted, and the index can lag it by a minute or more; a
-      consumer re-locked inside that window resolves the previous release
-      and the update silently does nothing.
+      PyPI reports. Then waits until PyPI serves that version to an
+      ordinary client on both APIs the fleet's builds read: the simple index
+      (uv) and the version's JSON (pip-audit, in security.yml). `uv publish`
+      returns when the upload is accepted, and PyPI's CDN can lag it by
+      minutes. A consumer re-locked inside that window resolves the previous
+      release, and a pull request opened inside it fails its dependency
+      audit with the version "not found on PyPI". The checks are made
+      without bypassing the CDN, so they see what a build sees, and then the
+      run waits a further settle period (--settle) for edges the runner did
+      not happen to hit.
 
   consumes <package> <uv.lock | ->
       During discovery. Exits 0 when the lock resolves the package from a
@@ -94,10 +99,15 @@ def output(**values: str) -> None:
             fh.writelines(f"{k}={v}\n" for k, v in values.items())
 
 
-def fetch_json(url: str, accept: str = "application/json") -> dict | None:
-    req = urllib.request.Request(
-        url, headers={"Accept": accept, "Cache-Control": "no-cache"}
-    )
+def fetch_json(
+    url: str, accept: str = "application/json", *, fresh: bool = True
+) -> dict | None:
+    """GET JSON, or None. ``fresh`` asks the CDN to revalidate; pass False to
+    see the response an ordinary client (uv, pip-audit) would get."""
+    headers = {"Accept": accept}
+    if fresh:
+        headers["Cache-Control"] = "no-cache"
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.load(resp)
@@ -114,9 +124,19 @@ def fetch_json(url: str, accept: str = "application/json") -> dict | None:
 
 
 def served(package: str, version: str) -> bool:
-    """True when the simple index lists a non-yanked file for the version."""
+    """True when a build would find the version: its JSON resolves, and the
+    simple index lists a non-yanked file for it.
+
+    Both read as an ordinary client does, through PyPI's CDN cache. Asking
+    the CDN to revalidate (as this once did) sees a release minutes before
+    the builds that follow do, which is the window this exists to wait out.
+    """
+    if not fetch_json(f"{PYPI}/pypi/{package}/{version}/json", fresh=False):
+        return False
     index = fetch_json(
-        f"{PYPI}/simple/{package}/", accept="application/vnd.pypi.simple.v1+json"
+        f"{PYPI}/simple/{package}/",
+        accept="application/vnd.pypi.simple.v1+json",
+        fresh=False,
     )
     if not index:
         return False
@@ -147,14 +167,19 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     while not served(package, version):
         if time.monotonic() >= deadline:
             print(
-                f"::error::PyPI's simple index still lists no file for {package} "
-                f"{version} after {args.timeout}s. If the release's upload failed, "
+                f"::error::PyPI still does not serve {package} {version} to an "
+                f"ordinary client after {args.timeout}s. If the release's upload failed, "
                 "there is nothing to update; otherwise run this again by hand."
             )
             return 1
-        print(f"{package} {version} not on the simple index yet; waiting.")
+        print(f"{package} {version} not served by PyPI yet; waiting.")
         time.sleep(args.interval)
     print(f"PyPI serves {package} {version}.")
+    if args.settle > 0:
+        # The check above saw one CDN edge. The consumers' CI, minutes later
+        # and on other runners, may hit edges that have not caught up.
+        print(f"Waiting {args.settle}s more for PyPI's CDN to settle.")
+        time.sleep(args.settle)
     output(package=package, version=version)
     return 0
 
@@ -445,6 +470,12 @@ def main() -> int:
     r.add_argument("version", nargs="?", default="")
     r.add_argument("--timeout", type=int, default=900)
     r.add_argument("--interval", type=int, default=20)
+    r.add_argument(
+        "--settle",
+        type=int,
+        default=180,
+        help="Seconds to wait after PyPI first serves the version.",
+    )
     r.set_defaults(func=cmd_resolve)
 
     c = sub.add_parser("consumes")

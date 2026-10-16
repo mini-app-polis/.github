@@ -14,11 +14,15 @@
 #      repository_dispatch here with the package and version. By hand, run it
 #      from the Actions tab with a package, and optionally a version (empty
 #      means PyPI's latest) and one repository.
-#   2. wait — `uv publish` returns when PyPI accepts the upload, and the
-#      simple index uv reads can lag it. Re-locking inside that window
-#      resolves the previous release and quietly does nothing, so discovery
-#      first polls the index until it lists a file for the version (15
-#      minutes at most, then the run fails and says so).
+#   2. wait — `uv publish` returns when PyPI accepts the upload, and PyPI's
+#      CDN can lag it by minutes. Re-locking inside that window resolves the
+#      previous release and quietly does nothing; a pull request opened
+#      inside it fails its dependency audit (pip-audit: "not found on
+#      PyPI"). So discovery first polls, as an ordinary client through the
+#      CDN, until both the simple index (uv) and the version's JSON
+#      (pip-audit) serve the version (15 minutes at most, then the run fails
+#      and says so), then waits SETTLE_SECONDS more for CDN edges the
+#      runner did not hit.
 #   3. discover — as dependency-fix.yml does: every repository the promote
 #      App is installed on, not archived, with a uv.lock on `dev`, kept only
 #      if that lock resolves the package from PyPI. The library's own repo
@@ -88,6 +92,10 @@ env:
   ORG: mini-app-polis
   # The libraries this may roll out. A dispatch naming anything else fails.
   PACKAGES: miniapppolis-common-utils miniapppolis-identity
+  # After PyPI first serves a release, how long to wait before any consumer
+  # re-locks and opens a pull request. Raise it if PRs still fail their
+  # dependency audit with the new version "not found on PyPI".
+  SETTLE_SECONDS: "180"
 
 jobs:
   discover:
@@ -118,7 +126,7 @@ jobs:
         env:
           PKG: ${{ github.event.client_payload.package || inputs.package }}
           VERSION: ${{ github.event.client_payload.version || inputs.version }}
-        run: python3 fleet/scripts/commons-update.py resolve "$PKG" "$VERSION"
+        run: python3 fleet/scripts/commons-update.py resolve "$PKG" "$VERSION" --settle "$SETTLE_SECONDS"
 
       # What the pull request says started it. The payload comes from a
       # library's release job, but it is still checked before it is quoted.
