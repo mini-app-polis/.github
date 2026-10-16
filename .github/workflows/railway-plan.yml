@@ -1,0 +1,78 @@
+# The fleet's shared Railway Infrastructure-as-Code plan: evaluate a
+# repository's .railway/railway.ts, diff it against the live environment,
+# post the plan to the pull request as a comment, and pin it for
+# railway-apply.yml to apply on merge. Reading the plan is the review;
+# merging is the approval. Nothing is ever applied from a workstation.
+#
+# **Why this is shared.** db-ops carried the fleet's first pair (MINI-67);
+# MINI-69 brings api-kaianolevine-com, api-deejaytools and wiki-curator-cog
+# onto the same pattern. One file means the pinned action and CLI, the fork
+# guard and the SDK install are fixed once (MINI-70).
+#
+# **Which environment is planned is the token's choice.** A Railway project
+# token is scoped to one environment, so the caller passes the token for the
+# environment the target branch deploys to: a production token on pull
+# requests into main and, for a service that also runs in development, a
+# development token on pull requests into dev. Never an account or
+# workspace token. `environment` only names the run.
+#
+# The IaC SDK the CLI evaluates railway.ts with lives in .railway/ (its own
+# package.json and lockfile), not at the root of a Python repository, so it
+# is installed from there and the action's own install is turned off.
+#
+# Usage, from a repository's .github/workflows/railway-plan.yml:
+#
+#   on:
+#     pull_request:
+#       branches: [main]
+#       paths: [".railway/**"]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#   jobs:
+#     plan:
+#       uses: mini-app-polis/.github/.github/workflows/railway-plan.yml@v3
+#       secrets:
+#         railway-token: ${{ secrets.RAILWAY_TOKEN }}
+
+name: railway-plan
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "The Railway environment the token is scoped to. Names the run and its concurrency group; it does not select the environment."
+        type: string
+        default: "production"
+    secrets:
+      railway-token:
+        description: "A Railway project token scoped to the environment being planned. Never an account or workspace token."
+        required: true
+
+jobs:
+  plan:
+    # Fork pull requests get no secrets, and must not plan with ours.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: railway-config-plan-${{ inputs.environment }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install the Railway IaC SDK
+        run: npm ci --prefix .railway --no-audit --no-fund
+
+      - uses: railwayapp/config@v1.2.0
+        with:
+          command: plan
+          railway-token: ${{ secrets.railway-token }}
+          package-manager: none
+          cli-version: "5.68.0"

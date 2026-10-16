@@ -13,6 +13,8 @@ workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
 pull request open whenever `dev` has something to release, and
 `automerge.yml` merges a pull request into `dev` once all its checks pass.
+`railway-plan.yml` and `railway-apply.yml` plan a repository's Railway
+Infrastructure as Code on a pull request and apply that plan on merge.
 
 Two run from here over the whole fleet and open pull requests into other
 repositories' `dev`: `dependency-fix.yml` re-locks packages the dependency
@@ -239,6 +241,67 @@ first deploy passed that check and failed at import on Lambda (cryptography
 needing GLIBC_2.28, runtime has 2.26), and evaluator-cog had been shipping
 x86_64 builds of pydantic-core and cryptography to an arm64 function
 without tripping it only because nothing it ran imported them.
+
+## Shared Railway plan and apply
+
+`.github/workflows/railway-plan.yml` and `railway-apply.yml` drive a
+repository's Railway Infrastructure as Code (`.railway/railway.ts`). A pull
+request that changes `.railway/` gets the plan as a comment and pins it;
+merging the pull request applies exactly that plan, and fails if the
+environment or the tree moved since. Nothing is applied from a workstation.
+db-ops carried the first pair (MINI-67); they moved here when three more
+repositories took up the pattern (MINI-70).
+
+```yaml
+# .github/workflows/railway-plan.yml
+on:
+  pull_request:
+    branches: [main]
+    paths: [".railway/**"]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  plan:
+    uses: mini-app-polis/.github/.github/workflows/railway-plan.yml@v3
+    secrets:
+      railway-token: ${{ secrets.RAILWAY_TOKEN }}
+
+# .github/workflows/railway-apply.yml
+on:
+  push:
+    branches: [main]
+    paths: [".railway/**"]
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+jobs:
+  apply:
+    uses: mini-app-polis/.github/.github/workflows/railway-apply.yml@v3
+    secrets:
+      railway-token: ${{ secrets.RAILWAY_TOKEN }}
+```
+
+**The token picks the environment.** A Railway project token is scoped to
+one environment, and each repository keeps its own as a secret — never an
+account, workspace or org-wide token. A service that also runs in
+development adds a second job to each file, on the `dev` branch, passing a
+development-scoped token (`RAILWAY_TOKEN_DEVELOPMENT`) and
+`environment: development`, so a change is planned and applied in
+development before it is promoted to main.
+
+| Input | Workflow | Default | Meaning |
+|---|---|---|---|
+| `environment` | both | `production` | Names the run and its concurrency group. It does not choose the environment; the token does |
+| `blocked-window` | apply | *(none)* | `<DD> <HH>-<HH>` UTC, hours inclusive, in which the apply refuses to run. db-ops passes `"02 09-10"`, its drill window |
+| `blocked-window-reason` | apply | *(generic)* | Printed when the apply refuses |
+
+Pinned here, so a bump is one change for the fleet: `railwayapp/config`
+v1.2.0 and Railway CLI 5.68.0. The plan installs the IaC SDK from
+`.railway/package.json` (`npm ci --prefix .railway`) and turns the
+action's own install off, because a Python repository has no root
+`package.json`. Fork pull requests get no plan: they get no secrets.
 
 ## Shared dev → main promotion
 

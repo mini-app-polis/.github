@@ -1,0 +1,93 @@
+# The fleet's shared Railway Infrastructure-as-Code apply: when a pull request
+# lands, apply exactly the plan railway-plan.yml pinned on it. If the
+# environment changed since (a dashboard edit) or .railway/ is not the
+# planned tree, it fails and the pull request needs a fresh plan. A push
+# that did not come through a pull request has no plan and fails by design.
+#
+# As with the plan, the token decides the environment: a production project
+# token on pushes to main, a development one on pushes to dev for a service
+# that also runs there. Each caller keeps its own token as a repository
+# secret — never an org-wide one.
+#
+# **blocked-window** keeps an apply out of a time when a redeploy would do
+# harm. db-ops passes its drill window: applying a change to db-drill
+# redeploys it, which stops a running drill before it can delete its forks.
+# The format is `<day-of-month> <first-hour>-<last-hour>`, UTC, both hours
+# inclusive — "02 09-10" is 09:00 to 10:59 on the 2nd. Empty, the default,
+# blocks nothing; the APIs pass nothing.
+#
+# Usage, from a repository's .github/workflows/railway-apply.yml:
+#
+#   on:
+#     push:
+#       branches: [main]
+#       paths: [".railway/**"]
+#   permissions:
+#     contents: read
+#     actions: read
+#     pull-requests: read
+#   jobs:
+#     apply:
+#       uses: mini-app-polis/.github/.github/workflows/railway-apply.yml@v3
+#       secrets:
+#         railway-token: ${{ secrets.RAILWAY_TOKEN }}
+
+name: railway-apply
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "The Railway environment the token is scoped to. Names the run and its concurrency group; it does not select the environment."
+        type: string
+        default: "production"
+      blocked-window:
+        description: "`<day-of-month> <first-hour>-<last-hour>` in UTC during which the apply refuses to run, e.g. \"02 09-10\". Empty blocks nothing."
+        type: string
+        default: ""
+      blocked-window-reason:
+        description: "What the blocked window protects, printed when the apply refuses."
+        type: string
+        default: "a redeploy now would interrupt scheduled work"
+    secrets:
+      railway-token:
+        description: "A Railway project token scoped to the environment being applied. Never an account or workspace token."
+        required: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    # pull-requests: read lets the action find the merged pull request, and
+    # actions: read lets it download that pull request's plan.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    concurrency:
+      group: railway-config-apply-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Outside the blocked window
+        if: inputs.blocked-window != ''
+        env:
+          WINDOW: ${{ inputs.blocked-window }}
+          REASON: ${{ inputs.blocked-window-reason }}
+        run: |
+          if ! [[ "$WINDOW" =~ ^([0-9]{2})\ ([0-9]{2})-([0-9]{2})$ ]]; then
+            echo "::error::blocked-window '$WINDOW' is not '<DD> <HH>-<HH>'."
+            exit 1
+          fi
+          day=${BASH_REMATCH[1]} first=$((10#${BASH_REMATCH[2]})) last=$((10#${BASH_REMATCH[3]}))
+          hour=$((10#$(date -u +%H)))
+          if [ "$(date -u +%d)" = "$day" ] && [ "$hour" -ge "$first" ] && [ "$hour" -le "$last" ]; then
+            echo "::error::Inside the blocked window ($WINDOW UTC): $REASON. Re-run this job after $(printf '%02d' $((last + 1))):00 UTC."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - uses: railwayapp/config@v1.2.0
+        with:
+          command: apply
+          railway-token: ${{ secrets.railway-token }}
+          cli-version: "5.68.0"
