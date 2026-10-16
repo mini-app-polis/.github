@@ -1,3 +1,10 @@
+# [3.15.0](https://github.com/mini-app-polis/.github/compare/v3.14.0...v3.15.0) (2026-10-16)
+
+
+### Features
+
+* **railway:** fail the plan on unlabelled destroys, as infra does ([37c5888](https://github.com/mini-app-polis/.github/commit/37c58881eb41101129c40cf901bb3d9f100b2a67))
+
 # [3.14.0](https://github.com/mini-app-polis/.github/compare/v3.13.0...v3.14.0) (2026-10-16)
 
 
