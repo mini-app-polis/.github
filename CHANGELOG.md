@@ -1,3 +1,10 @@
+## [3.15.2](https://github.com/mini-app-polis/.github/compare/v3.15.1...v3.15.2) (2026-10-16)
+
+
+### Bug Fixes
+
+* **automerge:** wait for pending checks from outside Actions ([3b31c9b](https://github.com/mini-app-polis/.github/commit/3b31c9b37e468323307c867d44fa34a007b91c97))
+
 ## [3.15.1](https://github.com/mini-app-polis/.github/compare/v3.15.0...v3.15.1) (2026-10-16)
 
 
