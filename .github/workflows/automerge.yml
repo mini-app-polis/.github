@@ -14,8 +14,11 @@
 # when every check on the pull request's head commit has finished and none
 # failed or was cancelled. Another workflow still running means "not yet":
 # its own completion triggers this again, and the last one to finish is the
-# one that merges. `--match-head-commit` pins the merge to the commit that
-# was checked, so a push that lands mid-run is never merged untested.
+# one that merges. A check from outside Actions (Cloudflare Pages on the
+# sites) triggers nothing when it finishes, so a pending check is waited on,
+# polling for up to `pending-wait-seconds`, before the run gives up.
+# `--match-head-commit` pins the merge to the commit that was checked, so a
+# push that lands mid-run is never merged untested.
 #
 # Not merged: drafts, anything not based on `dev`, and any head branch
 # matching the `skip-branch-pattern` input (empty by default; set it to
@@ -66,6 +69,10 @@ on:
         description: "Extended regex; pull requests whose head branch matches are never auto-merged. Empty (the default) merges every green pull request."
         type: string
         default: ""
+      pending-wait-seconds:
+        description: "How long to keep polling while a check is still pending. Checks from outside Actions (e.g. Cloudflare Pages) never re-trigger this workflow, so without the wait a pull request whose last check is external is never merged."
+        type: number
+        default: 600
     secrets:
       PROMOTE_APP_CLIENT_ID:
         required: false
@@ -97,6 +104,7 @@ jobs:
           BASE: ${{ inputs.base }}
           SKIP: ${{ inputs.skip-branch-pattern }}
           SHA: ${{ github.event.workflow_run.head_sha }}
+          WAIT: ${{ inputs.pending-wait-seconds }}
         run: |
           set -euo pipefail
           merge=false
@@ -123,11 +131,21 @@ jobs:
           if [ -z "$reason" ]; then
             # gh exits non-zero while checks are pending or failing; the
             # buckets are what decide, so its status is ignored here.
-            buckets=$(gh pr checks "$pr" -R "$GITHUB_REPOSITORY" --json bucket --jq '.[].bucket' || true)
-            if   [ -z "$buckets" ];                          then reason="no checks reported yet"
-            elif grep -Eq '^(fail|cancel)$' <<<"$buckets";   then reason="a check failed or was cancelled"
-            elif grep -q '^pending$' <<<"$buckets";          then reason="checks still running; a later run will merge"
-            fi
+            # Pending is polled: an Actions check that finishes later starts
+            # its own run, but an external one (Cloudflare Pages) does not.
+            deadline=$(( $(date +%s) + WAIT ))
+            while :; do
+              buckets=$(gh pr checks "$pr" -R "$GITHUB_REPOSITORY" --json bucket --jq '.[].bucket' || true)
+              if   [ -z "$buckets" ];                          then reason="no checks reported yet"
+              elif grep -Eq '^(fail|cancel)$' <<<"$buckets";   then reason="a check failed or was cancelled"
+              elif grep -q '^pending$' <<<"$buckets"; then
+                if [ "$(date +%s)" -lt "$deadline" ]; then
+                  echo "Checks still pending on #$pr; waiting."; sleep 20; continue
+                fi
+                reason="checks still pending after ${WAIT}s"
+              fi
+              break
+            done
           fi
 
           if [ -n "$reason" ]; then

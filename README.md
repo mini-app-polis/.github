@@ -373,6 +373,10 @@ jobs:
   merge to `main` is the gate. Drafts and anything not based on `dev` are
   not merged, and a repository can hold back branches by pattern with the
   `skip-branch-pattern` input (e.g. `"/majors-"`).
+- **Waits for checks from outside Actions.** Cloudflare Pages reports a
+  check that triggers no workflow when it finishes, so a pending check is
+  polled for up to `pending-wait-seconds` (default 600) before the run
+  gives up.
 - **Merges as the promote App**, so the push to `dev` runs CI and refreshes
   the promotion pull request. The App needs Contents: read and write for
   this; `promote.yml` still mints a read-only token.
