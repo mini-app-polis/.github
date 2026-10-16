@@ -1,3 +1,10 @@
+# [3.13.0](https://github.com/mini-app-polis/.github/compare/v3.12.1...v3.13.0) (2026-10-16)
+
+
+### Features
+
+* **railway:** shared Railway IaC plan and apply workflows ([48ecae0](https://github.com/mini-app-polis/.github/commit/48ecae06361bb613d448d9fa1ff2b168670071d5))
+
 ## [3.12.1](https://github.com/mini-app-polis/.github/compare/v3.12.0...v3.12.1) (2026-10-12)
 
 
