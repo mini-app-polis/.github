@@ -1,3 +1,10 @@
+## [3.15.1](https://github.com/mini-app-polis/.github/compare/v3.15.0...v3.15.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* **commons-update:** wait until PyPI serves a release to ordinary clients, then settle ([afba163](https://github.com/mini-app-polis/.github/commit/afba163fb6b93d83cae55bedf8b3fdd9bccb645b))
+
 # [3.15.0](https://github.com/mini-app-polis/.github/compare/v3.14.0...v3.15.0) (2026-10-16)
 
 
