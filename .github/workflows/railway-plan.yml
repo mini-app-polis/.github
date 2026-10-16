@@ -4,10 +4,14 @@
 # review, and merging is the approval. It changes nothing.
 #
 # Modelled on mini-app-polis/infra's terraform.yml: plan on the pull
-# request, plan again and apply on the push to main (railway-apply.yml),
-# and refuse destructive changes unless the pull request is labelled
-# allow-destroy. Nothing is pinned between the two: the apply re-plans, as
-# infra's does, so what lands is main as it is when it lands.
+# request, plan again and apply on the push to main (railway-apply.yml).
+#
+# **A plan that destroys anything fails this check** unless the pull
+# request is labelled allow-destroy — removing a service or a variable is
+# the change that causes outages, so it takes a deliberate decision, made
+# on the pull request where the plan is read. Labelled, the check passes and
+# lists exactly what goes; merging applies it. Callers re-run the check on
+# `labeled` / `unlabeled`, so adding the label is enough.
 #
 # **The token picks the environment.** A Railway project token is scoped to
 # one environment; the caller passes the one for the environment this plan
@@ -22,7 +26,8 @@
 #   on:
 #     pull_request:
 #       branches: [main]
-#       paths: [".railway/**"]
+#       types: [opened, synchronize, reopened, labeled, unlabeled]
+#       paths: [".railway/**", ".github/workflows/railway-plan.yml"]
 #   permissions:
 #     contents: read
 #   jobs:
@@ -44,6 +49,10 @@ on:
       railway-token:
         description: "A Railway project token scoped to the environment being planned. Never an account or workspace token."
         required: true
+    outputs:
+      changes:
+        description: "'true' when the plan has changes to apply."
+        value: ${{ jobs.plan.outputs.changes }}
 
 jobs:
   plan:
@@ -57,6 +66,8 @@ jobs:
       cancel-in-progress: true
     env:
       RAILWAY_TOKEN: ${{ secrets.railway-token }}
+    outputs:
+      changes: ${{ steps.plan.outputs.changes }}
     steps:
       - uses: actions/checkout@v7
 
@@ -74,22 +85,51 @@ jobs:
 
       # --detailed-exit-code: 0 no changes, 2 changes, anything else an error.
       - name: plan
-        env:
-          ENVIRONMENT: ${{ inputs.environment }}
+        id: plan
         run: |
           set +e
           railway config plan --verbose --detailed-exit-code > plan.txt 2>&1
           code=$?
           set -e
           cat plan.txt
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then exit "$code"; fi
+          echo "changes=$([ "$code" -eq 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # The CLI's plan reads like Terraform's: a `Plan: N to add, N to
+      # change, N to destroy` line, and each destructive change on a line of
+      # its own beginning `  - ` (`- Delete variable api.NAME`).
+      - name: refuse unlabelled destroys
+        if: steps.plan.outputs.changes == 'true'
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+        run: |
+          grep -E '^  - ' plan.txt > destroys.txt || true
+          [ -s destroys.txt ] || exit 0
+
+          if [[ " $PR_LABELS " == *" allow-destroy "* ]]; then
+            echo "::warning::This plan destroys Railway resources or variables; allowed by the allow-destroy label."
+            heading="## ⚠️ Destroys — allowed by allow-destroy"
+            code=0
+          else
+            echo "::error::This plan destroys Railway resources or variables. If that is intended, label the pull request allow-destroy."
+            heading="## ⛔ Destroys — label the pull request allow-destroy to allow them"
+            code=1
+          fi
+          cat destroys.txt
+          { echo "$heading"; echo '```'; cat destroys.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: summary
+        if: always()
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          # Nothing to summarise when the job failed before planning.
+          [ -f plan.txt ] || exit 0
           {
             echo "## Railway plan — ${ENVIRONMENT}"
             echo
-            case "$code" in
-              0) echo "No changes." ;;
-              2) echo "Changes pending. Destructive ones (removed services or variables) apply only if the pull request is labelled **allow-destroy**." ;;
-              *) echo "**The plan failed.**" ;;
-            esac
+            grep -E '^(Plan:|✓ Your Railway configuration is already up to date|!)' plan.txt || true
             echo
             echo '<details><summary>Full plan</summary>'
             echo
@@ -98,4 +138,3 @@ jobs:
             echo '```'
             echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then exit "$code"; fi

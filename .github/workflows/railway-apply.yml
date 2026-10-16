@@ -109,26 +109,46 @@ jobs:
           npm install --global --no-audit --no-fund @railway/cli@5.68.0
           npm ci --prefix .railway --no-audit --no-fund
 
+      # Planned again here rather than trusting the pull request's plan:
+      # main's can differ from it. As in infra, nothing is applied when
+      # there is nothing to apply, and destroys apply only under the label
+      # on the pull request this merge came from.
+      - name: plan
+        id: plan
+        run: |
+          set +e
+          railway config plan --verbose --detailed-exit-code > plan.txt 2>&1
+          code=$?
+          set -e
+          cat plan.txt
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then exit "$code"; fi
+          echo "changes=$([ "$code" -eq 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: apply
+        if: steps.plan.outputs.changes == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           ALLOW_DESTROY: ${{ inputs.allow-destroy }}
         run: |
           flags=(--yes --verbose)
-          case "$ALLOW_DESTROY" in
-            always)
-              flags+=(--confirm-destructive)
-              echo "Destructive changes allowed: allow-destroy is 'always' for this environment." ;;
-            label)
-              labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0].labels[].name' 2>/dev/null | tr '\n' ' ')
-              if [[ " $labels " == *" allow-destroy "* ]]; then
-                flags+=(--confirm-destructive)
-                echo "::warning::Destructive changes allowed by the allow-destroy label."
-              else
-                echo "Destructive changes will be refused: the pull request is not labelled allow-destroy."
-              fi ;;
-            *)
-              echo "::error::allow-destroy must be 'label' or 'always', not '$ALLOW_DESTROY'."
-              exit 1 ;;
-          esac
+          grep -E '^  - ' plan.txt > destroys.txt || true
+          if [ -s destroys.txt ]; then
+            case "$ALLOW_DESTROY" in
+              always)
+                echo "::warning::Applying destroys; allow-destroy is 'always' for this environment:" ;;
+              label)
+                labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0].labels[].name' 2>/dev/null | tr '\n' ' ')
+                if [[ " $labels " != *" allow-destroy "* ]]; then
+                  echo "::error::Refusing to apply unlabelled destroys. Label the pull request allow-destroy and re-run this job:"
+                  cat destroys.txt
+                  exit 1
+                fi
+                echo "::warning::Applying destroys allowed by allow-destroy:" ;;
+              *)
+                echo "::error::allow-destroy must be 'label' or 'always', not '$ALLOW_DESTROY'."
+                exit 1 ;;
+            esac
+            cat destroys.txt
+            flags+=(--confirm-destructive)
+          fi
           railway config apply "${flags[@]}"

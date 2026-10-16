@@ -258,6 +258,7 @@ moved here when three more repositories took up the pattern (MINI-70).
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths: [".railway/**", ".github/workflows/railway-plan.yml"]
 permissions:
   contents: read
@@ -285,12 +286,17 @@ jobs:
 ```
 
 The plan is `railway config plan`, written to the job summary (values are
-redacted by the CLI). The apply is `railway config apply --yes`, which
-plans afresh: as in infra, what lands is `main` as it is when it lands, not
-a pinned artifact. Removing a service or a variable is destructive, and the
-CLI refuses it in a non-interactive run unless `--confirm-destructive` is
-passed; the apply passes it only when the pull request the commit came
-from carries `allow-destroy`.
+redacted by the CLI). The apply plans again and runs `railway config apply
+--yes`: as in infra, what lands is `main` as it is when it lands, not a
+pinned artifact, and nothing is applied when the plan is empty.
+
+A plan that destroys anything — a `  - Delete …` line, counted in
+`N to destroy` — fails the pull request's `plan` check unless the pull
+request is labelled **`allow-destroy`**; the check re-runs on `labeled` /
+`unlabeled`, lists exactly what goes, and passes. The apply checks the same
+label on the pull request the merge came from before passing the CLI's
+`--confirm-destructive`, without which it refuses destructive changes
+anyway.
 
 **The token picks the environment.** A Railway project token is scoped to
 one environment, and each repository keeps its own as a secret — never an
