@@ -1,24 +1,21 @@
-# The fleet's shared Railway Infrastructure-as-Code plan: evaluate a
-# repository's .railway/railway.ts, diff it against the live environment,
-# post the plan to the pull request as a comment, and pin it for
-# railway-apply.yml to apply on merge. Reading the plan is the review;
-# merging is the approval. Nothing is ever applied from a workstation.
+# The fleet's shared Railway Infrastructure-as-Code plan, run on a pull
+# request into main. It evaluates .railway/railway.ts against the live
+# environment and writes the plan to the job summary; reading it is the
+# review, and merging is the approval. It changes nothing.
 #
-# **Why this is shared.** db-ops carried the fleet's first pair (MINI-67);
-# MINI-69 brings api-kaianolevine-com, api-deejaytools and wiki-curator-cog
-# onto the same pattern. One file means the pinned action and CLI, the fork
-# guard and the SDK install are fixed once (MINI-70).
+# Modelled on mini-app-polis/infra's terraform.yml: plan on the pull
+# request, plan again and apply on the push to main (railway-apply.yml),
+# and refuse destructive changes unless the pull request is labelled
+# allow-destroy. Nothing is pinned between the two: the apply re-plans, as
+# infra's does, so what lands is main as it is when it lands.
 #
-# **Which environment is planned is the token's choice.** A Railway project
-# token is scoped to one environment, so the caller passes the token for the
-# environment the target branch deploys to: a production token on pull
-# requests into main and, for a service that also runs in development, a
-# development token on pull requests into dev. Never an account or
-# workspace token. `environment` only names the run.
+# **The token picks the environment.** A Railway project token is scoped to
+# one environment; the caller passes the one for the environment this plan
+# is for. `environment` only names the run. Never an account or workspace
+# token.
 #
-# The IaC SDK the CLI evaluates railway.ts with lives in .railway/ (its own
-# package.json and lockfile), not at the root of a Python repository, so it
-# is installed from there and the action's own install is turned off.
+# Plan output redacts variable values (Railway CLI default), so the summary
+# carries names, never values.
 #
 # Usage, from a repository's .github/workflows/railway-plan.yml:
 #
@@ -28,7 +25,6 @@
 #       paths: [".railway/**"]
 #   permissions:
 #     contents: read
-#     pull-requests: write
 #   jobs:
 #     plan:
 #       uses: mini-app-polis/.github/.github/workflows/railway-plan.yml@v3
@@ -41,7 +37,7 @@ on:
   workflow_call:
     inputs:
       environment:
-        description: "The Railway environment the token is scoped to. Names the run and its concurrency group; it does not select the environment."
+        description: "The Railway environment the token is scoped to. Names the run; it does not select the environment."
         type: string
         default: "production"
     secrets:
@@ -52,14 +48,15 @@ on:
 jobs:
   plan:
     # Fork pull requests get no secrets, and must not plan with ours.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     concurrency:
-      group: railway-config-plan-${{ inputs.environment }}-${{ github.event.pull_request.number }}
+      group: railway-plan-${{ inputs.environment }}-${{ github.ref }}
       cancel-in-progress: true
+    env:
+      RAILWAY_TOKEN: ${{ secrets.railway-token }}
     steps:
       - uses: actions/checkout@v7
 
@@ -67,12 +64,38 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install the Railway IaC SDK
-        run: npm ci --prefix .railway --no-audit --no-fund
+      # The IaC SDK the CLI evaluates railway.ts with lives in .railway/
+      # (its own package.json and lockfile), not at the root of a Python
+      # repository.
+      - name: Install the Railway CLI and IaC SDK
+        run: |
+          npm install --global --no-audit --no-fund @railway/cli@5.68.0
+          npm ci --prefix .railway --no-audit --no-fund
 
-      - uses: railwayapp/config@v1.2.0
-        with:
-          command: plan
-          railway-token: ${{ secrets.railway-token }}
-          package-manager: none
-          cli-version: "5.68.0"
+      # --detailed-exit-code: 0 no changes, 2 changes, anything else an error.
+      - name: plan
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set +e
+          railway config plan --verbose --detailed-exit-code > plan.txt 2>&1
+          code=$?
+          set -e
+          cat plan.txt
+          {
+            echo "## Railway plan — ${ENVIRONMENT}"
+            echo
+            case "$code" in
+              0) echo "No changes." ;;
+              2) echo "Changes pending. Destructive ones (removed services or variables) apply only if the pull request is labelled **allow-destroy**." ;;
+              *) echo "**The plan failed.**" ;;
+            esac
+            echo
+            echo '<details><summary>Full plan</summary>'
+            echo
+            echo '```'
+            head -c 60000 plan.txt
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then exit "$code"; fi

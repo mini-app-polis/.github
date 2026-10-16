@@ -1,30 +1,38 @@
-# The fleet's shared Railway Infrastructure-as-Code apply: when a pull request
-# lands, apply exactly the plan railway-plan.yml pinned on it. If the
-# environment changed since (a dashboard edit) or .railway/ is not the
-# planned tree, it fails and the pull request needs a fresh plan. A push
-# that did not come through a pull request has no plan and fails by design.
+# The fleet's shared Railway Infrastructure-as-Code apply, run on a push to
+# the branch that deploys an environment (main for production) or by hand.
+# It plans afresh and applies that plan — `railway config apply --yes` —
+# as mini-app-polis/infra applies Terraform on a push to main. The merge is
+# the approval: read the pull request's plan (railway-plan.yml) first.
 #
-# As with the plan, the token decides the environment: a production project
-# token on pushes to main, a development one on pushes to dev for a service
-# that also runs there. Each caller keeps its own token as a repository
-# secret — never an org-wide one.
+# **Destructive changes need a label.** Removing a service or a variable is
+# destructive, and the CLI refuses it in a non-interactive run unless
+# --confirm-destructive is passed. That flag is passed only when the pull
+# request the pushed commit came from is labelled allow-destroy — infra's
+# rule, for the same reason: those are the changes that cause outages. A
+# caller can set `allow-destroy: always` for an environment where that is
+# the wrong trade (development, applied on every push to dev with no pull
+# request to label).
 #
 # **blocked-window** keeps an apply out of a time when a redeploy would do
 # harm. db-ops passes its drill window: applying a change to db-drill
 # redeploys it, which stops a running drill before it can delete its forks.
-# The format is `<day-of-month> <first-hour>-<last-hour>`, UTC, both hours
-# inclusive — "02 09-10" is 09:00 to 10:59 on the 2nd. Empty, the default,
-# blocks nothing; the APIs pass nothing.
+# Format `<day-of-month> <first-hour>-<last-hour>`, UTC, hours inclusive —
+# "02 09-10" is 09:00 to 10:59 on the 2nd. Empty, the default, blocks
+# nothing.
+#
+# As with the plan, the token picks the environment: a project token scoped
+# to it, kept as a repository secret. Never an account, workspace or
+# org-wide token.
 #
 # Usage, from a repository's .github/workflows/railway-apply.yml:
 #
 #   on:
 #     push:
 #       branches: [main]
-#       paths: [".railway/**"]
+#       paths: [".railway/**", ".github/workflows/railway-apply.yml"]
+#     workflow_dispatch:
 #   permissions:
 #     contents: read
-#     actions: read
 #     pull-requests: read
 #   jobs:
 #     apply:
@@ -41,6 +49,10 @@ on:
         description: "The Railway environment the token is scoped to. Names the run and its concurrency group; it does not select the environment."
         type: string
         default: "production"
+      allow-destroy:
+        description: "`label` (default): destructive changes apply only when the pull request the commit came from is labelled allow-destroy. `always`: they always apply."
+        type: string
+        default: "label"
       blocked-window:
         description: "`<day-of-month> <first-hour>-<last-hour>` in UTC during which the apply refuses to run, e.g. \"02 09-10\". Empty blocks nothing."
         type: string
@@ -57,15 +69,17 @@ on:
 jobs:
   apply:
     runs-on: ubuntu-latest
-    # pull-requests: read lets the action find the merged pull request, and
-    # actions: read lets it download that pull request's plan.
+    # pull-requests: read finds the pull request a commit came from, for its
+    # labels.
     permissions:
       contents: read
-      actions: read
       pull-requests: read
+    # One apply at a time per environment, never cancelled midway.
     concurrency:
-      group: railway-config-apply-${{ inputs.environment }}
+      group: railway-apply-${{ inputs.environment }}
       cancel-in-progress: false
+    env:
+      RAILWAY_TOKEN: ${{ secrets.railway-token }}
     steps:
       - name: Outside the blocked window
         if: inputs.blocked-window != ''
@@ -86,8 +100,35 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      - uses: railwayapp/config@v1.2.0
+      - uses: actions/setup-node@v7
         with:
-          command: apply
-          railway-token: ${{ secrets.railway-token }}
-          cli-version: "5.68.0"
+          node-version: "24"
+
+      - name: Install the Railway CLI and IaC SDK
+        run: |
+          npm install --global --no-audit --no-fund @railway/cli@5.68.0
+          npm ci --prefix .railway --no-audit --no-fund
+
+      - name: apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALLOW_DESTROY: ${{ inputs.allow-destroy }}
+        run: |
+          flags=(--yes --verbose)
+          case "$ALLOW_DESTROY" in
+            always)
+              flags+=(--confirm-destructive)
+              echo "Destructive changes allowed: allow-destroy is 'always' for this environment." ;;
+            label)
+              labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0].labels[].name' 2>/dev/null | tr '\n' ' ')
+              if [[ " $labels " == *" allow-destroy "* ]]; then
+                flags+=(--confirm-destructive)
+                echo "::warning::Destructive changes allowed by the allow-destroy label."
+              else
+                echo "Destructive changes will be refused: the pull request is not labelled allow-destroy."
+              fi ;;
+            *)
+              echo "::error::allow-destroy must be 'label' or 'always', not '$ALLOW_DESTROY'."
+              exit 1 ;;
+          esac
+          railway config apply "${flags[@]}"

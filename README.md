@@ -14,7 +14,8 @@ Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
 pull request open whenever `dev` has something to release, and
 `automerge.yml` merges a pull request into `dev` once all its checks pass.
 `railway-plan.yml` and `railway-apply.yml` plan a repository's Railway
-Infrastructure as Code on a pull request and apply that plan on merge.
+Infrastructure as Code on a pull request and plan again and apply on merge,
+as infra does for Terraform.
 
 Two run from here over the whole fleet and open pull requests into other
 repositories' `dev`: `dependency-fix.yml` re-locks packages the dependency
@@ -245,22 +246,21 @@ without tripping it only because nothing it ran imported them.
 ## Shared Railway plan and apply
 
 `.github/workflows/railway-plan.yml` and `railway-apply.yml` drive a
-repository's Railway Infrastructure as Code (`.railway/railway.ts`). A pull
-request that changes `.railway/` gets the plan as a comment and pins it;
-merging the pull request applies exactly that plan, and fails if the
-environment or the tree moved since. Nothing is applied from a workstation.
-db-ops carried the first pair (MINI-67); they moved here when three more
-repositories took up the pattern (MINI-70).
+repository's Railway Infrastructure as Code (`.railway/railway.ts`) the way
+mini-app-polis/infra drives Terraform: plan on the pull request into
+`main`, plan again and apply on the push to `main`, and refuse destructive
+changes unless the pull request is labelled **`allow-destroy`**. Nothing is
+applied from a workstation. db-ops carried the first pair (MINI-67); they
+moved here when three more repositories took up the pattern (MINI-70).
 
 ```yaml
 # .github/workflows/railway-plan.yml
 on:
   pull_request:
     branches: [main]
-    paths: [".railway/**"]
+    paths: [".railway/**", ".github/workflows/railway-plan.yml"]
 permissions:
   contents: read
-  pull-requests: write
 jobs:
   plan:
     uses: mini-app-polis/.github/.github/workflows/railway-plan.yml@v3
@@ -271,36 +271,46 @@ jobs:
 on:
   push:
     branches: [main]
-    paths: [".railway/**"]
+    paths: [".railway/**", ".github/workflows/railway-apply.yml"]
+  workflow_dispatch:
 permissions:
   contents: read
-  actions: read
   pull-requests: read
 jobs:
   apply:
+    if: github.ref_name == 'main'
     uses: mini-app-polis/.github/.github/workflows/railway-apply.yml@v3
     secrets:
       railway-token: ${{ secrets.RAILWAY_TOKEN }}
 ```
 
+The plan is `railway config plan`, written to the job summary (values are
+redacted by the CLI). The apply is `railway config apply --yes`, which
+plans afresh: as in infra, what lands is `main` as it is when it lands, not
+a pinned artifact. Removing a service or a variable is destructive, and the
+CLI refuses it in a non-interactive run unless `--confirm-destructive` is
+passed; the apply passes it only when the pull request the commit came
+from carries `allow-destroy`.
+
 **The token picks the environment.** A Railway project token is scoped to
 one environment, and each repository keeps its own as a secret — never an
 account, workspace or org-wide token. A service that also runs in
-development adds a second job to each file, on the `dev` branch, passing a
-development-scoped token (`RAILWAY_TOKEN_DEVELOPMENT`) and
-`environment: development`, so a change is planned and applied in
-development before it is promoted to main.
+development adds a job to its apply on the `dev` branch, passing a
+development-scoped token (`RAILWAY_TOKEN_DEVELOPMENT`),
+`environment: development` and `allow-destroy: always`: work is committed
+straight to `dev`, so there is no pull request to label, and development is
+where a mistake in the file should show up first.
 
 | Input | Workflow | Default | Meaning |
 |---|---|---|---|
 | `environment` | both | `production` | Names the run and its concurrency group. It does not choose the environment; the token does |
+| `allow-destroy` | apply | `label` | `label`: destructive changes need the `allow-destroy` label. `always`: they always apply |
 | `blocked-window` | apply | *(none)* | `<DD> <HH>-<HH>` UTC, hours inclusive, in which the apply refuses to run. db-ops passes `"02 09-10"`, its drill window |
 | `blocked-window-reason` | apply | *(generic)* | Printed when the apply refuses |
 
-Pinned here, so a bump is one change for the fleet: `railwayapp/config`
-v1.2.0 and Railway CLI 5.68.0. The plan installs the IaC SDK from
-`.railway/package.json` (`npm ci --prefix .railway`) and turns the
-action's own install off, because a Python repository has no root
+Pinned here, so a bump is one change for the fleet: Railway CLI 5.68.0.
+Both install the IaC SDK from `.railway/package.json`
+(`npm ci --prefix .railway`), because a Python repository has no root
 `package.json`. Fork pull requests get no plan: they get no secrets.
 
 ## Shared dev → main promotion
