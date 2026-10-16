@@ -1,3 +1,10 @@
+# [3.14.0](https://github.com/mini-app-polis/.github/compare/v3.13.0...v3.14.0) (2026-10-16)
+
+
+### Features
+
+* **railway:** plan and apply the way infra applies Terraform ([172a200](https://github.com/mini-app-polis/.github/commit/172a200cf937cf206236dc23a958a5ed48970ad5))
+
 # [3.13.0](https://github.com/mini-app-polis/.github/compare/v3.12.1...v3.13.0) (2026-10-16)
 
 
