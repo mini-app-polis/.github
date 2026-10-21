@@ -1,3 +1,10 @@
+## [3.15.4](https://github.com/mini-app-polis/.github/compare/v3.15.3...v3.15.4) (2026-10-21)
+
+
+### Bug Fixes
+
+* **security:** leave the fleet's own libraries out of consumers' audits, and run dependency-fix per repository ([9e18713](https://github.com/mini-app-polis/.github/commit/9e18713d7b54068f651975b4efc7e843c52cd522))
+
 ## [3.15.3](https://github.com/mini-app-polis/.github/compare/v3.15.2...v3.15.3) (2026-10-21)
 
 
