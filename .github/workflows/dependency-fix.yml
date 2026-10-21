@@ -15,7 +15,10 @@
 # consumers, so each repo can re-lock the transitive package itself, within
 # the ranges the library declares.
 #
-# So this runs from here, over the whole fleet, on a schedule:
+# So this runs from here, over the whole fleet, on a schedule, and for one
+# repository when it is dispatched with `repository` set: api-kaianolevine-com
+# does that within minutes of a build failing its dependency audit, so a new
+# advisory does not wait for the next scheduled run. Either way:
 #
 #   1. discover — every repository the promote App is installed on, not
 #      archived, with a uv.lock on `dev`. A new repo is covered the day the
@@ -61,8 +64,13 @@ on:
 permissions:
   contents: read
 
+# One group per target: a fleet-wide advisory dispatches this once per
+# affected repository within minutes, and GitHub keeps only the newest
+# pending run in a group, so a single shared group would cancel all but two
+# of them. Runs for different repositories touch different branches; a run
+# for one repository still queues behind another for the same one.
 concurrency:
-  group: dependency-fix
+  group: dependency-fix-${{ inputs.repository || 'fleet' }}
   cancel-in-progress: false
 
 env:
