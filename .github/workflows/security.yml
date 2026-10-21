@@ -36,6 +36,10 @@ on:
         description: "uv | pip — how Python dependencies are resolved before the audit. Ignored for TypeScript: osv-scanner reads the lockfile directly."
         type: string
         default: uv
+      own-package-prefix:
+        description: "Name prefix of the fleet's own published libraries. They are left out of a consumer's audit: each is audited in its own repository."
+        type: string
+        default: "miniapppolis-"
       sbom:
         description: "Generate a CycloneDX SBOM and retain it as a build artifact."
         type: boolean
@@ -106,6 +110,7 @@ jobs:
         if: inputs.language == 'python'
         env:
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          OWN_PREFIX: ${{ inputs.own-package-prefix }}
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip pip-audit
@@ -135,7 +140,7 @@ jobs:
             /tmp/auditenv/bin/pip freeze --exclude-editable > "${REQ}"
           fi
 
-          # Two kinds of line are removed before auditing, both because
+          # Three kinds of line are removed before auditing, all because
           # --strict treats "not on PyPI" as a hard error:
           #
           #  1. The project itself. `uv export` emits `-e .`; the project
@@ -145,14 +150,25 @@ jobs:
           #     be, and they are audited in their own repos, which run
           #     this same workflow. Auditing them here would double-count
           #     if it worked at all.
+          #  3. The fleet's own published libraries (OWN_PREFIX), for the
+          #     same reason as 2, and because a consumer's lock is bumped
+          #     the moment one is released: pip-audit re-resolves through
+          #     pip, and a PyPI CDN edge that does not list the new version
+          #     yet fails the audit with "no matching distribution". Their
+          #     own dependencies are still in this export and still audited.
           #
           # Everything dropped is printed, so the exclusion is visible in
           # the log rather than a silent hole in the audit.
-          if grep -qE '^[[:space:]]*(-e[[:space:]]|\.[[:space:]]*$)|@[[:space:]]+(git|file|https?)\+?' "${REQ}"; then
-            echo "Excluded from the audit (not resolvable on PyPI):"
-            grep -E '^[[:space:]]*(-e[[:space:]]|\.[[:space:]]*$)|@[[:space:]]+(git|file|https?)\+?' "${REQ}" | sed 's/^/  /'
+          EXCLUDED='^[[:space:]]*(-e[[:space:]]|\.[[:space:]]*$)|@[[:space:]]+(git|file|https?)\+?'
+          if [ -n "${OWN_PREFIX}" ]; then
+            EXCLUDED="${EXCLUDED}|^[[:space:]]*${OWN_PREFIX}"
           fi
-          sed -i -E '/^[[:space:]]*(-e[[:space:]]|\.[[:space:]]*$)/d; /@[[:space:]]+(git|file|https?)\+?/d' "${REQ}"
+          if grep -qE "${EXCLUDED}" "${REQ}"; then
+            echo "Excluded from the audit (not resolvable on PyPI, or audited in their own repositories):"
+            grep -E "${EXCLUDED}" "${REQ}" | sed 's/^/  /'
+          fi
+          grep -vE "${EXCLUDED}" "${REQ}" > "${REQ}.kept" || true
+          mv "${REQ}.kept" "${REQ}"
 
           COUNT=$(grep -cvE '^[[:space:]]*(#|$)' "${REQ}" || true)
           # An empty requirements file audits cleanly and proves nothing.

@@ -55,11 +55,16 @@ from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
-# The two kinds of line security.yml removes before auditing: the project
-# itself, and dependencies from git or a URL (the fleet's own unpublished
-# libraries, audited in their own repos). Kept identical to that workflow's
-# sed expression so the two audits cannot disagree about scope.
-EXCLUDED = re.compile(r"^\s*(-e\s|\.\s*$)|@\s+(git|file|https?)\+?")
+# The three kinds of line security.yml removes before auditing: the project
+# itself, dependencies from git or a URL, and the fleet's own published
+# libraries (audited in their own repos). Kept identical to that workflow's
+# expression, and OWN_PREFIX to its own-package-prefix default, so the two
+# audits cannot disagree about scope.
+OWN_PREFIX = os.environ.get("OWN_PACKAGE_PREFIX", "miniapppolis-")
+EXCLUDED = re.compile(
+    r"^\s*(-e\s|\.\s*$)|@\s+(git|file|https?)\+?"
+    + (rf"|^\s*{re.escape(OWN_PREFIX)}" if OWN_PREFIX else "")
+)
 
 
 def run(
