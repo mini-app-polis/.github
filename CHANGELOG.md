@@ -1,3 +1,10 @@
+## [3.15.3](https://github.com/mini-app-polis/.github/compare/v3.15.2...v3.15.3) (2026-10-21)
+
+
+### Bug Fixes
+
+* **dependency-fix:** one concurrency group per target repository ([f2fbf30](https://github.com/mini-app-polis/.github/commit/f2fbf30d7c77f9a2223723574bd24077673b04fc))
+
 ## [3.15.2](https://github.com/mini-app-polis/.github/compare/v3.15.1...v3.15.2) (2026-10-16)
 
 
