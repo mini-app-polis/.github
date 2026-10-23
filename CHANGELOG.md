@@ -1,3 +1,10 @@
+# [3.17.0](https://github.com/mini-app-polis/.github/compare/v3.16.0...v3.17.0) (2026-10-23)
+
+
+### Features
+
+* **agent:** send an unclear task back to grooming with the agent's questions ([6c5138d](https://github.com/mini-app-polis/.github/commit/6c5138d635324cbd1d0d650e607fb808b79f3bd7))
+
 # [3.16.0](https://github.com/mini-app-polis/.github/compare/v3.15.4...v3.16.0) (2026-10-23)
 
 
