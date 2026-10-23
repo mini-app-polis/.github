@@ -20,9 +20,15 @@
 # in an error, changes nothing, or changes a workflow file opens no pull
 # request. Nothing here retries.
 #
+# **Needs grooming.** A task the agent finds unclear or undetermined is not
+# guessed at: the agent changes nothing and ends with one or more
+# `QUESTION:` lines. The run reports `needs_grooming` with those questions
+# and opens no pull request, even if files were changed, and
+# task-manager-cog sends the task back to grooming.
+#
 # **The result always reports.** The last step runs whatever happened before
 # it, and posts how the run ended, what it cost (Claude Code's own figure)
-# and the pull request, with the task-agent machine key, which may post a
+# and the pull request, or its questions, with the task-agent machine key, which may post a
 # result and nothing else. The API hands it to task-manager-cog, which
 # moves the task. A run killed before it can report is failed by
 # task-manager-cog's sweep once it is overdue.
@@ -195,9 +201,15 @@ jobs:
           - Do not edit CHANGELOG.md or version numbers, and do not edit
             anything under .github/workflows.
           - Do not put board task ids in code or comments.
-          - If the task cannot be done as written, change nothing and say why.
-          - End your final message with one line, a conventional commit
-            subject for the change, for example:
+          - If the task is unclear or undetermined, so that finishing it would
+            mean guessing what its owner wants, change nothing. End your final
+            message instead with one line for each question only the owner
+            can answer, for example:
+            QUESTION: Should the old setting be read as a fallback for one release?
+          - If the task cannot be done as written for another reason, change
+            nothing and say why.
+          - Otherwise end your final message with one line, a conventional
+            commit subject for the change, for example:
             COMMIT: fix(sweep): skip tasks waiting only on blockers
 
           The task:
@@ -237,12 +249,21 @@ jobs:
           subtype=$(jq -r '.subtype // empty' "$result" 2>/dev/null)
           text=$(jq -r '.result // empty' "$result" 2>/dev/null)
           changed=$(git status --porcelain)
+          # Its questions, at most ten, as a JSON list for the report.
+          printf '%s\n' "$text" | sed -n 's/^QUESTION:[[:space:]]*//p' \
+            | jq -R -s -c 'split("\n") | map(select(test("\\S"))) | .[0:10]' \
+            > "$RUNNER_TEMP/questions.json"
+          asked=$(jq length "$RUNNER_TEMP/questions.json")
           outcome=failed
           if [ "$subtype" = "error_max_budget_usd" ]; then
             outcome=capped
             reason="reached its \$${BUDGET} budget limit"
           elif [ "$subtype" != "success" ]; then
             reason="the agent ended with ${subtype:-no result} (exit ${EXIT:-unknown})"
+          elif [ "$asked" -gt 0 ]; then
+            # Unclear: nothing is pushed, whatever was changed.
+            outcome=needs_grooming
+            reason=""
           elif [ -z "$changed" ]; then
             reason="the agent changed nothing: $(printf '%s' "$text" | tail -c 1500)"
           elif printf '%s\n' "$changed" | grep -q ' \.github/workflows/'; then
@@ -317,12 +338,12 @@ jobs:
           API_KEY: ${{ secrets.TASK_AGENT_API_KEY }}
           DECIDED: ${{ steps.decide.outputs.outcome }}
           COST: ${{ steps.decide.outputs.cost }}
-          REASON: ${{ steps.decide.outputs.reason }}
+          DECIDED_REASON: ${{ steps.decide.outputs.reason }}
           PR_URL: ${{ steps.pr.outputs.url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           outcome="${DECIDED:-failed}"
-          reason="$REASON"
+          reason="$DECIDED_REASON"
           if [ "$outcome" = "succeeded" ] && [ -z "$PR_URL" ]; then
             outcome=failed
             reason="the change was made but the pull request could not be opened"
@@ -330,12 +351,18 @@ jobs:
           if [ -z "$DECIDED" ]; then
             reason="the run stopped before the agent finished; see the workflow run"
           fi
+          questions="[]"
+          if [ "$outcome" = "needs_grooming" ]; then
+            questions=$(cat "$RUNNER_TEMP/questions.json")
+          fi
           body=$(jq -n \
             --arg run_id "$RUN_ID" --arg outcome "$outcome" --arg cost "$COST" \
             --arg pr "$PR_URL" --arg run_url "$RUN_URL" --arg reason "$reason" \
+            --argjson questions "$questions" \
             '{run_id: $run_id, outcome: $outcome, actions_run_url: $run_url}
              + (if $cost != "" then {cost_usd: ($cost | tonumber)} else {} end)
              + (if $outcome == "succeeded" then {pr_url: $pr} else {} end)
+             + (if $outcome == "needs_grooming" then {questions: $questions} else {} end)
              + (if $reason != "" then {reason: ($reason | .[0:2000])} else {} end)')
 
           if [ "$DRY_RUN" = "true" ]; then
