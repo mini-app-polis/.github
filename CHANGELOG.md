@@ -1,3 +1,10 @@
+# [3.16.0](https://github.com/mini-app-polis/.github/compare/v3.15.4...v3.16.0) (2026-10-23)
+
+
+### Features
+
+* **agent:** add the shared agent workflow ([6e3d0f1](https://github.com/mini-app-polis/.github/commit/6e3d0f149a8dea908fc9a5a2561e8e865881f917))
+
 ## [3.15.4](https://github.com/mini-app-polis/.github/compare/v3.15.3...v3.15.4) (2026-10-21)
 
 
