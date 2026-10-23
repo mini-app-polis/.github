@@ -1,0 +1,367 @@
+# The fleet's agent: one board task, implemented by headless Claude Code in
+# the calling repository, handed to a person as a draft pull request into
+# `dev`.
+#
+# task-manager-cog dispatches it. It records the run with api-kaianolevine-com
+# first, moves the task to In progress, then starts the caller in the
+# repository the task names, with the run's id, the task's text, the model
+# and the budget. A repository with a caller is one the agent may change;
+# one without is never a target.
+#
+# **The model never holds a GitHub write credential.** The checkout keeps no
+# credentials, and the agent's step has the Anthropic key and nothing else.
+# It edits files and runs the repository's own checks; it cannot commit,
+# push or open anything. The steps after it, which are fixed, decide what
+# happened, then mint the agent App's token, push `agent/<task>-<run>`, and
+# open the pull request: a **draft**, based on `dev`. automerge.yml skips
+# drafts, so what an agent wrote reaches `dev` only when a person merges it.
+#
+# **Capped, failed, or empty.** A run that reaches its budget limit, ends
+# in an error, changes nothing, or changes a workflow file opens no pull
+# request. Nothing here retries.
+#
+# **The result always reports.** The last step runs whatever happened before
+# it, and posts how the run ended, what it cost (Claude Code's own figure)
+# and the pull request, with the task-agent machine key, which may post a
+# result and nothing else. The API hands it to task-manager-cog, which
+# moves the task. A run killed before it can report is failed by
+# task-manager-cog's sweep once it is overdue.
+#
+# **dry_run** runs everything but the model, the push and the post: it
+# proves the checkout, the toolchain, the App's credentials and the API key,
+# and prints the result it would have posted.
+#
+# Secrets: AGENT_ANTHROPIC_API_KEY (the agent's own Anthropic workspace),
+# AGENT_APP_CLIENT_ID and AGENT_APP_PRIVATE_KEY (the agent App), and
+# TASK_AGENT_API_KEY. Organisation secrets, visible only to the repositories
+# the agent may change, passed with `secrets: inherit`.
+#
+# Usage, as its own workflow in each repository the agent may change. The
+# inputs are the ones task-manager-cog sends; `workflow_dispatch` runs only
+# a workflow that is on the default branch:
+#
+#   name: agent
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         run_id: { required: true, type: string }
+#         task_id: { required: true, type: string }
+#         task: { required: true, type: string }
+#         model: { required: true, type: string }
+#         budget_usd: { required: true, type: string }
+#         dry_run: { required: false, type: boolean, default: false }
+#   permissions:
+#     contents: read
+#   concurrency:
+#     group: agent
+#     cancel-in-progress: false
+#   jobs:
+#     agent:
+#       uses: mini-app-polis/.github/.github/workflows/agent.yml@v3
+#       with:
+#         run_id: ${{ inputs.run_id }}
+#         task_id: ${{ inputs.task_id }}
+#         task: ${{ inputs.task }}
+#         model: ${{ inputs.model }}
+#         budget_usd: ${{ inputs.budget_usd }}
+#         dry_run: ${{ inputs.dry_run }}
+#       secrets: inherit
+
+name: agent
+
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        description: "The agent run's id, as the API recorded it."
+        type: string
+        required: true
+      task_id:
+        description: "The task's id on the board, for the branch and the pull request."
+        type: string
+        required: true
+      task:
+        description: "The task's name and body, as the board has them."
+        type: string
+        required: true
+      model:
+        description: "The model the agent runs."
+        type: string
+        required: true
+      budget_usd:
+        description: "The run's budget limit, in USD. Claude Code stops the run when its own estimate reaches it."
+        type: string
+        required: true
+      dry_run:
+        description: "Run everything but the model, the push and the post."
+        type: boolean
+        default: false
+      claude-code-version:
+        description: "The Claude Code release to install, pinned so a run is reproducible."
+        type: string
+        default: "2.1.296"
+      api-url:
+        description: "Base URL of api-kaianolevine-com."
+        type: string
+        default: https://api.kaianolevine.com
+    secrets:
+      AGENT_ANTHROPIC_API_KEY:
+        required: false
+      AGENT_APP_CLIENT_ID:
+        required: false
+      AGENT_APP_PRIVATE_KEY:
+        required: false
+      TASK_AGENT_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    runs-on: ubuntu-24.04
+    # Below task-manager-cog's AGENT_RUN_TIMEOUT_MINUTES, so a run it fails
+    # as overdue has stopped.
+    timeout-minutes: 60
+    env:
+      RUN_ID: ${{ inputs.run_id }}
+      TASK_ID: ${{ inputs.task_id }}
+      MODEL: ${{ inputs.model }}
+      BUDGET: ${{ inputs.budget_usd }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      API_URL: ${{ inputs.api-url }}
+    steps:
+      - name: Check the inputs and the secrets
+        id: inputs
+        env:
+          HAS_ANTHROPIC: ${{ secrets.AGENT_ANTHROPIC_API_KEY != '' }}
+          HAS_APP: ${{ secrets.AGENT_APP_CLIENT_ID != '' && secrets.AGENT_APP_PRIVATE_KEY != '' }}
+          HAS_API: ${{ secrets.TASK_AGENT_API_KEY != '' }}
+        run: |
+          if ! [[ "$RUN_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::run_id is not a run id: $RUN_ID"; exit 1
+          fi
+          if ! [[ "$BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::budget_usd is not a number: $BUDGET"; exit 1
+          fi
+          for pair in "AGENT_ANTHROPIC_API_KEY:$HAS_ANTHROPIC" \
+                      "AGENT_APP_CLIENT_ID and AGENT_APP_PRIVATE_KEY:$HAS_APP" \
+                      "TASK_AGENT_API_KEY:$HAS_API"; do
+            if [ "${pair##*:}" != "true" ]; then
+              echo "::error::${pair%:*} must be set as organisation secrets visible to this repository, and passed with 'secrets: inherit'."
+              exit 1
+            fi
+          done
+          slug=$(printf '%s' "$TASK_ID" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+          echo "branch=agent/${slug:-task}-${RUN_ID:0:8}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: dev
+          persist-credentials: false
+
+      - name: Install uv
+        if: hashFiles('uv.lock') != ''
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install the repository's dependencies
+        if: hashFiles('uv.lock') != ''
+        run: uv sync --all-extras --locked
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install Claude Code
+        env:
+          VERSION: ${{ inputs.claude-code-version }}
+        run: npm install -g "@anthropic-ai/claude-code@${VERSION}"
+
+      - name: Write the prompt
+        env:
+          TASK: ${{ inputs.task }}
+        run: |
+          {
+            cat <<'PROMPT'
+          You are implementing one task from the board, in this repository, on
+          a branch from dev. A person will review your change as a pull request.
+
+          - Make the change the task's "Done when" describes, within its
+            Constraints. Keep the change minimal.
+          - Run the repository's checks (for a uv repository: uv run pytest,
+            uv run ruff check ., uv run ruff format --check .) and leave them
+            passing.
+          - Do not commit, push or open a pull request: that happens after you.
+          - Do not edit CHANGELOG.md or version numbers, and do not edit
+            anything under .github/workflows.
+          - Do not put board task ids in code or comments.
+          - If the task cannot be done as written, change nothing and say why.
+          - End your final message with one line, a conventional commit
+            subject for the change, for example:
+            COMMIT: fix(sweep): skip tasks waiting only on blockers
+
+          The task:
+
+          PROMPT
+            printf '%s\n' "$TASK"
+          } > "$RUNNER_TEMP/prompt.md"
+
+      - name: Run the agent
+        id: agent
+        if: ${{ !inputs.dry_run }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.AGENT_ANTHROPIC_API_KEY }}
+          DISABLE_AUTOUPDATER: "1"
+        run: |
+          set +e
+          claude -p \
+            --model "$MODEL" \
+            --max-budget-usd "$BUDGET" \
+            --max-turns 80 \
+            --output-format json \
+            --permission-mode dontAsk \
+            --allowedTools Read Edit Write Glob Grep \
+              "Bash(uv run *)" "Bash(uv sync *)" "Bash(git diff *)" \
+              "Bash(git status *)" "Bash(git log *)" "Bash(ls *)" \
+            < "$RUNNER_TEMP/prompt.md" > "$RUNNER_TEMP/result.json"
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Decide how the run ended
+        id: decide
+        if: ${{ !inputs.dry_run }}
+        env:
+          EXIT: ${{ steps.agent.outputs.exit }}
+        run: |
+          result="$RUNNER_TEMP/result.json"
+          cost=$(jq -r '.total_cost_usd // empty' "$result" 2>/dev/null)
+          subtype=$(jq -r '.subtype // empty' "$result" 2>/dev/null)
+          text=$(jq -r '.result // empty' "$result" 2>/dev/null)
+          changed=$(git status --porcelain)
+          outcome=failed
+          if [ "$subtype" = "error_max_budget_usd" ]; then
+            outcome=capped
+            reason="reached its \$${BUDGET} budget limit"
+          elif [ "$subtype" != "success" ]; then
+            reason="the agent ended with ${subtype:-no result} (exit ${EXIT:-unknown})"
+          elif [ -z "$changed" ]; then
+            reason="the agent changed nothing: $(printf '%s' "$text" | tail -c 1500)"
+          elif printf '%s\n' "$changed" | grep -q ' \.github/workflows/'; then
+            reason="the agent changed a workflow file, which it may not"
+          else
+            outcome=succeeded
+            reason=""
+          fi
+          subject=$(printf '%s\n' "$text" | sed -n 's/^COMMIT: //p' | tail -n 1)
+          if ! printf '%s' "$subject" | grep -Eq '^(feat|fix|docs|refactor|perf|test|build|ci|chore|style)(\([a-z0-9._-]+\))?!?: .{3,}$'; then
+            subject="chore(agent): implement the task"
+          fi
+          printf '%s' "$text" > "$RUNNER_TEMP/summary.md"
+          {
+            echo "outcome=$outcome"
+            echo "cost=$cost"
+            echo "subject=$subject"
+            echo "reason<<REASON_END"
+            printf '%s\n' "$reason"
+            echo "REASON_END"
+          } >> "$GITHUB_OUTPUT"
+          echo "Outcome: $outcome${reason:+ ($reason)}; cost: ${cost:-unknown}"
+
+      - name: Mint the agent App's token
+        id: app-token
+        if: ${{ inputs.dry_run || steps.decide.outputs.outcome == 'succeeded' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.AGENT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Push the branch and open a draft pull request
+        id: pr
+        if: ${{ !inputs.dry_run && steps.decide.outputs.outcome == 'succeeded' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BRANCH: ${{ steps.inputs.outputs.branch }}
+          SUBJECT: ${{ steps.decide.outputs.subject }}
+          COST: ${{ steps.decide.outputs.cost }}
+        run: |
+          set -euo pipefail
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "/users/${bot}" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add -A
+          git commit -q -m "$SUBJECT"
+          git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          {
+            echo "Opened by the agent for ${TASK_ID} (agent run \`${RUN_ID}\`), cost \$${COST:-unknown}."
+            echo
+            echo "A draft: review it, merge it into \`dev\`, confirm the change in dev, then mark the task done. The agent's own account below is not proof the work is done."
+            echo
+            echo "### The agent's summary"
+            echo
+            cat "$RUNNER_TEMP/summary.md"
+          } > "$RUNNER_TEMP/body.md"
+          url=$(gh pr create -R "$GITHUB_REPOSITORY" --draft --base dev --head "$BRANCH" \
+            --title "$SUBJECT" --body-file "$RUNNER_TEMP/body.md")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Opened $url"
+
+      - name: Report the result
+        if: always()
+        env:
+          API_KEY: ${{ secrets.TASK_AGENT_API_KEY }}
+          DECIDED: ${{ steps.decide.outputs.outcome }}
+          COST: ${{ steps.decide.outputs.cost }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          outcome="${DECIDED:-failed}"
+          reason="$REASON"
+          if [ "$outcome" = "succeeded" ] && [ -z "$PR_URL" ]; then
+            outcome=failed
+            reason="the change was made but the pull request could not be opened"
+          fi
+          if [ -z "$DECIDED" ]; then
+            reason="the run stopped before the agent finished; see the workflow run"
+          fi
+          body=$(jq -n \
+            --arg run_id "$RUN_ID" --arg outcome "$outcome" --arg cost "$COST" \
+            --arg pr "$PR_URL" --arg run_url "$RUN_URL" --arg reason "$reason" \
+            '{run_id: $run_id, outcome: $outcome, actions_run_url: $run_url}
+             + (if $cost != "" then {cost_usd: ($cost | tonumber)} else {} end)
+             + (if $outcome == "succeeded" then {pr_url: $pr} else {} end)
+             + (if $reason != "" then {reason: ($reason | .[0:2000])} else {} end)')
+
+          if [ "$DRY_RUN" = "true" ]; then
+            status=$(curl -sS --max-time 30 -o "$RUNNER_TEMP/whoami.json" -w "%{http_code}" \
+              -H "Authorization: Bearer ${API_KEY}" "${API_URL%/}/v1/identity/whoami")
+            if [ "$status" != "200" ]; then
+              echo "::error::TASK_AGENT_API_KEY was refused by ${API_URL} (${status})."; exit 1
+            fi
+            echo "Dry run: the API key works. The result a real run would post:"
+            jq . <<<"$body"
+            exit 0
+          fi
+
+          # A 502 means the result was not queued and not recorded, so it is
+          # posted again; a 409 means it was already recorded.
+          status=$(curl -sS --max-time 30 \
+            --retry 4 --retry-connrefused --retry-delay 10 \
+            -A "mini-app-polis-agent/1 (+https://github.com/mini-app-polis/.github)" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            -o "$RUNNER_TEMP/posted.json" -w "%{http_code}" \
+            -X POST "${API_URL%/}/v1/tasks/agent-runs/results" -d "$body") || {
+              echo "::error::could not reach ${API_URL}."; exit 1
+            }
+          case "$status" in
+            2*) echo "Reported: $outcome" ;;
+            409) echo "Already reported." ;;
+            *) echo "::error::the API answered ${status}:"; cat "$RUNNER_TEMP/posted.json"; exit 1 ;;
+          esac

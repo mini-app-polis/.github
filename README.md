@@ -13,6 +13,8 @@ workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
 pull request open whenever `dev` has something to release, and
 `automerge.yml` merges a pull request into `dev` once all its checks pass.
+`agent.yml` implements one board task in a repository and opens a draft
+pull request into `dev` for a person to review.
 `railway-plan.yml` and `railway-apply.yml` plan a repository's Railway
 Infrastructure as Code on a pull request and plan again and apply on merge,
 as infra does for Terraform.
@@ -384,6 +386,37 @@ jobs:
   secrets.
 - **Runs from `main`'s copy** of the consumer's file, like every
   `workflow_run` workflow, so it starts working after the first promotion.
+
+## Shared agent
+
+`.github/workflows/agent.yml` runs headless Claude Code on one board task in
+the calling repository and opens a **draft** pull request into `dev`.
+task-manager-cog dispatches it for a Ready task and applies the result it
+reports; see that repository's README for which tasks it takes. Each
+repository the agent may change has a thin `workflow_dispatch` caller (the
+usage is in the workflow's header), and having that caller is what makes a
+repository a target.
+
+- **The model holds no GitHub write credential.** The checkout keeps none
+  and the agent's step has only the Anthropic key. It edits and runs the
+  repository's checks; later fixed steps push `agent/<task>-<run>` and open
+  the draft as the agent App.
+- **Drafts only**, so `automerge.yml` never merges what an agent wrote.
+- **Nothing is retried.** A run that reaches its budget, errors, changes
+  nothing or touches a workflow file opens no pull request.
+- **Always reports** its outcome, cost and pull request to
+  api-kaianolevine-com with the task-agent key, which may post a result
+  and nothing else.
+- **`dry_run`** proves the checkout, toolchain, App and API key without
+  calling the model, pushing or posting.
+- **Secrets:** `AGENT_ANTHROPIC_API_KEY`, `AGENT_APP_CLIENT_ID`,
+  `AGENT_APP_PRIVATE_KEY` and `TASK_AGENT_API_KEY`, as organisation secrets
+  visible only to the target repositories. The agent App needs Contents,
+  Pull requests and Actions read and write, installed on the target
+  repositories only.
+- **Runs only from the default branch's caller**: `workflow_dispatch`
+  needs the caller on `main`, so a new target starts working after its
+  first promotion.
 
 ## Fleet-wide re-locks
 
