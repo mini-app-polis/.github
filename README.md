@@ -346,7 +346,10 @@ It opens the pull request as a GitHub App rather than as
 bot-opened pull request for manual approval. The App needs Pull requests:
 write and Contents: read, is installed on the org, and is configured
 through two org secrets, `PROMOTE_APP_CLIENT_ID` and
-`PROMOTE_APP_PRIVATE_KEY`. Without them the job fails and names them.
+`PROMOTE_APP_PRIVATE_KEY`. Their values live in Doppler, and Doppler's
+GitHub sync writes them to the org's Actions and Dependabot secrets; they
+are never set by hand in GitHub. Without them the job fails and names
+them.
 
 ## Shared auto-merge into dev
 
@@ -383,7 +386,8 @@ jobs:
   the promotion pull request. The App needs Contents: read and write for
   this; `promote.yml` still mints a read-only token.
 - **Secrets** go in the org's Dependabot secrets as well as its Actions
-  secrets.
+  secrets, since a Dependabot-triggered run sees only Dependabot secrets.
+  Doppler's GitHub sync writes both.
 - **Runs from `main`'s copy** of the consumer's file, like every
   `workflow_run` workflow, so it starts working after the first promotion.
 
@@ -415,10 +419,11 @@ repository a target.
 - **`dry_run`** proves the checkout, toolchain, App and API key without
   calling the model, pushing or posting.
 - **Secrets:** `AGENT_ANTHROPIC_API_KEY`, `AGENT_APP_CLIENT_ID`,
-  `AGENT_APP_PRIVATE_KEY` and `TASK_AGENT_API_KEY`, as organisation secrets
-  visible only to the target repositories. The agent App needs Contents,
-  Pull requests and Actions read and write, installed on the target
-  repositories only.
+  `AGENT_APP_PRIVATE_KEY` and `TASK_AGENT_API_KEY`, as organisation
+  secrets written by Doppler's GitHub sync. The sync scopes an org secret
+  to all repositories, not chosen ones, so what limits the agent is the
+  App: it needs Contents, Pull requests and Actions read and write, and is
+  installed on the target repositories only.
 - **Runs only from the default branch's caller**: `workflow_dispatch`
   needs the caller on `main`, so a new target starts working after its
   first promotion.
@@ -495,7 +500,7 @@ cannot send the dispatch.
   Contents: write: the libraries' release jobs mint a token for `.github`
   to send the dispatch, and `repository_dispatch` requires Contents: write.
 - The org secrets `PROMOTE_APP_CLIENT_ID` and `PROMOTE_APP_PRIVATE_KEY`,
-  visible to this repository and to common-python-utils and identity.
+  written by Doppler's GitHub sync and visible to every repository.
 
 A new consumer needs nothing added to it: it is covered once the App is
 installed on it and its `dev` lock resolves the package.
