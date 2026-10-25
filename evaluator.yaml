@@ -1,5 +1,5 @@
 # .github / evaluator.yaml
-# Per-repo evaluation configuration — ecosystem-standards ADR-001, ADR-002
+# Per-repo evaluation configuration — ecosystem-standards ADR-0001, ADR-0002
 
 # This repo holds GitHub Actions workflow definitions and nothing else: no
 # source, no runtime, no deployment. The `shared-workflows` type appears in
