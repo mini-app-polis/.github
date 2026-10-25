@@ -66,6 +66,39 @@ the second is the directory inside it.
 | `sbom` | `true` | Generate and retain a CycloneDX SBOM |
 | `gitleaks-version` | `8.28.0` | Pinned gitleaks release |
 | `syft-version` | `1.29.1` | Pinned syft release |
+| `self-test` | `false` | Also prove the GitHub advisory pass against known advisories. This repo's own CI turns it on; consumers leave it off |
+
+### Advisory sources
+
+The dependency audit reads two sources, and a finding in either fails it:
+
+| Language | First source | Second source |
+|---|---|---|
+| Python | pip-audit, on PyPI's vulnerability service (PyPA advisories) | GitHub's reviewed advisory database |
+| TypeScript | osv-scanner, on OSV.dev | GitHub's reviewed advisory database |
+
+The second source is what Dependabot alerts read. PyPA and OSV mirror it
+but can lag: on 2026-10-24 GHSA-cx6f-vjhg-g3cc (virtualenv, high) was in
+GitHub's database and in a Dependabot alert while both audits passed the
+same lock. The GitHub pass asks `GET /advisories` about every locked
+package, fails on **high** or **critical**, and lists lower severities
+without failing. A finding names the package, the locked version, the
+advisory id and the first patched version.
+
+- It authenticates with the job's own `GITHUB_TOKEN`, for the rate limit
+  only; no secret is added and the endpoint needs no permission.
+- GitHub matches package names exactly, and stores some Python projects
+  under more than one spelling (`PyYAML` and `pyyaml` carry different
+  advisories), so a Python package is asked about under its lock name, its
+  normalized name and its PyPI display name.
+- The packages the first source leaves out (the project itself, git
+  dependencies, and the fleet's own published libraries) are left out of
+  this one too. A Python line that is not pinned with `==` is printed as
+  unchecked.
+- It fails rather than passes when it has nothing to check, or when GitHub
+  or PyPI cannot be read after three attempts.
+- `dependency-fix.yml` still fixes what pip-audit finds; a finding only the
+  GitHub pass makes is fixed by hand.
 
 ### Not required
 
@@ -516,12 +549,11 @@ tag correctly stays put.
 | Tag | Contains |
 |---|---|
 | `v1` | `security.yml` only, before the osv-scanner swap |
-| `v2` | `security.yml` as most of the fleet calls it today |
-| `v3` | the same `security.yml`, plus `evaluate.yml`, `python-test.yml` and `lambda-deploy.yml`. Moves with each release |
+| `v2` | `security.yml` before the GitHub advisory pass |
+| `v3` | `security.yml` with the GitHub advisory pass, plus `evaluate.yml`, `python-test.yml` and `lambda-deploy.yml`. Moves with each release |
 
-`security.yml` is byte-identical across `v2` and `v3`, so a repo calling it
-may pin either. A repo pinning two different majors is correct, not a
-mistake.
+`v2` no longer moves, so its `security.yml` lacks the GitHub advisory pass
+(see "Advisory sources"); a repo calling `security.yml` pins `v3`.
 
 ### Why this is automated rather than documented
 

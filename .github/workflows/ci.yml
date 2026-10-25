@@ -23,6 +23,10 @@ jobs:
       language: python
       package-manager: pip
       sbom: true
+      # Proves the GitHub advisory pass against known advisories, so a
+      # change to it is caught here rather than by a consumer passing a
+      # lock it should have failed.
+      self-test: true
 
   # The TypeScript branch needs exercising here too, or a change to it
   # reaches consumers untested — which is how the osv-scanner swap in v2
