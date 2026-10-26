@@ -196,7 +196,10 @@ jobs:
             Constraints. Keep the change minimal.
           - Run the repository's checks (for a uv repository: uv run pytest,
             uv run ruff check ., uv run ruff format --check .) and leave them
-            passing.
+            passing. Run each as a command of its own, from the repository
+            root where you start: no cd, no pipes, no && or ;, and no
+            VAR=value prefix. Only these command shapes are allowed, and any
+            other shell command is denied.
           - Do not commit, push or open a pull request: that happens after you.
           - Do not edit CHANGELOG.md or version numbers, and do not edit
             anything under .github/workflows.
@@ -248,6 +251,10 @@ jobs:
           cost=$(jq -r '.total_cost_usd // empty' "$result" 2>/dev/null)
           subtype=$(jq -r '.subtype // empty' "$result" 2>/dev/null)
           text=$(jq -r '.result // empty' "$result" 2>/dev/null)
+          # Each tool call the permission rules refused, so a denied check
+          # names the exact command in the log.
+          jq -r '.permission_denials[]? | "::warning::denied \(.tool_name): \(.tool_input.command // .tool_input.file_path // "" | tostring | .[0:300])"' \
+            "$result" 2>/dev/null || true
           changed=$(git status --porcelain)
           # Its questions, at most ten, as a JSON list for the report.
           printf '%s\n' "$text" | sed -n 's/^QUESTION:[[:space:]]*//p' \
