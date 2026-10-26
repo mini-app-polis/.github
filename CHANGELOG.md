@@ -1,3 +1,10 @@
+## [3.18.2](https://github.com/mini-app-polis/.github/compare/v3.18.1...v3.18.2) (2026-10-26)
+
+
+### Bug Fixes
+
+* give the shared workflows a read-only top-level token default ([d3ed02c](https://github.com/mini-app-polis/.github/commit/d3ed02c5b25c0027d9cfc80508530844e21be6f4))
+
 ## [3.18.1](https://github.com/mini-app-polis/.github/compare/v3.18.0...v3.18.1) (2026-10-26)
 
 
