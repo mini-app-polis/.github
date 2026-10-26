@@ -79,6 +79,9 @@ on:
       PROMOTE_APP_PRIVATE_KEY:
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   automerge:
     # Only a pull request's CI, and only a successful one, can lead to a

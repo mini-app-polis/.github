@@ -54,6 +54,9 @@ on:
         description: "'true' when the plan has changes to apply."
         value: ${{ jobs.plan.outputs.changes }}
 
+permissions:
+  contents: read
+
 jobs:
   plan:
     # Fork pull requests get no secrets, and must not plan with ours.

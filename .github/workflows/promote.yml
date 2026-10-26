@@ -63,6 +63,9 @@ on:
         description: "Private key of that GitHub App."
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   promote:
     runs-on: ubuntu-latest
