@@ -1,3 +1,10 @@
+## [3.18.1](https://github.com/mini-app-polis/.github/compare/v3.18.0...v3.18.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **agent:** run checks as single commands from the root, and log each denied tool call ([354dcc3](https://github.com/mini-app-polis/.github/commit/354dcc3842c9527ccd11c7e1808a3cd388234a15))
+
 # [3.18.0](https://github.com/mini-app-polis/.github/compare/v3.17.0...v3.18.0) (2026-10-25)
 
 
