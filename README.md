@@ -449,6 +449,11 @@ repository a target.
 - **Always reports** its outcome, cost and pull request (or questions) to
   api-kaianolevine-com with the task-agent key, which may post a result
   and nothing else.
+- **Toolchains** follow the repository's lock file: uv, pnpm, npm or
+  Terraform, plus PyYAML for Python scripts under `scripts/` in a
+  repository without `uv.lock`. Each sets up the dependencies before the
+  agent starts and allows its check commands (`uv run`, `pnpm run`,
+  `npm run`, `terraform fmt` and `validate`, `python3 scripts/`).
 - **`dry_run`** proves the checkout, toolchain, App and API key without
   calling the model, pushing or posting.
 - **Secrets:** `AGENT_ANTHROPIC_API_KEY`, `AGENT_APP_CLIENT_ID`,

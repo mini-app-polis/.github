@@ -33,6 +33,13 @@
 # moves the task. A run killed before it can report is failed by
 # task-manager-cog's sweep once it is overdue.
 #
+# **Toolchains.** The repository's lock file says what is installed before
+# the agent starts, and which check commands it may run: uv.lock (uv run),
+# pnpm-lock.yaml (pnpm run), package-lock.json (npm run), and
+# .terraform.lock.hcl (terraform fmt and validate, after an init without a
+# backend). A repository with Python scripts under scripts/ and no uv.lock
+# gets PyYAML and may run them with python3.
+#
 # **dry_run** runs everything but the model, the push and the post: it
 # proves the checkout, the toolchain, the App's credentials and the API key,
 # and prints the result it would have posted.
@@ -178,6 +185,37 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install pnpm
+        if: hashFiles('pnpm-lock.yaml') != ''
+        uses: pnpm/action-setup@v6
+
+      - name: Install the repository's dependencies (pnpm)
+        if: hashFiles('pnpm-lock.yaml') != ''
+        run: pnpm install --frozen-lockfile
+
+      - name: Install the repository's dependencies (npm)
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
+
+      - uses: hashicorp/setup-terraform@v4
+        if: hashFiles('.terraform.lock.hcl') != ''
+        with:
+          terraform_version: "1.16.2"
+          terraform_wrapper: false
+
+      - name: Initialise Terraform without a backend
+        if: hashFiles('.terraform.lock.hcl') != ''
+        run: terraform init -backend=false -input=false
+
+      - uses: actions/setup-python@v7
+        if: hashFiles('uv.lock') == '' && hashFiles('scripts/*.py') != ''
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML for the repository's scripts
+        if: hashFiles('uv.lock') == '' && hashFiles('scripts/*.py') != ''
+        run: pip install pyyaml
+
       - name: Install Claude Code
         env:
           VERSION: ${{ inputs.claude-code-version }}
@@ -194,9 +232,15 @@ jobs:
 
           - Make the change the task's "Done when" describes, within its
             Constraints. Keep the change minimal.
-          - Run the repository's checks (for a uv repository: uv run pytest,
-            uv run ruff check ., uv run ruff format --check .) and leave them
-            passing. Run each as a command of its own, from the repository
+          - Run the repository's checks, the ones its CI workflows run, and
+            leave them passing. For a uv repository: uv run pytest, uv run
+            ruff check ., uv run ruff format --check . For a pnpm or npm
+            repository: its package.json scripts, as pnpm run <script> or
+            npm run <script> (for example check, typecheck, lint, test,
+            build). For Terraform: terraform fmt -check -recursive and
+            terraform validate. For Python scripts under scripts/ with no
+            uv.lock: python3 scripts/<name>.py, as CI runs them.
+            Run each as a command of its own, from the repository
             root where you start: no cd, no pipes, no && or ;, and no
             VAR=value prefix. Only these command shapes are allowed, and any
             other shell command is denied.
@@ -237,6 +281,9 @@ jobs:
             --permission-mode dontAsk \
             --allowedTools Read Edit Write Glob Grep \
               "Bash(uv run *)" "Bash(uv sync *)" "Bash(git diff *)" \
+              "Bash(pnpm run *)" "Bash(npm run *)" \
+              "Bash(terraform fmt *)" "Bash(terraform validate *)" \
+              "Bash(python3 scripts/*)" \
               "Bash(git status *)" "Bash(git log *)" "Bash(ls *)" \
             < "$RUNNER_TEMP/prompt.md" > "$RUNNER_TEMP/result.json"
           echo "exit=$?" >> "$GITHUB_OUTPUT"
