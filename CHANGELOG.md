@@ -1,3 +1,10 @@
+# [3.19.0](https://github.com/mini-app-polis/.github/compare/v3.18.2...v3.19.0) (2026-10-28)
+
+
+### Features
+
+* **agent:** set up and allow the checks for pnpm, npm, Terraform and script repositories ([64f841e](https://github.com/mini-app-polis/.github/commit/64f841ee78a83cf29030929f9d10b291e1756455))
+
 ## [3.18.2](https://github.com/mini-app-polis/.github/compare/v3.18.1...v3.18.2) (2026-10-26)
 
 
