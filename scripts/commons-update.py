@@ -29,7 +29,11 @@ commons-update.yml runs this in three places:
       release's own ranges move. A rewrite of anything else — the lock's
       header, or an unrelated package's markers or sources at the same
       version, which a different uv can produce — fails rather than riding
-      along in a `fix(deps)` pull request nobody reads closely. Then
+      along in a `fix(deps)` pull request nobody reads closely. The one
+      exception is `resolution-markers`, the lock's and a package's: uv
+      derives them afresh whenever it resolves, and the same uv can write
+      the same environments differently after a one-package re-lock, so a
+      change there is listed in the pull request instead. Then
       `uv lock --check`.
 
       --branch-lock is the uv.lock on the update branch, when there is one,
@@ -208,11 +212,19 @@ def cmd_consumes(args: argparse.Namespace) -> int:
 # --- bump --------------------------------------------------------------------
 
 
-def by_name(lock: dict) -> dict[str, list[str]]:
-    """Each package name's entries, as canonical JSON, for comparison."""
+# Written by uv from the forks it derives on each resolve, not from anything
+# a person or a dependency declared: re-locking one package can respell them
+# (`(a and b) or (c and d)` as an equivalent expression) with the same uv.
+DERIVED = "resolution-markers"
+
+
+def by_name(lock: dict, drop: str | None = None) -> dict[str, list[str]]:
+    """Each package name's entries, as canonical JSON, for comparison,
+    without the key `drop` when given."""
     out: dict[str, list[str]] = {}
     for p in lock.get("package", []):
-        out.setdefault(p["name"], []).append(json.dumps(p, sort_keys=True))
+        entry = {k: v for k, v in p.items() if k != drop}
+        out.setdefault(p["name"], []).append(json.dumps(entry, sort_keys=True))
     return {k: sorted(v) for k, v in out.items()}
 
 
@@ -224,18 +236,25 @@ def versions_of(lock: dict, name: str) -> list[str]:
 
 def lock_changes(
     before: dict, after: dict, package: str
-) -> tuple[list[str], list[str]]:
-    """(expected side effects to report, rewrites that should not happen)."""
+) -> tuple[list[str], list[str], list[str]]:
+    """(dependency moves to report, re-derived markers to report, rewrites
+    that should not happen)."""
     effects: list[str] = []
+    markers: list[str] = []
     problems: list[str] = []
 
     head_b = {k: v for k, v in before.items() if k != "package"}
     head_a = {k: v for k, v in after.items() if k != "package"}
     for key in sorted(set(head_b) | set(head_a)):
-        if head_b.get(key) != head_a.get(key):
+        if head_b.get(key) == head_a.get(key):
+            continue
+        if key == DERIVED:
+            markers.append(f"the lock's top-level `{key}`")
+        else:
             problems.append(f"the lock's top-level `{key}` changed")
 
     pb, pa = by_name(before), by_name(after)
+    pb_kept, pa_kept = by_name(before, DERIVED), by_name(after, DERIVED)
     for name in sorted(set(pb) | set(pa)):
         if name == package or pb.get(name) == pa.get(name):
             continue
@@ -248,12 +267,16 @@ def lock_changes(
                 f"{name} {', '.join(versions_of(before, name))} → "
                 f"{', '.join(versions_of(after, name))}"
             )
+        elif pb_kept.get(name) == pa_kept.get(name):
+            markers.append(
+                f"{name} {', '.join(versions_of(after, name))}'s `{DERIVED}`"
+            )
         else:
             problems.append(
                 f"{name} {', '.join(versions_of(after, name))} was rewritten "
                 "at the same version (markers, sources or metadata)"
             )
-    return effects, problems
+    return effects, markers, problems
 
 
 def uv(
@@ -394,7 +417,7 @@ def cmd_bump(args: argparse.Namespace) -> int:
             else:
                 after_text = lock_path.read_text()
                 after = tomllib.loads(after_text)
-                effects, problems = lock_changes(before, after, package)
+                effects, markers, problems = lock_changes(before, after, package)
                 check = uv(["lock", "--check"], repo)
                 if check.returncode != 0:
                     problems.append(
@@ -440,6 +463,17 @@ def cmd_bump(args: argparse.Namespace) -> int:
                             "The new release's own dependencies also moved:",
                             "",
                             *[f"- {e}" for e in effects],
+                            "",
+                        ]
+                    if markers:
+                        body += [
+                            (
+                                "uv re-derived these environment markers while "
+                                "resolving (`uv lock --check` passes on the "
+                                "result):"
+                            ),
+                            "",
+                            *[f"- {m}" for m in markers],
                             "",
                         ]
                     body += [
