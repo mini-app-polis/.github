@@ -1,3 +1,10 @@
+## [3.19.1](https://github.com/mini-app-polis/.github/compare/v3.19.0...v3.19.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **commons-update:** accept re-derived resolution-markers in a one-package bump ([75c010a](https://github.com/mini-app-polis/.github/commit/75c010a6ee9ced3b010e27d7d47754e09cf6c212))
+
 # [3.19.0](https://github.com/mini-app-polis/.github/compare/v3.18.2...v3.19.0) (2026-10-28)
 
 
