@@ -1,0 +1,6 @@
+{
+  "name": "semantic-release-npm-stub",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Stands in for npm, which semantic-release pulls in through @semantic-release/npm. No .releaserc in the fleet uses that plugin, so npm and the copies it bundles are kept out of the lockfile. See ../README.md."
+}

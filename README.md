@@ -1,12 +1,13 @@
 # .github
 
-Org-wide GitHub configuration for **mini-app-polis**. Four reusable
+Org-wide GitHub configuration for **mini-app-polis**. Reusable
 workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 
 | Stage | Workflow |
 |---|---|
 | `security` | `security.yml` — the fleet's shared security controls |
 | `test` | `python-test.yml` — lock check, lint, format and tests for a uv repo |
+| `release` | `release.yml` — semantic-release from the fleet's locked tooling |
 | `deploy` | `lambda-deploy.yml` — build, prove and upload a cog's Lambda zip |
 | `evaluate` | `evaluate.yml` — ask for the repository to be evaluated |
 
@@ -220,6 +221,60 @@ jobs:
 |---|---|---|
 | `python-version` | `3.11` | Match the runtime the repo deploys to |
 | `pytest-args` | `--cov=src --cov-report=term-missing` | Appended to pytest |
+
+## Shared release
+
+`.github/workflows/release.yml` runs semantic-release for the calling
+repository. It wraps the composite action `.github/actions/semantic-release`,
+which installs semantic-release and its plugins with `npm ci` from the
+lockfile committed beside it, then runs semantic-release in the caller's
+checkout. Every release in the fleet installs the same reviewed versions,
+transitive dependencies included, and Dependabot moves them forward
+(ecosystem-standards VER-006). The action's README says what is locked and
+why `@semantic-release/npm` is not used.
+
+### Using it
+
+A release job that is only checkout and release calls the workflow:
+
+```yaml
+jobs:
+  release:
+    needs: [test, security]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: mini-app-polis/.github/.github/workflows/release.yml@v3
+```
+
+A release job with steps of its own around the release (a dependency
+install before it, a dispatch after it) keeps its job and replaces its
+semantic-release install and run with the action:
+
+```yaml
+      - uses: mini-app-polis/.github/.github/actions/semantic-release@v3
+        id: release
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+Both expose `tag`: the `v*` tag the run released, or empty when it
+released nothing.
+
+### Inputs
+
+| Input | Default | Meaning |
+|---|---|---|
+| `dry-run` | `false` | Work out the next version and the notes, and change nothing |
+| `node-version` | `22` | Node.js version semantic-release runs under |
+| `git-author-name` | empty | Author and committer name of the release commit; empty keeps semantic-release-bot |
+| `git-author-email` | empty | Author and committer email, used with `git-author-name` |
+| `github-token` | the job's token | Action only: the token semantic-release pushes and creates the release with |
+
+Run by hand from the Actions tab, `release.yml` is a dry run of this
+repository's own next release.
 
 ## Shared Lambda deploy
 

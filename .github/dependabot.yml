@@ -28,3 +28,18 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: "ci(deps)"
+
+  # The release tooling every repo's release installs: semantic-release and
+  # its plugins, locked in .github/actions/semantic-release (VER-006).
+  # Moving this lockfile forward is the only way those versions change.
+  - package-ecosystem: "npm"
+    directory: "/.github/actions/semantic-release"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      release-tooling:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"

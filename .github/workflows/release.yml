@@ -1,0 +1,86 @@
+# The fleet's shared release job (ecosystem-standards CD-026, VER-006).
+#
+# Checks out the caller with its full history and runs the semantic-release
+# action, which installs semantic-release and its plugins from the
+# lockfile committed beside it. A repository whose release job is only
+# that calls this workflow; one with steps of its own around the release
+# (a build before it, a dispatch after it) calls the action as a step
+# instead. Both install the same lockfile.
+#
+# Usage, in a consumer's .github/workflows/ci.yml:
+#
+#   jobs:
+#     release:
+#       needs: [test, security]
+#       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+#       permissions:
+#         contents: write
+#         issues: write
+#         pull-requests: write
+#       uses: mini-app-polis/.github/.github/workflows/release.yml@v3
+#
+# The action is referenced with `$/`, which resolves to this repository at
+# the commit of this workflow that is running, so a caller pinned to a tag
+# gets the action and lockfile from that same tag.
+#
+# Run by hand from the Actions tab, it is a dry run of this repository's
+# own next release, and nothing else: it changes nothing.
+
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      dry-run:
+        description: "Run semantic-release --dry-run: work out the next version and the notes, and change nothing."
+        type: boolean
+        default: false
+      node-version:
+        description: Node.js version to run semantic-release under.
+        type: string
+        default: "22"
+      git-author-name:
+        description: Author and committer name for the release commit. Empty keeps semantic-release-bot.
+        type: string
+        default: ""
+      git-author-email:
+        description: Author and committer email for the release commit. Used only with git-author-name.
+        type: string
+        default: ""
+    outputs:
+      tag:
+        description: The v* tag this run released, or empty when it released nothing.
+        value: ${{ jobs.release.outputs.tag }}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # semantic-release reads the tag history to decide the next
+          # version.
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Release
+        id: release
+        uses: $/.github/actions/semantic-release
+        with:
+          github-token: ${{ github.token }}
+          # A run started by hand is always a dry run.
+          dry-run: ${{ github.event_name == 'workflow_dispatch' || inputs.dry-run }}
+          node-version: ${{ inputs.node-version || '22' }}
+          git-author-name: ${{ inputs.git-author-name }}
+          git-author-email: ${{ inputs.git-author-email }}

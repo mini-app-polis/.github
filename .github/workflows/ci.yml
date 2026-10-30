@@ -30,10 +30,9 @@ jobs:
 
   # The TypeScript branch needs exercising here too, or a change to it
   # reaches consumers untested — which is how the osv-scanner swap in v2
-  # would otherwise have gone out. This repo carries no lockfile, so what
-  # this covers is the preflight skip path rather than a real scan. That
-  # is the case most likely to break silently, and the cheapest place to
-  # find out is here.
+  # would otherwise have gone out. The only Node lockfile here is the
+  # release tooling's, in .github/actions/semantic-release, so this job is
+  # also the audit of what every repo's release installs.
   test:
     uses: ./.github/workflows/security.yml
     with:
@@ -42,40 +41,18 @@ jobs:
 
   # CD-025: needs the security job, not just the work job. A release that
   # lists only `test` goes out whether or not the scan passed.
+  #
+  # Calls the local release.yml rather than the published tag, like the
+  # security self-calls above, so a change to the release workflow or its
+  # locked tooling is exercised by this repo's own release first.
   release:
     needs: [test, security]
-    runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: write
       issues: write
       pull-requests: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # semantic-release reads the tag history to decide the next
-          # version, and move-major-tag.sh pushes a tag of its own.
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-      - name: Install semantic-release plugins
-        run: |
-          npm install --no-save \
-            semantic-release \
-            @semantic-release/changelog \
-            @semantic-release/exec \
-            @semantic-release/git \
-            @semantic-release/github \
-            @semantic-release/npm \
-            @semantic-release/commit-analyzer \
-            @semantic-release/release-notes-generator
-      - name: Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx semantic-release
+    uses: ./.github/workflows/release.yml
 
   # This repo asks for its own conformance evaluation like any other, and
   # like the security jobs above it calls the local file rather than the

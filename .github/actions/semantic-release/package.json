@@ -1,0 +1,18 @@
+{
+  "name": "semantic-release-tooling",
+  "private": true,
+  "description": "The fleet's release tooling: semantic-release and the plugins the repos' .releaserc files list, installed with npm ci from the lockfile beside this file. See README.md.",
+  "dependencies": {
+    "@semantic-release/changelog": "7.0.0",
+    "@semantic-release/commit-analyzer": "13.0.1",
+    "@semantic-release/exec": "7.1.0",
+    "@semantic-release/git": "11.0.1",
+    "@semantic-release/github": "12.0.10",
+    "@semantic-release/release-notes-generator": "14.1.1",
+    "npm": "file:./npm-stub",
+    "semantic-release": "25.0.9"
+  },
+  "overrides": {
+    "npm": "$npm"
+  }
+}

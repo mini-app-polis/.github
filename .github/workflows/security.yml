@@ -574,6 +574,9 @@ jobs:
                   for result in results
                   for p in result.get("packages", [])
                   if p["package"].get("ecosystem") == "npm"
+                  # A local link (a file: dependency) has no version and
+                  # nothing to look up; osv-scanner skips it as local too.
+                  and p["package"].get("version")
               }
           )
           with open("/tmp/audit-packages.tsv", "w") as out:
