@@ -522,7 +522,10 @@ repository a target.
   grooming.
 - **Always reports** its outcome, cost and pull request (or questions) to
   api-kaianolevine-com with the task-agent key, which may post a result
-  and nothing else.
+  and nothing else. task-manager-cog posts a succeeded run's result on its
+  task as the `Handed off:` comment and moves the task to Review. The
+  task closes when a `Landed:` comment confirms green CI on dev, from
+  whoever confirms it.
 - **Toolchains** follow the repository's lock file: uv, pnpm, npm or
   Terraform, plus PyYAML for Python scripts under `scripts/` in a
   repository without `uv.lock`. Each sets up the dependencies before the

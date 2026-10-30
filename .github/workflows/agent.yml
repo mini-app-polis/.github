@@ -30,7 +30,8 @@
 # it, and posts how the run ended, what it cost (Claude Code's own figure)
 # and the pull request, or its questions, with the task-agent machine key, which may post a
 # result and nothing else. The API hands it to task-manager-cog, which
-# moves the task. A run killed before it can report is failed by
+# moves the task and, for a pull request, posts the `Handed off:` comment.
+# A run killed before it can report is failed by
 # task-manager-cog's sweep once it is overdue.
 #
 # **Toolchains.** The repository's lock file says what is installed before
@@ -375,7 +376,7 @@ jobs:
           {
             echo "Opened by the agent for ${TASK_ID} (agent run \`${RUN_ID}\`), cost \$${COST:-unknown}."
             echo
-            echo "A draft: review it, merge it into \`dev\`, confirm the change in dev, then mark the task done. The agent's own account below is not proof the work is done."
+            echo "A draft: review it and merge it into \`dev\`. The task closes when a comment on it starting \`Landed:\` confirms green CI on dev. The agent's own account below is not proof the work is done."
             echo
             echo "### The agent's summary"
             echo
