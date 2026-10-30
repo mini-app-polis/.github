@@ -101,6 +101,25 @@ advisory id and the first patched version.
 - `dependency-fix.yml` still fixes what pip-audit finds; a finding only the
   GitHub pass makes is fixed by hand.
 
+### Exceptions
+
+An advisory with no fixed release can be excepted for one lockfile, for a
+while, in an `osv-scanner.toml` beside that lockfile:
+
+```toml
+[[IgnoredVulns]]
+id = "GHSA-xxxx-xxxx-xxxx"
+ignoreUntil = 2027-01-27
+reason = "Why it cannot be fixed now, and why it is not reachable."
+```
+
+osv-scanner honours the file for that lockfile, and the GitHub advisory pass
+honours each entry that has an `ignoreUntil` date, reporting the finding as a
+warning instead of failing. An exception covers a package only where every
+lockfile holding it carries the same entry. On the date the finding gates
+again, so an exception is renewed with a reason or removed, never forgotten.
+The Node audit reads these files; the Python audit does not yet.
+
 ### Not required
 
 Calling this workflow is one of two conformant shapes. A repo may equally

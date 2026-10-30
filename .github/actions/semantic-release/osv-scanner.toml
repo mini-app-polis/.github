@@ -1,0 +1,14 @@
+# Exceptions to the dependency audit for the release tooling lockfile only.
+# osv-scanner honours this file for the lockfile beside it, and security.yml's
+# GitHub advisory pass honours each entry that has an ignoreUntil date. On
+# that date the finding gates again: renew it with a reason, or remove it.
+
+# braces is the brace expansion behind micromatch, which semantic-release
+# and @semantic-release/commit-analyzer use to match branch names and
+# release rules. 3.0.3 is the newest braces, and no release fixes this
+# advisory. The input it reaches is the repository's own .releaserc and its
+# commit messages, in a job that runs only on a push to main.
+[[IgnoredVulns]]
+id = "GHSA-vfj7-8cjw-p6xm"
+ignoreUntil = 2027-01-27
+reason = "No fixed braces release; reached only through semantic-release's matching of the repository's own config and commits."

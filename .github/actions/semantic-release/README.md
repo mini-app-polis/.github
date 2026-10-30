@@ -35,3 +35,9 @@ listed where `@semantic-release/npm` would have been, before
 `@semantic-release/git`. That `npm` is the one setup-node installs, not this
 lockfile's. A `.releaserc` that still lists `@semantic-release/npm` fails at
 release time, because the npm it would run is the stub.
+
+## Exceptions
+
+`osv-scanner.toml` here holds the audit exceptions for this lockfile only,
+each with a reason and an expiry date. See "Exceptions" in the repository
+README.

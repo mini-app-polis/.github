@@ -79,11 +79,17 @@ env:
   GHSA_AUDIT_PY: |
       """Check pinned dependencies against GitHub's reviewed advisory database.
 
-      Usage: python -c "$GHSA_AUDIT_PY" <pip|npm> <packages.tsv>
+      Usage: python -c "$GHSA_AUDIT_PY" <pip|npm> <packages.tsv> [ignores.tsv]
 
       Each line of packages.tsv is "name<TAB>version". A locked package with a
       reviewed advisory at high or critical severity fails the check; lower
       severities are listed and do not gate.
+
+      Each line of ignores.tsv is "id<TAB>name<TAB>version<TAB>until<TAB>reason":
+      an exception the repository recorded for that advisory on that locked
+      package, in the osv-scanner.toml beside its lockfile. Until the date
+      (YYYY-MM-DD, UTC) a matching finding is reported as a warning and does
+      not gate; from that day it gates again.
 
       GitHub matches package names exactly, and the database spells one project
       more than one way (``Django`` and ``django``, ``PyYAML`` and ``pyyaml`` carry
@@ -102,6 +108,7 @@ env:
 
       from __future__ import annotations
 
+      import datetime
       import json
       import os
       import re
@@ -216,7 +223,24 @@ env:
           return found
 
 
-      def main(ecosystem: str, path: str) -> int:
+      def load_ignores(ecosystem: str, path: str | None) -> dict[tuple[str, str, str], tuple[str, str]]:
+          """(id, normalized name, version) -> (until, reason), for exceptions not yet expired."""
+          ignores: dict[tuple[str, str, str], tuple[str, str]] = {}
+          if not path:
+              return ignores
+          today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+          with open(path) as handle:
+              for line in handle:
+                  if not line.strip():
+                      continue
+                  ghsa_id, name, version, until, reason = line.rstrip("\n").split("\t", 4)
+                  if until >= today:
+                      ignores[(ghsa_id, normalize(ecosystem, name), version)] = (until, reason)
+          return ignores
+
+
+      def main(ecosystem: str, path: str, ignore_path: str | None = None) -> int:
+          ignores = load_ignores(ecosystem, ignore_path)
           packages: dict[str, tuple[str, set[str]]] = {}
           with open(path) as handle:
               for line in handle:
@@ -254,7 +278,13 @@ env:
 
           print(f"Checked {len(locked)} locked {ecosystem} packages against GitHub's "
                 "reviewed advisory database.")
-          gating = [f for f in findings if f[3] in GATING]
+          excepted = [f for f in findings
+                      if (f[2], normalize(ecosystem, f[0]), f[1]) in ignores]
+          gating = [f for f in findings if f[3] in GATING and f not in excepted]
+          for name, version, ghsa_id, severity, fix in excepted:
+              until, reason = ignores[(ghsa_id, normalize(ecosystem, name), version)]
+              print(f"::warning::{name} {version} has {ghsa_id} ({severity}); excepted "
+                    f"until {until} by osv-scanner.toml: {reason}")
           if findings:
               print(f"{'Name':<32} {'Version':<16} {'ID':<22} {'Severity':<9} Fix Versions")
               for name, version, ghsa_id, severity, fix in findings:
@@ -265,12 +295,12 @@ env:
           if gating:
               return 1
           if findings:
-              print("Only advisories below high severity: not gating.")
+              print("Only advisories below high severity, or excepted: not gating.")
           return 0
 
 
       if __name__ == "__main__":
-          sys.exit(main(sys.argv[1], sys.argv[2]))
+          sys.exit(main(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None))
 
 jobs:
   # SEC-001 / SEC-002. Gating: a detected secret fails the build. The
@@ -562,28 +592,62 @@ jobs:
           python -m pip install --quiet packaging
           osv-scanner scan source --recursive --all-packages --offline \
             --format json --output-file /tmp/osv-packages.json ./ > /dev/null 2>&1 || true
+          # Exceptions: osv-scanner.toml beside a lockfile, the file
+          # osv-scanner itself honours there. Each [[IgnoredVulns]] entry
+          # needs an ignoreUntil date to be honoured here as well; one
+          # without a date still gates in this pass. An exception covers a
+          # package only when every lockfile holding that package@version
+          # carries it, so it never leaks to a lockfile that did not ask.
           python - <<'PY'
           import json
+          import os
+          import tomllib
           try:
               results = json.load(open("/tmp/osv-packages.json"))["results"]
           except (OSError, ValueError, KeyError):
               results = []
-          packages = sorted(
-              {
+          by_lock: dict[str, set[tuple[str, str]]] = {}
+          for result in results:
+              lock = (result.get("source") or {}).get("path", "")
+              by_lock.setdefault(lock, set()).update(
                   (p["package"]["name"], p["package"]["version"])
-                  for result in results
                   for p in result.get("packages", [])
                   if p["package"].get("ecosystem") == "npm"
                   # A local link (a file: dependency) has no version and
                   # nothing to look up; osv-scanner skips it as local too.
                   and p["package"].get("version")
-              }
-          )
+              )
+          packages = sorted(set().union(*by_lock.values()))
           with open("/tmp/audit-packages.tsv", "w") as out:
               out.writelines(f"{name}\t{version}\n" for name, version in packages)
           print(f"Listed {len(packages)} npm packages from the lockfiles.")
+
+          excepted: dict[str, dict[str, tuple[str, str]]] = {}
+          for lock in by_lock:
+              config = os.path.join(os.path.dirname(lock), "osv-scanner.toml")
+              if not os.path.isfile(config):
+                  continue
+              with open(config, "rb") as handle:
+                  entries = tomllib.load(handle).get("IgnoredVulns", [])
+              excepted[lock] = {
+                  str(e["id"]): (str(e["ignoreUntil"])[:10], str(e.get("reason", "")).replace("\t", " ").replace("\n", " "))
+                  for e in entries
+                  if e.get("id") and e.get("ignoreUntil")
+              }
+          rows = set()
+          for lock, ids in excepted.items():
+              for ghsa_id, (until, reason) in ids.items():
+                  for name, version in by_lock[lock]:
+                      holders = [l for l, pkgs in by_lock.items() if (name, version) in pkgs]
+                      if all(ghsa_id in excepted.get(l, {}) for l in holders):
+                          rows.add((ghsa_id, name, version, until, reason))
+          with open("/tmp/audit-ignores.tsv", "w") as out:
+              out.writelines("\t".join(row) + "\n" for row in sorted(rows))
+          for lock, ids in excepted.items():
+              for ghsa_id, (until, reason) in sorted(ids.items()):
+                  print(f"Exception in {os.path.relpath(lock)}: {ghsa_id} until {until} ({reason})")
           PY
-          python -c "${GHSA_AUDIT_PY}" npm /tmp/audit-packages.tsv
+          python -c "${GHSA_AUDIT_PY}" npm /tmp/audit-packages.tsv /tmp/audit-ignores.tsv
 
   # SEC-004. Not gating, by design: SAST is noisy enough that a blocking
   # gate on day one gets switched off rather than fixed. The findings go
