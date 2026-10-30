@@ -1,3 +1,11 @@
+# [3.20.0](https://github.com/mini-app-polis/.github/compare/v3.19.1...v3.20.0) (2026-10-30)
+
+
+### Features
+
+* **release:** shared release workflow that installs semantic-release from a committed lockfile ([d9db3e2](https://github.com/mini-app-polis/.github/commit/d9db3e2ac579d0a0aee249679588e385778223b2))
+* **security:** dated, per-lockfile audit exceptions from osv-scanner.toml ([05dcf3f](https://github.com/mini-app-polis/.github/commit/05dcf3fd7c4d1bba4260c0e2c4ff2608867cbc21))
+
 ## [3.19.1](https://github.com/mini-app-polis/.github/compare/v3.19.0...v3.19.1) (2026-10-29)
 
 
