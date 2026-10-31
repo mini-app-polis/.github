@@ -1,3 +1,10 @@
+# [3.21.0](https://github.com/mini-app-polis/.github/compare/v3.20.0...v3.21.0) (2026-10-31)
+
+
+### Features
+
+* **dependency-fix:** fix pnpm repositories with package.json bumps and pnpm.overrides ([0e670f6](https://github.com/mini-app-polis/.github/commit/0e670f6ae5f378614b709717ac4935b013ed0457))
+
 # [3.20.0](https://github.com/mini-app-polis/.github/compare/v3.19.1...v3.20.0) (2026-10-30)
 
 
