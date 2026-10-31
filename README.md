@@ -98,8 +98,8 @@ advisory id and the first patched version.
   unchecked.
 - It fails rather than passes when it has nothing to check, or when GitHub
   or PyPI cannot be read after three attempts.
-- `dependency-fix.yml` still fixes what pip-audit finds; a finding only the
-  GitHub pass makes is fixed by hand.
+- `dependency-fix.yml` still fixes what pip-audit or osv-scanner finds; a
+  finding only the GitHub pass makes is fixed by hand.
 
 ### Exceptions
 
@@ -547,9 +547,10 @@ repository a target.
 
 Two workflows here are not called by anything. They run in this repository,
 find every repository the promote App is installed on that has a `uv.lock`
-on `dev`, and re-lock each one, opening one `fix(deps)` pull request into
-`dev` per repository. `automerge.yml` merges it once CI is green, and it
-reaches `main` through the promotion pull request like anything else.
+on `dev` (for `dependency-fix.yml`, or a `pnpm-lock.yaml`), and re-lock
+each one, opening one `fix(deps)` pull request into `dev` per repository.
+`automerge.yml` merges it once CI is green, and it reaches `main` through
+the promotion pull request like anything else.
 Both open or refresh their pull request with `scripts/open-lock-pr.sh`: the
 branch is one commit on top of `dev`, and is left alone, not re-pushed, when
 it already carries the same lock on the current `dev`.
@@ -558,6 +559,26 @@ it already carries the same lock on the current `dev`.
 |---|---|---|---|
 | `dependency-fix.yml` | once a day (10:23 UTC), or by hand | each package the dependency audit (SEC-003) flags, to the smallest version that clears it | `security-fix/deps` |
 | `commons-update.yml` | a `commons-released` repository_dispatch from a library's release job, or by hand | one fleet library, to the version just released | `commons-update/<package>` |
+
+### dependency-fix in a pnpm repository
+
+pnpm cannot re-lock one package to a chosen version, so the fix is written
+into `package.json` and the lock re-resolved from it
+(`scripts/fix-vulnerable-pnpm-deps.py`), against the same osv-scanner audit
+security.yml runs:
+
+- **A direct dependency** at the flagged version has its declared range
+  raised to the fixed version, keeping its `^`, `~` or exact form.
+- **A transitive one** gets a `pnpm.overrides` entry for its release line,
+  `"name@7": "^7.29.0"`, or `"name@>=0.24.0 <0.25.0": "^0.25.0"` when the fix
+  is past the line. pnpm applies a keyed override only where the range a
+  dependent asks for falls inside the key, which is why the key is the whole
+  line rather than the vulnerable range. An override already under the same
+  key, or the bare name, is raised instead.
+- An edit that does not resolve, or does not clear its advisory, is dropped,
+  and the advisory is reported as not cleared.
+
+The pull request carries `package.json` and `pnpm-lock.yaml`.
 
 ### commons-update
 

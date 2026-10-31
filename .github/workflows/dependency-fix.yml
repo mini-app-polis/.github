@@ -4,7 +4,10 @@
 # published advisory. It finds; it never fixes. The fix is nearly always a
 # re-lock of one transitive package, and it is needed in every repo on that
 # package at once — on 2026-09-30 urllib3 and virtualenv were bumped by hand
-# in api-kaianolevine-com, and every other uv repo carried the same two.
+# in api-kaianolevine-com, and every other uv repo carried the same two. A
+# pnpm repo is the same job with a different lever: a raised range in
+# package.json for a direct dependency, a `pnpm.overrides` entry for a
+# transitive one, then a re-lock.
 #
 # Neither existing mechanism covers it. Dependabot security updates act on
 # GitHub's advisory database, which lags the PyPA advisories pip-audit reads
@@ -21,25 +24,32 @@
 # advisory does not wait for the next scheduled run. Either way:
 #
 #   1. discover — every repository the promote App is installed on, not
-#      archived, with a uv.lock on `dev`. A new repo is covered the day the
-#      App is installed on it; nothing is added to the repo itself.
+#      archived, with a uv.lock or a pnpm-lock.yaml on `dev` (uv.lock wins
+#      if it has both). A new repo is covered the day the App is installed
+#      on it; nothing is added to the repo itself.
 #   2. fix, per repository — check out `dev`, run the same audit
 #      security.yml runs, re-lock each flagged package at the smallest
-#      version that clears it (scripts/fix-vulnerable-deps.py), re-audit,
-#      and open or refresh one `fix(deps)` pull request into `dev` from the
+#      version that clears it (scripts/fix-vulnerable-deps.py for uv,
+#      scripts/fix-vulnerable-pnpm-deps.py for pnpm), re-audit, and open or
+#      refresh one `fix(deps)` pull request into `dev` from the
 #      `security-fix/deps` branch. automerge.yml merges it once CI is green;
 #      it reaches `main` through the promotion pull request like anything
 #      else.
 #
 # A job fails, and says why in its summary, only when an advisory is left
 # that re-locking cannot clear: no fixed version is published yet, or a
-# declared range keeps the lock below it. That is the case that needs a
+# declared range keeps the lock below it (or, for pnpm, the dependency is
+# declared in a form with no simple range to raise). That is the case that needs a
 # person, and the red job is how it gets one.
 #
 # When `dev` is already clean the job opens nothing, and closes a leftover
 # pull request from an earlier run. When the branch already holds the same
 # fix on top of the current `dev`, it is left alone rather than re-pushed,
 # so an unmerged fix does not restart CI every day.
+#
+# Each repository is audited with the first source its own build uses:
+# pip-audit for uv, osv-scanner for pnpm. A finding only security.yml's
+# GitHub advisory pass makes is fixed by hand.
 #
 # Runs as the promote App (the org secrets promote.yml and automerge.yml
 # use), for two reasons: GITHUB_TOKEN cannot reach other repositories, and a
@@ -76,6 +86,9 @@ concurrency:
 env:
   ORG: mini-app-polis
   BRANCH: security-fix/deps
+  # The osv-scanner security.yml audits pnpm repositories with: keep the two
+  # in step, so the fix and the gate read the same findings.
+  OSV_SCANNER_VERSION: "2.5.1"
 
 jobs:
   discover:
@@ -104,7 +117,8 @@ jobs:
           owner: ${{ env.ORG }}
           permission-contents: read
 
-      - name: List repositories with a uv.lock on dev
+      # One matrix entry per repository: its name and which lock it has.
+      - name: List repositories with a uv.lock or pnpm-lock.yaml on dev
         id: list
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -115,16 +129,19 @@ jobs:
           while read -r name; do
             [ -n "$ONLY" ] && [ "$name" != "$ONLY" ] && continue
             if gh api "repos/${ORG}/${name}/contents/uv.lock?ref=dev" --silent 2>/dev/null; then
-              repos+=("$name")
+              repos+=("${name} uv")
+            elif gh api "repos/${ORG}/${name}/contents/pnpm-lock.yaml?ref=dev" --silent 2>/dev/null; then
+              repos+=("${name} pnpm")
             fi
           done < <(gh api --paginate /installation/repositories \
                      --jq '.repositories[] | select(.archived | not) | .name')
           echo "Fleet: ${repos[*]:-none}"
           if [ -n "$ONLY" ] && [ "${#repos[@]}" -eq 0 ]; then
-            echo "::error::${ORG}/${ONLY} has no uv.lock on dev, or the App is not installed on it."
+            echo "::error::${ORG}/${ONLY} has no uv.lock or pnpm-lock.yaml on dev, or the App is not installed on it."
             exit 1
           fi
-          printf '%s\n' "${repos[@]}" | jq -Rnc '[inputs | select(length > 0)]' > repos.json
+          printf '%s\n' "${repos[@]}" \
+            | jq -Rnc '[inputs | select(length > 0) | split(" ") | {repo: .[0], kind: .[1]}]' > repos.json
           echo "repos=$(cat repos.json)" >> "$GITHUB_OUTPUT"
 
   fix:
@@ -135,7 +152,7 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        repo: ${{ fromJSON(needs.discover.outputs.repos) }}
+        include: ${{ fromJSON(needs.discover.outputs.repos) }}
     steps:
       # This repository, for the script.
       - uses: actions/checkout@v7
@@ -167,6 +184,7 @@ jobs:
           python-version: "3.11"
 
       - name: Set up uv
+        if: matrix.kind == 'uv'
         uses: astral-sh/setup-uv@v7
         with:
           # The target's own `[tool.uv] required-version`, so the re-lock is
@@ -175,16 +193,62 @@ jobs:
           # this repository is at fleet/ and the target at target/.
           version-file: target/pyproject.toml
 
-      - name: Re-lock vulnerable dependencies
-        id: fix
+      # The same Node and pnpm as the target's own CI: Node 22, and the pnpm
+      # its package.json `packageManager` names. action-setup reads
+      # package.json from the workspace root by default, and the target is
+      # at target/.
+      - name: Set up Node
+        if: matrix.kind == 'pnpm'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Set up pnpm
+        if: matrix.kind == 'pnpm'
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: target/package.json
+
+      # As security.yml installs it: the asset URL from the release API.
+      - name: Install osv-scanner
+        if: matrix.kind == 'pnpm'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip pip-audit
-          python fleet/scripts/fix-vulnerable-deps.py target
+          api="https://api.github.com/repos/google/osv-scanner/releases/tags/v${OSV_SCANNER_VERSION}"
+          url="$(curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" "${api}" \
+                 | jq -r '.assets[].browser_download_url
+                          | select(test("linux[_-]amd64([.]tar[.]gz)?$"))' \
+                 | head -1)"
+          if [ -z "${url}" ]; then
+            echo "::error::No linux/amd64 asset found for osv-scanner v${OSV_SCANNER_VERSION}."
+            exit 1
+          fi
+          case "${url}" in
+            *.tar.gz) curl -sSfL "${url}" | sudo tar -xz -C /usr/local/bin osv-scanner ;;
+            *)        sudo curl -sSfL "${url}" -o /usr/local/bin/osv-scanner ;;
+          esac
+          sudo chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      - name: Re-lock vulnerable dependencies
+        id: fix
+        env:
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" = pnpm ]; then
+            python -m pip install --upgrade pip pyyaml
+            python fleet/scripts/fix-vulnerable-pnpm-deps.py target
+          else
+            python -m pip install --upgrade pip pip-audit
+            python fleet/scripts/fix-vulnerable-deps.py target
+          fi
           cat fix-report.md >> "$GITHUB_STEP_SUMMARY"
 
       # The branch is always one commit on top of dev; if it already is that
-      # commit, with this lock, nothing is pushed. Shared with
+      # commit, with these files, nothing is pushed. Shared with
       # commons-update.yml.
       - name: Open or refresh the pull request
         if: steps.fix.outputs.changed == 'true'
@@ -193,7 +257,12 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SLUG: ${{ steps.app-token.outputs.app-slug }}
           REPO: ${{ env.ORG }}/${{ matrix.repo }}
-        run: bash ../fleet/scripts/open-lock-pr.sh "$REPO" "$BRANCH" ../fix-subject.txt ../fix-body.md
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          files=(uv.lock)
+          [ "$KIND" = pnpm ] && files=(package.json pnpm-lock.yaml)
+          bash ../fleet/scripts/open-lock-pr.sh "$REPO" "$BRANCH" ../fix-subject.txt ../fix-body.md "${files[@]}"
 
       - name: Close a pull request dev no longer needs
         if: steps.fix.outputs.changed != 'true' && steps.fix.outputs.remaining == '0'
