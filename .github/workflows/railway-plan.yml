@@ -21,6 +21,11 @@
 # Plan output redacts variable values (Railway CLI default), so the summary
 # carries names, never values.
 #
+# **.railway/ installs with pnpm or npm.** With a .railway/pnpm-lock.yaml it
+# is `pnpm install --frozen-lockfile`, at the pnpm version named by the
+# packageManager field of .railway/package.json (required); otherwise
+# `npm ci` from .railway/package-lock.json. Same in railway-apply.yml.
+#
 # Usage, from a repository's .github/workflows/railway-plan.yml:
 #
 #   on:
@@ -74,17 +79,30 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # pnpm only for a .railway/ that has moved to it; the version comes
+      # from the packageManager field of .railway/package.json.
+      - name: Set up pnpm
+        if: hashFiles('.railway/pnpm-lock.yaml') != ''
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: .railway/package.json
+
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
 
       # The IaC SDK the CLI evaluates railway.ts with lives in .railway/
       # (its own package.json and lockfile), not at the root of a Python
-      # repository.
+      # repository. A .railway/pnpm-lock.yaml installs it with pnpm
+      # (frozen lockfile); otherwise package-lock.json with npm ci.
       - name: Install the Railway CLI and IaC SDK
         run: |
           npm install --global --no-audit --no-fund @railway/cli@5.68.0
-          npm ci --prefix .railway --no-audit --no-fund
+          if [ -f .railway/pnpm-lock.yaml ]; then
+            pnpm install --dir .railway --frozen-lockfile
+          else
+            npm ci --prefix .railway --no-audit --no-fund
+          fi
 
       # --detailed-exit-code: 0 no changes, 2 changes, anything else an error.
       - name: plan

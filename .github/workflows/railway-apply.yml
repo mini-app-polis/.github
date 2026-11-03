@@ -24,6 +24,10 @@
 # to it, kept as a repository secret. Never an account, workspace or
 # org-wide token.
 #
+# .railway/ installs as in the plan: pnpm (frozen lockfile, version from
+# .railway/package.json's packageManager) when .railway/pnpm-lock.yaml
+# exists, npm ci otherwise.
+#
 # Usage, from a repository's .github/workflows/railway-apply.yml:
 #
 #   on:
@@ -103,6 +107,14 @@ jobs:
 
       - uses: actions/checkout@v7
 
+      # pnpm only for a .railway/ that has moved to it; the version comes
+      # from the packageManager field of .railway/package.json.
+      - name: Set up pnpm
+        if: hashFiles('.railway/pnpm-lock.yaml') != ''
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: .railway/package.json
+
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
@@ -110,7 +122,11 @@ jobs:
       - name: Install the Railway CLI and IaC SDK
         run: |
           npm install --global --no-audit --no-fund @railway/cli@5.68.0
-          npm ci --prefix .railway --no-audit --no-fund
+          if [ -f .railway/pnpm-lock.yaml ]; then
+            pnpm install --dir .railway --frozen-lockfile
+          else
+            npm ci --prefix .railway --no-audit --no-fund
+          fi
 
       # Planned again here rather than trusting the pull request's plan:
       # main's can differ from it. As in infra, nothing is applied when
