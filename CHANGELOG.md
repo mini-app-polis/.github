@@ -1,3 +1,10 @@
+# [3.22.0](https://github.com/mini-app-polis/.github/compare/v3.21.0...v3.22.0) (2026-11-03)
+
+
+### Features
+
+* **railway:** install .railway/ with pnpm when it has a pnpm-lock.yaml, npm ci otherwise ([d965ab2](https://github.com/mini-app-polis/.github/commit/d965ab27daf00f3d8fc786a495f0bb88fe46d4f2))
+
 # [3.21.0](https://github.com/mini-app-polis/.github/compare/v3.20.0...v3.21.0) (2026-10-31)
 
 
