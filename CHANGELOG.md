@@ -1,3 +1,10 @@
+# [3.23.0](https://github.com/mini-app-polis/.github/compare/v3.22.0...v3.23.0) (2026-11-04)
+
+
+### Features
+
+* check facts.json in the shared python test stage ([ac040c6](https://github.com/mini-app-polis/.github/commit/ac040c638f025c94552defb0abbe337c388c1b76))
+
 # [3.22.0](https://github.com/mini-app-polis/.github/compare/v3.21.0...v3.22.0) (2026-11-03)
 
 
