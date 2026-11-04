@@ -120,3 +120,11 @@ jobs:
 
       - name: Test
         run: uv run pytest ${{ inputs.pytest-args }}
+
+      # A repo that publishes the figures it owns keeps facts.json in step
+      # with its data: `facts check` fails when the committed file no longer
+      # matches what facts.yaml computes. Run from the latest
+      # miniapppolis-common-utils, so it needs no dependency in the repo.
+      - name: Facts are current
+        if: hashFiles('facts.yaml') != ''
+        run: uvx --from miniapppolis-common-utils facts check
