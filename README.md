@@ -515,11 +515,11 @@ repository a target.
 - **Drafts only**, so `automerge.yml` never merges what an agent wrote.
 - **Nothing is retried.** A run that reaches its budget, errors, changes
   nothing or touches a workflow file opens no pull request.
-- **Unclear tasks go back to grooming.** An agent that finds its task
+- **Unclear tasks go back to refining.** An agent that finds its task
   unclear or undetermined changes nothing and ends with `QUESTION:` lines.
-  The run reports `needs_grooming` with those questions and pushes nothing,
+  The run reports `needs_refining` with those questions and pushes nothing,
   even if it changed files; task-manager-cog moves the task back to
-  grooming.
+  refining.
 - **Always reports** its outcome, cost and pull request (or questions) to
   api-kaianolevine-com with the task-agent key, which may post a result
   and nothing else. task-manager-cog posts a succeeded run's result on its
