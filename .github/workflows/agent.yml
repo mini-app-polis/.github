@@ -20,11 +20,11 @@
 # in an error, changes nothing, or changes a workflow file opens no pull
 # request. Nothing here retries.
 #
-# **Needs refining.** A task the agent finds unclear or undetermined is not
+# **Needs grooming.** A task the agent finds unclear or undetermined is not
 # guessed at: the agent changes nothing and ends with one or more
-# `QUESTION:` lines. The run reports `needs_refining` with those questions
+# `QUESTION:` lines. The run reports `needs_grooming` with those questions
 # and opens no pull request, even if files were changed, and
-# task-manager-cog sends the task back to refining.
+# task-manager-cog sends the task back to grooming.
 #
 # **The result always reports.** The last step runs whatever happened before
 # it, and posts how the run ended, what it cost (Claude Code's own figure)
@@ -317,7 +317,7 @@ jobs:
             reason="the agent ended with ${subtype:-no result} (exit ${EXIT:-unknown})"
           elif [ "$asked" -gt 0 ]; then
             # Unclear: nothing is pushed, whatever was changed.
-            outcome=needs_refining
+            outcome=needs_grooming
             reason=""
           elif [ -z "$changed" ]; then
             reason="the agent changed nothing: $(printf '%s' "$text" | tail -c 1500)"
@@ -407,7 +407,7 @@ jobs:
             reason="the run stopped before the agent finished; see the workflow run"
           fi
           questions="[]"
-          if [ "$outcome" = "needs_refining" ]; then
+          if [ "$outcome" = "needs_grooming" ]; then
             questions=$(cat "$RUNNER_TEMP/questions.json")
           fi
           body=$(jq -n \
@@ -417,7 +417,7 @@ jobs:
             '{run_id: $run_id, outcome: $outcome, actions_run_url: $run_url}
              + (if $cost != "" then {cost_usd: ($cost | tonumber)} else {} end)
              + (if $outcome == "succeeded" then {pr_url: $pr} else {} end)
-             + (if $outcome == "needs_refining" then {questions: $questions} else {} end)
+             + (if $outcome == "needs_grooming" then {questions: $questions} else {} end)
              + (if $reason != "" then {reason: ($reason | .[0:2000])} else {} end)')
 
           if [ "$DRY_RUN" = "true" ]; then
