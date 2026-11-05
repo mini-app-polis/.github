@@ -1,3 +1,10 @@
+# [3.24.0](https://github.com/mini-app-polis/.github/compare/v3.23.0...v3.24.0) (2026-11-05)
+
+
+### Features
+
+* **agent:** report an unclear task as needs_refining ([d414a76](https://github.com/mini-app-polis/.github/commit/d414a76d826821e71418bb88c390a319bc97e391))
+
 # [3.23.0](https://github.com/mini-app-polis/.github/compare/v3.22.0...v3.23.0) (2026-11-04)
 
 
