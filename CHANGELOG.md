@@ -1,3 +1,10 @@
+## [3.24.1](https://github.com/mini-app-polis/.github/compare/v3.24.0...v3.24.1) (2026-11-05)
+
+
+### Reverts
+
+* Revert "feat(agent): report an unclear task as needs_refining" ([c11f668](https://github.com/mini-app-polis/.github/commit/c11f6686aa145789038974a90b6eee9c23637dc9))
+
 # [3.24.0](https://github.com/mini-app-polis/.github/compare/v3.23.0...v3.24.0) (2026-11-05)
 
 
