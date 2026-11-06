@@ -41,6 +41,10 @@
 # backend). A repository with Python scripts under scripts/ and no uv.lock
 # gets PyYAML and may run them with python3.
 #
+# **facts.json.** In a repository with a facts.yaml, facts.json is
+# regenerated after the agent's change and before the commit, as the
+# pre-commit hook does for a person, so `facts check` passes in CI.
+#
 # **dry_run** runs everything but the model, the push and the post: it
 # proves the checkout, the toolchain, the App's credentials and the API key,
 # and prints the result it would have posted.
@@ -175,7 +179,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        if: hashFiles('uv.lock') != ''
+        if: hashFiles('uv.lock') != '' || hashFiles('facts.yaml') != ''
         uses: astral-sh/setup-uv@v7
 
       - name: Install the repository's dependencies
@@ -341,6 +345,14 @@ jobs:
             echo "REASON_END"
           } >> "$GITHUB_OUTPUT"
           echo "Outcome: $outcome${reason:+ ($reason)}; cost: ${cost:-unknown}"
+
+      # A repository with a facts.yaml keeps facts.json in step with its
+      # code, and CI's `facts check` fails when it is not. A person's commit
+      # gets this from the pre-commit hook; the agent has none, so facts.json
+      # is regenerated here, after the agent's change and before the commit.
+      - name: Regenerate facts.json
+        if: ${{ !inputs.dry_run && steps.decide.outputs.outcome == 'succeeded' && hashFiles('facts.yaml') != '' }}
+        run: uvx --from miniapppolis-common-utils facts generate
 
       - name: Mint the agent App's token
         id: app-token
