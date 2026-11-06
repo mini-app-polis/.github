@@ -1,3 +1,10 @@
+## [3.25.1](https://github.com/mini-app-polis/.github/compare/v3.25.0...v3.25.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* **agent:** regenerate facts.json before the agent's commit ([5d258f5](https://github.com/mini-app-polis/.github/commit/5d258f583c264fd437d23100e16a4dca23d7b51c))
+
 # [3.25.0](https://github.com/mini-app-polis/.github/compare/v3.24.1...v3.25.0) (2026-11-05)
 
 
