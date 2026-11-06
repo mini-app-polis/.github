@@ -1,6 +1,7 @@
 # The fleet's agent: one board task, implemented by headless Claude Code in
 # the calling repository, handed to a person as a draft pull request into
-# `dev`.
+# the branch the run was started on: `dev`, or `main` in a repository with
+# no `dev` (this one).
 #
 # task-manager-cog dispatches it. It records the run with api-kaianolevine-com
 # first, moves the task to In progress, then starts the caller in the
@@ -13,8 +14,13 @@
 # It edits files and runs the repository's own checks; it cannot commit,
 # push or open anything. The steps after it, which are fixed, decide what
 # happened, then mint the agent App's token, push `agent/<task>-<run>`, and
-# open the pull request: a **draft**, based on `dev`. automerge.yml skips
-# drafts, so what an agent wrote reaches `dev` only when a person merges it.
+# open the pull request: a **draft**, based on the branch the run started
+# on. automerge.yml skips drafts, so what an agent wrote is merged only by a
+# person.
+#
+# **This repository** has only `main`, and is its own caller: the
+# workflow_dispatch trigger below starts it here, on `main`. The agent still
+# never edits a workflow, so here it changes scripts and docs only.
 #
 # **Capped, failed, or empty.** A run that reaches its budget limit, ends
 # in an error, changes nothing, or changes a workflow file opens no pull
@@ -88,6 +94,15 @@
 name: agent
 
 on:
+  # This repository's own caller; the inputs are workflow_call's.
+  workflow_dispatch:
+    inputs:
+      run_id: { required: true, type: string }
+      task_id: { required: true, type: string }
+      task: { required: true, type: string }
+      model: { required: true, type: string }
+      budget_usd: { required: true, type: string }
+      dry_run: { required: false, type: boolean, default: false }
   workflow_call:
     inputs:
       run_id:
@@ -114,6 +129,7 @@ on:
         description: "Run everything but the model, the push and the post."
         type: boolean
         default: false
+      # Not dispatch inputs: a dispatched run takes the defaults below.
       claude-code-version:
         description: "The Claude Code release to install, pinned so a run is reproducible."
         type: string
@@ -147,7 +163,10 @@ jobs:
       MODEL: ${{ inputs.model }}
       BUDGET: ${{ inputs.budget_usd }}
       DRY_RUN: ${{ inputs.dry_run }}
-      API_URL: ${{ inputs.api-url }}
+      API_URL: ${{ inputs.api-url || 'https://api.kaianolevine.com' }}
+      # The branch the run was started on: the checkout, and the pull
+      # request's base.
+      BASE: ${{ github.ref_name }}
     steps:
       - name: Check the inputs and the secrets
         id: inputs
@@ -175,7 +194,7 @@ jobs:
 
       - uses: actions/checkout@v7
         with:
-          ref: dev
+          ref: ${{ github.ref_name }}
           persist-credentials: false
 
       - name: Install uv
@@ -223,7 +242,7 @@ jobs:
 
       - name: Install Claude Code
         env:
-          VERSION: ${{ inputs.claude-code-version }}
+          VERSION: ${{ inputs.claude-code-version || '2.1.296' }}
         run: npm install -g "@anthropic-ai/claude-code@${VERSION}"
 
       - name: Write the prompt
@@ -233,7 +252,7 @@ jobs:
           {
             cat <<'PROMPT'
           You are implementing one task from the board, in this repository, on
-          a branch from dev. A person will review your change as a pull request.
+          a new branch. A person will review your change as a pull request.
 
           - Make the change the task's "Done when" describes, within its
             Constraints. Keep the change minimal.
@@ -388,13 +407,13 @@ jobs:
           {
             echo "Opened by the agent for ${TASK_ID} (agent run \`${RUN_ID}\`), cost \$${COST:-unknown}."
             echo
-            echo "A draft: review it and merge it into \`dev\`. The task closes when a comment on it starting \`Landed:\` confirms green CI on dev. The agent's own account below is not proof the work is done."
+            echo "A draft: review it and merge it into \`${BASE}\`. The task closes when a comment on it starting \`Landed:\` confirms green CI on ${BASE}. The agent's own account below is not proof the work is done."
             echo
             echo "### The agent's summary"
             echo
             cat "$RUNNER_TEMP/summary.md"
           } > "$RUNNER_TEMP/body.md"
-          url=$(gh pr create -R "$GITHUB_REPOSITORY" --draft --base dev --head "$BRANCH" \
+          url=$(gh pr create -R "$GITHUB_REPOSITORY" --draft --base "$BASE" --head "$BRANCH" \
             --title "$SUBJECT" --body-file "$RUNNER_TEMP/body.md")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "Opened $url"
