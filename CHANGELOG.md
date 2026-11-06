@@ -1,3 +1,10 @@
+# [3.27.0](https://github.com/mini-app-polis/.github/compare/v3.26.0...v3.27.0) (2026-11-06)
+
+
+### Features
+
+* **agent:** gate the pull request on CI's test stage, shared with python-test through one action ([191923e](https://github.com/mini-app-polis/.github/commit/191923ec192bf4ab8df10c5750b20212df939d39))
+
 # [3.26.0](https://github.com/mini-app-polis/.github/compare/v3.25.1...v3.26.0) (2026-11-06)
 
 
