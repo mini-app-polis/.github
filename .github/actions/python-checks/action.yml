@@ -1,0 +1,108 @@
+# The fleet's test stage for a uv-managed Python repository, as one action:
+# python-test.yml runs it as CI's `test` job, and agent.yml runs it on the
+# agent's change before a pull request is opened, so the two cannot drift.
+#
+# The checks themselves are in checks.sh beside this file, in order: the
+# lock agrees with pyproject (CD-020), the install, lint, format, the type
+# check (TEST-012), Terraform fmt and validate for a cog that declares its
+# own infrastructure, the suite with coverage, and facts.json being current.
+# Each runs in its own log group, the run stops at the first that fails,
+# and everything they print is also written to the file the `log` output
+# names, so a caller can hand the failure on.
+#
+# Usage, as a step after a checkout:
+#
+#   - uses: mini-app-polis/.github/.github/actions/python-checks@v3
+#     with:
+#       pytest-args: "--cov=my_cog --cov-report=term-missing"
+#       typecheck: "uv run mypy src/"
+#
+# With `print-only: "true"` it runs nothing and writes the commands it would
+# run, one per line, to the file the `commands` output names.
+
+name: python-checks
+description: The fleet's test stage for a uv-managed Python repository.
+
+inputs:
+  python-version:
+    description: "Match the runtime the repo deploys to — for a Lambda cog, infra/worker.tf's `runtime`."
+    default: "3.11"
+  pytest-args:
+    description: "Appended to the pytest command."
+    default: "--cov=src --cov-report=term-missing"
+  typecheck:
+    description: >-
+      A type-check command, e.g. "uv run mypy src/". Empty skips it and
+      raises a TEST-012 warning saying so.
+    default: ""
+  terraform-dir:
+    description: >-
+      A Lambda cog's Terraform directory, e.g. "infra". Set, it is checked
+      with `terraform fmt -check` and `terraform validate`: no state, no
+      credentials, no plan. Empty skips both.
+    default: ""
+  terraform-version:
+    description: "Match what applies it from the workstation, so fmt agrees."
+    default: "1.16.2"
+  print-only:
+    description: "\"true\": run nothing; write the commands to the `commands` file."
+    default: "false"
+
+outputs:
+  log:
+    description: "The file holding everything the checks printed."
+    value: ${{ steps.paths.outputs.log }}
+  commands:
+    description: "With print-only, the file listing the commands, one per line."
+    value: ${{ steps.paths.outputs.commands }}
+
+runs:
+  using: composite
+  steps:
+    - id: paths
+      shell: bash
+      run: |
+        echo "log=${RUNNER_TEMP}/python-checks.log" >> "$GITHUB_OUTPUT"
+        echo "commands=${RUNNER_TEMP}/python-checks.txt" >> "$GITHUB_OUTPUT"
+
+    - name: List the checks
+      if: inputs.print-only == 'true'
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+        PYTEST_ARGS: ${{ inputs.pytest-args }}
+        TYPECHECK: ${{ inputs.typecheck }}
+        TF_DIR: ${{ inputs.terraform-dir }}
+        COMMANDS: ${{ steps.paths.outputs.commands }}
+      run: '"$GITHUB_ACTION_PATH/checks.sh" --print > "$COMMANDS"'
+
+    - name: Install uv
+      if: inputs.print-only != 'true'
+      uses: astral-sh/setup-uv@v7
+
+    - name: Set up Python
+      if: inputs.print-only != 'true'
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: uv python install "$PYTHON_VERSION"
+
+    - name: Set up Terraform
+      if: inputs.print-only != 'true' && inputs.terraform-dir != ''
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        # Plain terraform output; the wrapper only matters for steps that
+        # read stdout as outputs, and none here do.
+        terraform_wrapper: false
+
+    - name: Run the checks
+      if: inputs.print-only != 'true'
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+        PYTEST_ARGS: ${{ inputs.pytest-args }}
+        TYPECHECK: ${{ inputs.typecheck }}
+        TF_DIR: ${{ inputs.terraform-dir }}
+        LOG: ${{ steps.paths.outputs.log }}
+      run: '"$GITHUB_ACTION_PATH/checks.sh"'

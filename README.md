@@ -227,8 +227,12 @@ it to work that out for themselves.
 
 `.github/workflows/python-test.yml` is the `test` job for a uv-managed
 Python repo: `uv lock --check` (CD-020), `uv sync --locked`, `ruff check`,
-`ruff format --check`, then pytest. It is the union of what the cogs ran
-inline, so adopting it removes no check a caller had.
+`ruff format --check`, the type check, Terraform fmt and validate when
+asked, pytest, and `facts check` when the repo has a `facts.yaml`. It is the
+union of what the cogs ran inline, so adopting it removes no check a caller
+had. The checks live in the composite action
+`.github/actions/python-checks`, which the shared agent also runs on an
+agent's change before it opens a pull request.
 
 ```yaml
 jobs:
@@ -501,7 +505,8 @@ jobs:
 ## Shared agent
 
 `.github/workflows/agent.yml` runs headless Claude Code on one board task in
-the calling repository and opens a **draft** pull request into `dev`.
+the calling repository and opens a **draft** pull request into the branch
+it was started on: `dev`, or `main` in this repository, its own caller.
 task-manager-cog dispatches it for a Ready task and applies the result it
 reports; see that repository's README for which tasks it takes. Each
 repository the agent may change has a thin `workflow_dispatch` caller (the
@@ -515,6 +520,13 @@ repository a target.
 - **Drafts only**, so `automerge.yml` never merges what an agent wrote.
 - **Nothing is retried.** A run that reaches its budget, errors, changes
   nothing or touches a workflow file opens no pull request.
+- **CI's test stage gates the pull request.** In a uv repository the
+  `python-checks` action runs on the agent's change, with the inputs the
+  repository's own `ci.yml` passes to `python-test.yml`, and the prompt
+  lists those same commands. A failure gets one repair attempt under its
+  own budget (`repair-budget-usd`, default 0.50 USD); if the stage still
+  fails, the branch is pushed for a person to look at, no pull request is
+  opened, and the run reports failed.
 - **Unclear tasks go back to refining.** An agent that finds its task
   unclear or undetermined changes nothing and ends with `QUESTION:` lines.
   The run reports `needs_refining` with those questions and pushes nothing,
@@ -531,8 +543,9 @@ repository a target.
   repository without `uv.lock`. Each sets up the dependencies before the
   agent starts and allows its check commands (`uv run`, `pnpm run`,
   `npm run`, `terraform fmt` and `validate`, `python3 scripts/`).
-- **`dry_run`** proves the checkout, toolchain, App and API key without
-  calling the model, pushing or posting.
+- **`dry_run`** proves the checkout, toolchain, CI's test stage on the
+  unchanged branch, App and API key without calling the model, pushing or
+  posting.
 - **Secrets:** `AGENT_ANTHROPIC_API_KEY`, `AGENT_APP_CLIENT_ID`,
   `AGENT_APP_PRIVATE_KEY` and `TASK_AGENT_API_KEY`, as organisation
   secrets written by Doppler's GitHub sync. The sync scopes an org secret

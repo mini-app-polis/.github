@@ -24,7 +24,18 @@
 #
 # **Capped, failed, or empty.** A run that reaches its budget limit, ends
 # in an error, changes nothing, or changes a workflow file opens no pull
-# request. Nothing here retries.
+# request. Nothing here retries a run.
+#
+# **CI's test stage gates the pull request.** In a uv repository the
+# python-checks action, the same one python-test.yml runs as CI's `test`
+# job, runs on the agent's change before anything is pushed, with the
+# python-test inputs the repository's own .github/workflows/ci.yml passes
+# (its typecheck, pytest-args, python-version and terraform-dir). The
+# prompt lists those same commands rather than a list of its own. When the
+# stage fails, the agent gets its output for one repair attempt, under its
+# own small budget (repair-budget-usd). If the stage still fails, the
+# branch is pushed so a person can look, no pull request is opened, and the
+# run reports failed.
 #
 # **Needs refining.** A task the agent finds unclear or undetermined is not
 # guessed at: the agent changes nothing and ends with one or more
@@ -52,8 +63,9 @@
 # pre-commit hook does for a person, so `facts check` passes in CI.
 #
 # **dry_run** runs everything but the model, the push and the post: it
-# proves the checkout, the toolchain, the App's credentials and the API key,
-# and prints the result it would have posted.
+# proves the checkout, the toolchain, CI's test stage on the unchanged
+# branch, the App's credentials and the API key, and prints the result it
+# would have posted. A dry run whose test stage fails fails.
 #
 # Secrets: AGENT_ANTHROPIC_API_KEY (the agent's own Anthropic workspace),
 # AGENT_APP_CLIENT_ID and AGENT_APP_PRIVATE_KEY (the agent App), and
@@ -138,6 +150,10 @@ on:
         description: "Base URL of api-kaianolevine-com."
         type: string
         default: https://api.kaianolevine.com
+      repair-budget-usd:
+        description: "The budget limit, in USD, for the one attempt to repair a change that fails CI's test stage."
+        type: string
+        default: "0.50"
     secrets:
       AGENT_ANTHROPIC_API_KEY:
         required: false
@@ -164,6 +180,7 @@ jobs:
       BUDGET: ${{ inputs.budget_usd }}
       DRY_RUN: ${{ inputs.dry_run }}
       API_URL: ${{ inputs.api-url || 'https://api.kaianolevine.com' }}
+      REPAIR_BUDGET: ${{ inputs.repair-budget-usd || '0.50' }}
       # The branch the run was started on: the checkout, and the pull
       # request's base.
       BASE: ${{ github.ref_name }}
@@ -245,9 +262,42 @@ jobs:
           VERSION: ${{ inputs.claude-code-version || '2.1.296' }}
         run: npm install -g "@anthropic-ai/claude-code@${VERSION}"
 
+      # CI's test stage, as the repository's own ci.yml calls it: the `with:`
+      # of the job that uses python-test.yml. A key it does not set takes
+      # python-test.yml's default, as it does in CI.
+      - name: Read CI's test stage inputs
+        id: ci
+        if: hashFiles('uv.lock') != ''
+        run: |
+          set -euo pipefail
+          with='{}'
+          if [ -f .github/workflows/ci.yml ]; then
+            with=$(yq -o=json '[.jobs[] | select((.uses // "") | test("/python-test\\.yml@")) | .with // {}] | .[0] // {}' .github/workflows/ci.yml)
+          fi
+          field() { jq -r --arg k "$1" --arg d "$2" '.[$k] // $d | tostring' <<<"$with"; }
+          {
+            echo "python-version=$(field python-version 3.11)"
+            echo "pytest-args=$(field pytest-args '--cov=src --cov-report=term-missing')"
+            echo "typecheck=$(field typecheck '')"
+            echo "terraform-dir=$(field terraform-dir '')"
+          } >> "$GITHUB_OUTPUT"
+          echo "CI's test stage inputs: $with"
+
+      - name: List CI's test stage
+        id: checks-list
+        if: hashFiles('uv.lock') != ''
+        uses: mini-app-polis/.github/.github/actions/python-checks@v3
+        with:
+          print-only: "true"
+          python-version: ${{ steps.ci.outputs.python-version }}
+          pytest-args: ${{ steps.ci.outputs.pytest-args }}
+          typecheck: ${{ steps.ci.outputs.typecheck }}
+          terraform-dir: ${{ steps.ci.outputs.terraform-dir }}
+
       - name: Write the prompt
         env:
           TASK: ${{ inputs.task }}
+          CHECKS: ${{ steps.checks-list.outputs.commands }}
         run: |
           {
             cat <<'PROMPT'
@@ -257,8 +307,9 @@ jobs:
           - Make the change the task's "Done when" describes, within its
             Constraints. Keep the change minimal.
           - Run the repository's checks, the ones its CI workflows run, and
-            leave them passing. For a uv repository: uv run pytest, uv run
-            ruff check ., uv run ruff format --check . For a pnpm or npm
+            leave them passing. For a uv repository they are CI's test stage,
+            listed at the end of this prompt; they run again after you, and
+            a change that fails them gets no pull request. For a pnpm or npm
             repository: its package.json scripts, as pnpm run <script> or
             npm run <script> (for example check, typecheck, lint, test,
             build). For Terraform: terraform fmt -check -recursive and
@@ -287,7 +338,23 @@ jobs:
 
           PROMPT
             printf '%s\n' "$TASK"
+            if [ -n "$CHECKS" ] && [ -s "$CHECKS" ]; then
+              printf '\nCI'"'"'s test stage, in order (run the ones you may):\n\n'
+              sed 's/^/  /' "$CHECKS"
+            fi
           } > "$RUNNER_TEMP/prompt.md"
+
+      # The commands the agent may run, for its first run and for a repair.
+      - name: Write the agent's tool rules
+        run: |
+          cat > "$RUNNER_TEMP/tools.sh" <<'TOOLS'
+          tools=(Read Edit Write Glob Grep
+            "Bash(uv run *)" "Bash(uv sync *)" "Bash(uv lock --check)" "Bash(git diff *)"
+            "Bash(pnpm run *)" "Bash(npm run *)"
+            "Bash(terraform fmt *)" "Bash(terraform validate *)"
+            "Bash(python3 scripts/*)"
+            "Bash(git status *)" "Bash(git log *)" "Bash(ls *)")
+          TOOLS
 
       - name: Run the agent
         id: agent
@@ -297,18 +364,14 @@ jobs:
           DISABLE_AUTOUPDATER: "1"
         run: |
           set +e
+          source "$RUNNER_TEMP/tools.sh"
           claude -p \
             --model "$MODEL" \
             --max-budget-usd "$BUDGET" \
             --max-turns 80 \
             --output-format json \
             --permission-mode dontAsk \
-            --allowedTools Read Edit Write Glob Grep \
-              "Bash(uv run *)" "Bash(uv sync *)" "Bash(git diff *)" \
-              "Bash(pnpm run *)" "Bash(npm run *)" \
-              "Bash(terraform fmt *)" "Bash(terraform validate *)" \
-              "Bash(python3 scripts/*)" \
-              "Bash(git status *)" "Bash(git log *)" "Bash(ls *)" \
+            --allowedTools "${tools[@]}" \
             < "$RUNNER_TEMP/prompt.md" > "$RUNNER_TEMP/result.json"
           echo "exit=$?" >> "$GITHUB_OUTPUT"
 
@@ -373,9 +436,117 @@ jobs:
         if: ${{ !inputs.dry_run && steps.decide.outputs.outcome == 'succeeded' && hashFiles('facts.yaml') != '' }}
         run: uvx --from miniapppolis-common-utils facts generate
 
+      - name: CI's test stage
+        id: checks
+        if: ${{ hashFiles('uv.lock') != '' && (inputs.dry_run || steps.decide.outputs.outcome == 'succeeded') }}
+        continue-on-error: true
+        uses: mini-app-polis/.github/.github/actions/python-checks@v3
+        with:
+          python-version: ${{ steps.ci.outputs.python-version }}
+          pytest-args: ${{ steps.ci.outputs.pytest-args }}
+          typecheck: ${{ steps.ci.outputs.typecheck }}
+          terraform-dir: ${{ steps.ci.outputs.terraform-dir }}
+
+      # One repair attempt, in the same conversation, with the stage's output
+      # and a budget of its own.
+      - name: Repair the change
+        id: repair
+        if: ${{ !inputs.dry_run && steps.decide.outputs.outcome == 'succeeded' && steps.checks.outcome == 'failure' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.AGENT_ANTHROPIC_API_KEY }}
+          DISABLE_AUTOUPDATER: "1"
+          LOG: ${{ steps.checks.outputs.log }}
+        run: |
+          set +e
+          source "$RUNNER_TEMP/tools.sh"
+          {
+            cat <<'PROMPT'
+          CI's test stage failed on your change. Fix the change so that the
+          stage passes, within the task's Constraints and the rules above. Do
+          not skip, weaken or delete a check or a test to make it pass. End
+          your final message as before. The stage's output, ending at the check
+          that failed:
+
+          PROMPT
+            tail -n 200 "$LOG"
+          } > "$RUNNER_TEMP/repair.md"
+          claude -p --continue \
+            --model "$MODEL" \
+            --max-budget-usd "$REPAIR_BUDGET" \
+            --max-turns 40 \
+            --output-format json \
+            --permission-mode dontAsk \
+            --allowedTools "${tools[@]}" \
+            < "$RUNNER_TEMP/repair.md" > "$RUNNER_TEMP/repair.json"
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate facts.json after the repair
+        if: ${{ steps.repair.conclusion == 'success' && hashFiles('facts.yaml') != '' }}
+        run: uvx --from miniapppolis-common-utils facts generate
+
+      - name: CI's test stage after the repair
+        id: recheck
+        if: ${{ steps.repair.conclusion == 'success' }}
+        continue-on-error: true
+        uses: mini-app-polis/.github/.github/actions/python-checks@v3
+        with:
+          python-version: ${{ steps.ci.outputs.python-version }}
+          pytest-args: ${{ steps.ci.outputs.pytest-args }}
+          typecheck: ${{ steps.ci.outputs.typecheck }}
+          terraform-dir: ${{ steps.ci.outputs.terraform-dir }}
+
+      # How the run ended, with the test stage counted: what the steps after
+      # this one read.
+      - name: Settle the outcome
+        id: settle
+        if: ${{ !inputs.dry_run }}
+        env:
+          DECIDED: ${{ steps.decide.outputs.outcome }}
+          DECIDED_REASON: ${{ steps.decide.outputs.reason }}
+          COST: ${{ steps.decide.outputs.cost }}
+          CHECKS: ${{ steps.checks.outcome }}
+          REPAIRED: ${{ steps.repair.conclusion }}
+          RECHECK: ${{ steps.recheck.outcome }}
+          LOG: ${{ steps.recheck.outputs.log || steps.checks.outputs.log }}
+          BRANCH: ${{ steps.inputs.outputs.branch }}
+        run: |
+          outcome="${DECIDED:-failed}"
+          reason="$DECIDED_REASON"
+          cost="$COST"
+          push=false
+          if [ "$REPAIRED" = "success" ]; then
+            repair_cost=$(jq -r '.total_cost_usd // empty' "$RUNNER_TEMP/repair.json" 2>/dev/null)
+            if [ -n "$repair_cost" ]; then
+              cost=$(awk -v a="${cost:-0}" -v b="$repair_cost" 'BEGIN { printf "%.4f", a + b }')
+            fi
+          fi
+          if [ "$outcome" = "succeeded" ] && [ "$CHECKS" = "failure" ]; then
+            failed_check=$(sed -n 's/^FAILED (exit [0-9]*): //p' "$LOG" 2>/dev/null | tail -n 1)
+            if git status --porcelain | grep -q ' \.github/workflows/'; then
+              outcome=failed
+              reason="the repair changed a workflow file, which it may not"
+            elif [ "$RECHECK" != "success" ]; then
+              outcome=failed
+              push=true
+              reason="CI's test stage failed after one repair attempt (${failed_check:-see the workflow run}); the change is on branch ${BRANCH}, with no pull request"
+            fi
+          fi
+          if [ "$outcome" = "succeeded" ]; then
+            push=true
+          fi
+          {
+            echo "outcome=$outcome"
+            echo "cost=$cost"
+            echo "push=$push"
+            echo "reason<<REASON_END"
+            printf '%s\n' "$reason"
+            echo "REASON_END"
+          } >> "$GITHUB_OUTPUT"
+          echo "Settled: $outcome${reason:+ ($reason)}; cost: ${cost:-unknown}"
+
       - name: Mint the agent App's token
         id: app-token
-        if: ${{ inputs.dry_run || steps.decide.outputs.outcome == 'succeeded' }}
+        if: ${{ inputs.dry_run || steps.settle.outputs.push == 'true' }}
         uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ secrets.AGENT_APP_CLIENT_ID }}
@@ -385,15 +556,18 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # A change that failed CI's test stage after its repair is pushed too,
+      # so a person can look, but gets no pull request.
       - name: Push the branch and open a draft pull request
         id: pr
-        if: ${{ !inputs.dry_run && steps.decide.outputs.outcome == 'succeeded' }}
+        if: ${{ !inputs.dry_run && steps.settle.outputs.push == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           BRANCH: ${{ steps.inputs.outputs.branch }}
           SUBJECT: ${{ steps.decide.outputs.subject }}
-          COST: ${{ steps.decide.outputs.cost }}
+          COST: ${{ steps.settle.outputs.cost }}
+          OUTCOME: ${{ steps.settle.outputs.outcome }}
         run: |
           set -euo pipefail
           bot="${APP_SLUG}[bot]"
@@ -404,6 +578,10 @@ jobs:
           git add -A
           git commit -q -m "$SUBJECT"
           git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          if [ "$OUTCOME" != "succeeded" ]; then
+            echo "Pushed ${BRANCH}; no pull request: the change fails CI's test stage."
+            exit 0
+          fi
           {
             echo "Opened by the agent for ${TASK_ID} (agent run \`${RUN_ID}\`), cost \$${COST:-unknown}."
             echo
@@ -422,9 +600,10 @@ jobs:
         if: always()
         env:
           API_KEY: ${{ secrets.TASK_AGENT_API_KEY }}
-          DECIDED: ${{ steps.decide.outputs.outcome }}
-          COST: ${{ steps.decide.outputs.cost }}
-          DECIDED_REASON: ${{ steps.decide.outputs.reason }}
+          DECIDED: ${{ steps.settle.outputs.outcome }}
+          COST: ${{ steps.settle.outputs.cost }}
+          DECIDED_REASON: ${{ steps.settle.outputs.reason }}
+          CHECKS: ${{ steps.checks.outcome }}
           PR_URL: ${{ steps.pr.outputs.url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -459,6 +638,9 @@ jobs:
             fi
             echo "Dry run: the API key works. The result a real run would post:"
             jq . <<<"$body"
+            if [ "$CHECKS" = "failure" ]; then
+              echo "::error::CI's test stage fails on the unchanged branch; see its step above."; exit 1
+            fi
             exit 0
           fi
 
