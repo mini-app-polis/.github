@@ -1,3 +1,10 @@
+# [3.26.0](https://github.com/mini-app-polis/.github/compare/v3.25.1...v3.26.0) (2026-11-06)
+
+
+### Features
+
+* **agent:** run on the branch it was dispatched on, and be this repository's own caller ([c146769](https://github.com/mini-app-polis/.github/commit/c14676993682cb08e2b1c94637fef8483bfd2804))
+
 ## [3.25.1](https://github.com/mini-app-polis/.github/compare/v3.25.0...v3.25.1) (2026-11-06)
 
 
