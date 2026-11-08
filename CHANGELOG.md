@@ -1,3 +1,10 @@
+# [3.29.0](https://github.com/mini-app-polis/.github/compare/v3.28.0...v3.29.0) (2026-11-08)
+
+
+### Features
+
+* default the shared workflows to Python 3.14 ([1473704](https://github.com/mini-app-polis/.github/commit/14737043fdcbb02f20e54ba513a3f9eaa2f92ab6))
+
 # [3.28.0](https://github.com/mini-app-polis/.github/compare/v3.27.0...v3.28.0) (2026-11-08)
 
 
