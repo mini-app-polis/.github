@@ -209,13 +209,24 @@ jobs:
         with:
           package_json_file: target/package.json
 
-      # As security.yml installs it: the asset URL from the release API.
-      - name: Install osv-scanner
+      # As security.yml installs it: the asset URL from the release API,
+      # cached per version so a run only downloads when the cache is cold.
+      - name: Restore osv-scanner
+        id: osv-cache
         if: matrix.kind == 'pnpm'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/fleet-tools/osv-scanner
+          key: osv-scanner-${{ env.OSV_SCANNER_VERSION }}-linux-amd64
+
+      - name: Install osv-scanner
+        if: matrix.kind == 'pnpm' && steps.osv-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          dir="${HOME}/.cache/fleet-tools/osv-scanner"
+          mkdir -p "${dir}"
           api="https://api.github.com/repos/google/osv-scanner/releases/tags/v${OSV_SCANNER_VERSION}"
           url="$(curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" "${api}" \
                  | jq -r '.assets[].browser_download_url
@@ -226,11 +237,16 @@ jobs:
             exit 1
           fi
           case "${url}" in
-            *.tar.gz) curl -sSfL "${url}" | sudo tar -xz -C /usr/local/bin osv-scanner ;;
-            *)        sudo curl -sSfL "${url}" -o /usr/local/bin/osv-scanner ;;
+            *.tar.gz) curl -sSfL "${url}" | tar -xz -C "${dir}" osv-scanner ;;
+            *)        curl -sSfL "${url}" -o "${dir}/osv-scanner" ;;
           esac
-          sudo chmod +x /usr/local/bin/osv-scanner
-          osv-scanner --version
+          chmod +x "${dir}/osv-scanner"
+
+      - name: Put osv-scanner on PATH
+        if: matrix.kind == 'pnpm'
+        run: |
+          echo "${HOME}/.cache/fleet-tools/osv-scanner" >> "$GITHUB_PATH"
+          "${HOME}/.cache/fleet-tools/osv-scanner/osv-scanner" --version
 
       - name: Re-lock vulnerable dependencies
         id: fix
