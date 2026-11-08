@@ -41,3 +41,15 @@ release time, because the npm it would run is the stub.
 `osv-scanner.toml` here holds the audit exceptions for this lockfile only,
 each with a reason and an expiry date. See "Exceptions" in the repository
 README.
+
+## `bin/git`, and why pushes are retried
+
+GitHub sometimes answers a push with `! [remote rejected] <ref> (failed)`, a
+server-side failure rather than a refusal. semantic-release pushes the
+release tag and then a notes ref, and a failure there stops it before the
+publish step: no GitHub release, no package upload, no major-tag move, while
+the tag is already pushed, so a re-run finds nothing new to release.
+`action.yml` puts `bin/` first on `PATH` for semantic-release, and `bin/git`
+retries a `git push` that failed with a transient error, waiting longer each
+time. Every other git command, and every real refusal (non-fast-forward, a
+protected branch, a hook), goes through unchanged.

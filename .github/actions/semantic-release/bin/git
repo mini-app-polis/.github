@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# git, with a retry around `git push`. action.yml puts this directory first
+# on PATH for semantic-release only, so every push semantic-release and its
+# plugins make goes through here; every other git command passes straight
+# to the real git.
+#
+# Why: GitHub sometimes answers a push with "! [remote rejected] <ref>
+# (failed)", a server-side failure rather than a refusal. semantic-release
+# pushes the release tag and then its notes ref, and a failure there stops
+# it before the publish step (the GitHub release, a package's upload, the
+# major-tag move) and leaves the tag pushed, so a re-run finds nothing new
+# to release and the release is never finished. Every push it makes is safe
+# to repeat: one that already landed is reported up to date.
+#
+# Only transient answers are retried. A real refusal (non-fast-forward, a
+# protected branch, a hook) fails at once, as it did before.
+set -uo pipefail
+
+real="${SEMANTIC_RELEASE_REAL_GIT:?SEMANTIC_RELEASE_REAL_GIT names the real git}"
+
+if [ "${1:-}" != "push" ]; then
+  exec "${real}" "$@"
+fi
+
+attempts=4
+delay="${SEMANTIC_RELEASE_PUSH_RETRY_DELAY:-5}"
+transient='\(failed\)|RPC failed|unexpected disconnect|early EOF|Connection reset|returned error: 5[0-9][0-9]|Internal Server Error|Service Unavailable'
+
+for attempt in $(seq 1 "${attempts}"); do
+  err="$(mktemp)"
+  "${real}" "$@" 2>"${err}"
+  rc=$?
+  cat "${err}" >&2
+  if [ "${rc}" -eq 0 ]; then
+    rm -f "${err}"
+    exit 0
+  fi
+  if [ "${attempt}" -lt "${attempts}" ] && grep -qE "${transient}" "${err}"; then
+    rm -f "${err}"
+    echo "::warning::git push failed with a transient error (attempt ${attempt} of ${attempts}); retrying in ${delay}s" >&2
+    sleep "${delay}"
+    delay=$((delay * 2))
+    continue
+  fi
+  rm -f "${err}"
+  exit "${rc}"
+done
