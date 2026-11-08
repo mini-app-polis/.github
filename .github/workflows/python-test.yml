@@ -23,7 +23,7 @@ on:
       python-version:
         description: "Match the runtime the repo deploys to — for a Lambda cog, infra/worker.tf's `runtime`."
         type: string
-        default: "3.11"
+        default: "3.14"
       pytest-args:
         description: "Appended to the pytest command."
         type: string

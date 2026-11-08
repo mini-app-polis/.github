@@ -72,7 +72,7 @@ on:
       python-version:
         description: "The Lambda runtime's Python, as in `runtime = \"python<version>\"`."
         type: string
-        default: "3.11"
+        default: "3.14"
       strip:
         description: "Space-separated top-level paths to remove from the zip, for dependencies the cog never imports. Guard 3 fails the build if one is in fact imported. boto3 and its stack are always removed; the runtime provides them."
         type: string

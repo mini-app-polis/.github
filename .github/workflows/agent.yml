@@ -278,7 +278,7 @@ jobs:
             with=$(yq -o=json '[.jobs[] | select((.uses // "") | test("/python-test\\.yml@")) | .with // {}] | .[0] // {}' .github/workflows/ci.yml)
           fi
           field() { jq -r --arg k "$1" --arg d "$2" '.[$k] // $d | tostring' <<<"$with"; }
-          python_default=3.11
+          python_default=3.14
           if [ -f .python-version ]; then
             python_default=$(tr -d '[:space:]' < .python-version)
           fi
