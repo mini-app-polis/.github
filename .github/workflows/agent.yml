@@ -264,7 +264,10 @@ jobs:
 
       # CI's test stage, as the repository's own ci.yml calls it: the `with:`
       # of the job that uses python-test.yml. A key it does not set takes
-      # python-test.yml's default, as it does in CI.
+      # python-test.yml's default, as it does in CI — except python-version,
+      # which falls back to the repository's .python-version when it has one:
+      # a ci.yml that runs its tests inline passes nothing here, and its
+      # Python is the one .python-version names.
       - name: Read CI's test stage inputs
         id: ci
         if: hashFiles('uv.lock') != ''
@@ -275,8 +278,12 @@ jobs:
             with=$(yq -o=json '[.jobs[] | select((.uses // "") | test("/python-test\\.yml@")) | .with // {}] | .[0] // {}' .github/workflows/ci.yml)
           fi
           field() { jq -r --arg k "$1" --arg d "$2" '.[$k] // $d | tostring' <<<"$with"; }
+          python_default=3.11
+          if [ -f .python-version ]; then
+            python_default=$(tr -d '[:space:]' < .python-version)
+          fi
           {
-            echo "python-version=$(field python-version 3.11)"
+            echo "python-version=$(field python-version "$python_default")"
             echo "pytest-args=$(field pytest-args '--cov=src --cov-report=term-missing')"
             echo "typecheck=$(field typecheck '')"
             echo "terraform-dir=$(field terraform-dir '')"

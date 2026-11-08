@@ -129,7 +129,7 @@ jobs:
           # (glibc 2.34). Wheels are chosen at the matching manylinux tag.
           case "$PY" in
             3.8|3.9|3.10|3.11) echo "GLIBC_MINOR=26" >> "$GITHUB_ENV"; echo "MANYLINUX=manylinux_2_17" >> "$GITHUB_ENV" ;;
-            3.12|3.13)         echo "GLIBC_MINOR=34" >> "$GITHUB_ENV"; echo "MANYLINUX=manylinux_2_28" >> "$GITHUB_ENV" ;;
+            3.12|3.13|3.14)    echo "GLIBC_MINOR=34" >> "$GITHUB_ENV"; echo "MANYLINUX=manylinux_2_28" >> "$GITHUB_ENV" ;;
             *) echo "::error::no known Lambda runtime for python ${PY}"; exit 1 ;;
           esac
 

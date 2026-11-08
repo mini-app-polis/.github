@@ -342,7 +342,10 @@ jobs:
         if: inputs.language == 'python'
         uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          # The newest Python the fleet runs: pip resolves the exported lock
+          # here, and a lock resolved for a newer requires-python can pin
+          # versions an older interpreter cannot install.
+          python-version: "3.14"
 
       - name: Set up uv
         if: inputs.language == 'python' && inputs.package-manager == 'uv'
