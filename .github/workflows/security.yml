@@ -314,15 +314,31 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The pinned binary is cached per version, so a run only reaches
+      # GitHub's release downloads when the cache is cold. A release-asset
+      # outage then fails only a run whose cache is empty.
+      - name: Restore gitleaks
+        id: gitleaks-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/fleet-tools/gitleaks
+          key: gitleaks-${{ inputs.gitleaks-version }}-linux-x64
+
       - name: Install gitleaks
+        if: steps.gitleaks-cache.outputs.cache-hit != 'true'
         env:
           GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
         run: |
           set -euo pipefail
+          mkdir -p ~/.cache/fleet-tools/gitleaks
           url="https://github.com/gitleaks/gitleaks/releases/download"
           curl -sSfL "${url}/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin gitleaks
-          gitleaks version
+            | tar -xz -C ~/.cache/fleet-tools/gitleaks gitleaks
+
+      - name: Put gitleaks on PATH
+        run: |
+          echo "${HOME}/.cache/fleet-tools/gitleaks" >> "$GITHUB_PATH"
+          "${HOME}/.cache/fleet-tools/gitleaks/gitleaks" version
 
       - name: Scan history for secrets
         run: gitleaks detect --source . --redact --no-banner --exit-code 1
@@ -523,12 +539,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Cached per version, as gitleaks is above.
+      - name: Restore osv-scanner
+        id: osv-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/fleet-tools/osv-scanner
+          key: osv-scanner-${{ inputs.osv-scanner-version }}-linux-amd64
+
       - name: Install osv-scanner
+        if: steps.osv-cache.outputs.cache-hit != 'true'
         env:
           OSV_VERSION: ${{ inputs.osv-scanner-version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          dir="${HOME}/.cache/fleet-tools/osv-scanner"
+          mkdir -p "${dir}"
           api="https://api.github.com/repos/google/osv-scanner/releases/tags/v${OSV_VERSION}"
           url="$(curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" "${api}" \
                  | jq -r '.assets[].browser_download_url
@@ -540,11 +567,15 @@ jobs:
           fi
           echo "Installing ${url}"
           case "${url}" in
-            *.tar.gz) curl -sSfL "${url}" | sudo tar -xz -C /usr/local/bin osv-scanner ;;
-            *)        sudo curl -sSfL "${url}" -o /usr/local/bin/osv-scanner ;;
+            *.tar.gz) curl -sSfL "${url}" | tar -xz -C "${dir}" osv-scanner ;;
+            *)        curl -sSfL "${url}" -o "${dir}/osv-scanner" ;;
           esac
-          sudo chmod +x /usr/local/bin/osv-scanner
-          osv-scanner --version
+          chmod +x "${dir}/osv-scanner"
+
+      - name: Put osv-scanner on PATH
+        run: |
+          echo "${HOME}/.cache/fleet-tools/osv-scanner" >> "$GITHUB_PATH"
+          "${HOME}/.cache/fleet-tools/osv-scanner/osv-scanner" --version
 
       - name: Audit Node dependencies
         id: osv
@@ -683,14 +714,27 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Cached per version, as gitleaks is above.
+      - name: Restore syft
+        id: syft-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/fleet-tools/syft
+          key: syft-${{ inputs.syft-version }}-linux
+
       - name: Install syft
+        if: steps.syft-cache.outputs.cache-hit != 'true'
         env:
           SYFT_VERSION: ${{ inputs.syft-version }}
         run: |
           set -euo pipefail
           url="https://raw.githubusercontent.com/anchore/syft/main/install.sh"
-          curl -sSfL "${url}" | sh -s -- -b /usr/local/bin "v${SYFT_VERSION}"
-          syft version
+          curl -sSfL "${url}" | sh -s -- -b "${HOME}/.cache/fleet-tools/syft" "v${SYFT_VERSION}"
+
+      - name: Put syft on PATH
+        run: |
+          echo "${HOME}/.cache/fleet-tools/syft" >> "$GITHUB_PATH"
+          "${HOME}/.cache/fleet-tools/syft/syft" version
 
       - name: Generate SBOM
         run: syft dir:. -o cyclonedx-json=sbom.cyclonedx.json
