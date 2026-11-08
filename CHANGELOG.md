@@ -1,3 +1,10 @@
+# [3.28.0](https://github.com/mini-app-polis/.github/compare/v3.27.0...v3.28.0) (2026-11-08)
+
+
+### Features
+
+* support Python 3.14 in Lambda deploys, the dependency audit and agent checks ([7969b14](https://github.com/mini-app-polis/.github/commit/7969b14783729272ff81f39edcbd0b79aa50d0ea))
+
 # [3.27.0](https://github.com/mini-app-polis/.github/compare/v3.26.0...v3.27.0) (2026-11-06)
 
 
