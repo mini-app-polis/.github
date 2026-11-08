@@ -1,3 +1,10 @@
+## [3.29.1](https://github.com/mini-app-polis/.github/compare/v3.29.0...v3.29.1) (2026-11-08)
+
+
+### Bug Fixes
+
+* **semantic-release:** retry a push GitHub fails transiently, so a release is never left half-finished ([02d497f](https://github.com/mini-app-polis/.github/commit/02d497f46e0a879fbc8f373b7a473534e0810f54))
+
 # [3.29.0](https://github.com/mini-app-polis/.github/compare/v3.28.0...v3.29.0) (2026-11-08)
 
 
