@@ -1,3 +1,10 @@
+## [3.29.3](https://github.com/mini-app-polis/.github/compare/v3.29.2...v3.29.3) (2026-11-08)
+
+
+### Bug Fixes
+
+* **dependency-fix:** cache the pinned osv-scanner binary, as security.yml does ([166dfa9](https://github.com/mini-app-polis/.github/commit/166dfa9a5dd3b61e3241b14da65f35231b892df0))
+
 ## [3.29.2](https://github.com/mini-app-polis/.github/compare/v3.29.1...v3.29.2) (2026-11-08)
 
 
