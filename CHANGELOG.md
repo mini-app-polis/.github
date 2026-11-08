@@ -1,3 +1,10 @@
+## [3.29.2](https://github.com/mini-app-polis/.github/compare/v3.29.1...v3.29.2) (2026-11-08)
+
+
+### Bug Fixes
+
+* **security:** cache the pinned gitleaks, osv-scanner and syft binaries so a GitHub release-asset outage only fails a cold-cache run ([a293d59](https://github.com/mini-app-polis/.github/commit/a293d597ca41ba9136f1ddfc6816a31e4e566ff6))
+
 ## [3.29.1](https://github.com/mini-app-polis/.github/compare/v3.29.0...v3.29.1) (2026-11-08)
 
 
