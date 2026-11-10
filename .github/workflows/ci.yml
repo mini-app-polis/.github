@@ -54,15 +54,19 @@ jobs:
       pull-requests: write
     uses: ./.github/workflows/release.yml
 
-  # This repo asks for its own conformance evaluation like any other, and
-  # like the security jobs above it calls the local file rather than the
-  # published tag. A change to evaluate.yml is therefore exercised against
-  # the real API here — after the release, so it cannot hold a bad version
-  # back, but before anyone reports it as a mystery failure in their own
-  # pipeline. That is the same reason the security self-calls exist.
+  # Conformance is graded on every change once CI passes, before it is
+  # released (CD-031), so a docs or chore commit that cuts no release is
+  # graded too. Nothing waits for the answer: the job reports whether the
+  # request landed, never what was found.
+  #
+  # Like the security jobs above, it calls the local file rather than the
+  # published tag, so a change to evaluate.yml is exercised against the
+  # real API here before anyone meets it in their own pipeline.
   evaluate:
-    needs: release
+    needs: [test, security]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     uses: ./.github/workflows/evaluate.yml
+    with:
+      ref: main
     secrets:
       api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
