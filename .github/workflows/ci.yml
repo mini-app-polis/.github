@@ -54,10 +54,10 @@ jobs:
       pull-requests: write
     uses: ./.github/workflows/release.yml
 
-  # Conformance is graded on every change once CI passes, before it is
-  # released (CD-031), so a docs or chore commit that cuts no release is
-  # graded too. Nothing waits for the answer: the job reports whether the
-  # request landed, never what was found.
+  # Conformance is graded on every push to main once CI passes, before the
+  # release (CD-031), so a promotion that cuts no release (docs or chore
+  # commits only) is graded too. Nothing waits for the answer: the job
+  # reports whether the request landed, never what was found.
   #
   # Like the security jobs above, it calls the local file rather than the
   # published tag, so a change to evaluate.yml is exercised against the
@@ -66,7 +66,5 @@ jobs:
     needs: [test, security]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     uses: ./.github/workflows/evaluate.yml
-    with:
-      ref: main
     secrets:
       api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}

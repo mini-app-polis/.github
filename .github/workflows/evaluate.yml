@@ -1,16 +1,16 @@
 # The fleet's shared conformance-evaluation trigger.
 #
 # A repository's conformance changes when that repository changes, so the
-# event that should evaluate it is each change, once CI passes and before
-# it is released (CD-031). This workflow is how a CI job says so: it POSTs
+# event that should evaluate it is each push to main, once CI passes and
+# before the release (CD-031). This workflow is how a CI job says so: it POSTs
 # to api-kaianolevine-com, which hands the job to evaluator-cog and
 # acknowledges. Nothing here waits for findings.
 #
 # Two scopes, and the difference is which release you are reacting to:
 #
-#   scope: repo   (default)  — evaluate the calling repository, at the
-#                              ref it passes: dev, after CI, for every repo
-#                              whose own code just changed.
+#   scope: repo   (default)  — evaluate the calling repository: main,
+#                              after CI, for every repo whose own code
+#                              just changed.
 #   scope: fleet             — evaluate every repository in the registry,
 #                              plus the checks that scope to none of them.
 #                              For ecosystem-standards and evaluator-cog
@@ -36,10 +36,8 @@
 #   jobs:
 #     evaluate:
 #       needs: [test, security]
-#       if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+#       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 #       uses: mini-app-polis/.github/.github/workflows/evaluate.yml@v3
-#       with:
-#         ref: dev
 #       secrets:
 #         api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
 
@@ -53,7 +51,7 @@ on:
         type: string
         default: repo
       ref:
-        description: "Branch or tag to evaluate: dev, for a request made after CI and before the release. Defaults to the repository's default branch, which a fleet pass after a release grades."
+        description: "Branch or tag to evaluate. Defaults to the repository's default branch, main, which every request grades."
         type: string
         default: ""
       repo:
