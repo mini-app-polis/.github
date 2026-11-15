@@ -62,6 +62,16 @@
 # regenerated after the agent's change and before the commit, as the
 # pre-commit hook does for a person, so `facts check` passes in CI.
 #
+# **Postgres.** A caller whose tests need a database passes `postgres: true`
+# (and `postgres-db`, the database's name, which must end in _test). A
+# pgvector Postgres 16 is started on localhost:5432, as a repository's ci.yml
+# runs it as a service, and TEST_DATABASE_URL names it for the agent and for
+# CI's test stage. `services:` cannot depend on an input, so it is started
+# with docker run and waited on until it is healthy.
+#
+# **Coverage data** (.coverage, .coverage.*), which CI's test stage writes,
+# is never committed, whatever the repository's .gitignore says.
+#
 # **dry_run** runs everything but the model, the push and the post: it
 # proves the checkout, the toolchain, CI's test stage on the unchanged
 # branch, the App's credentials and the API key, and prints the result it
@@ -101,6 +111,9 @@
 #         model: ${{ inputs.model }}
 #         budget_usd: ${{ inputs.budget_usd }}
 #         dry_run: ${{ inputs.dry_run }}
+#         # Only for a repository whose tests need Postgres:
+#         # postgres: true
+#         # postgres-db: my_app_test
 #       secrets: inherit
 
 name: agent
@@ -154,6 +167,17 @@ on:
         description: "The budget limit, in USD, for the one attempt to repair a change that fails CI's test stage."
         type: string
         default: "0.50"
+      postgres:
+        description: >-
+          Start a pgvector Postgres 16 on localhost:5432 and set
+          TEST_DATABASE_URL to it, for a repository whose tests need one, as
+          its ci.yml runs it as a service.
+        type: boolean
+        default: false
+      postgres-db:
+        description: "With postgres, the database's name. The fleet's integration tests refuse one not named *_test."
+        type: string
+        default: app_test
     secrets:
       AGENT_ANTHROPIC_API_KEY:
         required: false
@@ -213,6 +237,38 @@ jobs:
         with:
           ref: ${{ github.ref_name }}
           persist-credentials: false
+
+      # As a ci.yml runs it under `services:`, which cannot depend on an
+      # input. TEST_DATABASE_URL reaches every later step: the agent, the
+      # repair, and CI's test stage.
+      - name: Start Postgres
+        if: ${{ inputs.postgres }}
+        env:
+          POSTGRES_DB: ${{ inputs.postgres-db || 'app_test' }}
+        run: |
+          set -euo pipefail
+          docker run -d --name postgres \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB="$POSTGRES_DB" \
+            -p 5432:5432 \
+            --health-cmd "pg_isready -U postgres" \
+            --health-interval 5s \
+            --health-timeout 5s \
+            --health-retries 10 \
+            pgvector/pgvector:pg16 > /dev/null
+          for _ in $(seq 1 60); do
+            health=$(docker inspect -f '{{.State.Health.Status}}' postgres)
+            if [ "$health" = "healthy" ]; then
+              echo "TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/${POSTGRES_DB}" >> "$GITHUB_ENV"
+              echo "Postgres is ready: database ${POSTGRES_DB}"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs postgres
+          echo "::error::Postgres did not become healthy."
+          exit 1
 
       - name: Install uv
         if: hashFiles('uv.lock') != '' || hashFiles('facts.yaml') != ''
@@ -345,6 +401,9 @@ jobs:
 
           PROMPT
             printf '%s\n' "$TASK"
+            if [ -n "${TEST_DATABASE_URL:-}" ]; then
+              printf '\nA Postgres for the tests is running; TEST_DATABASE_URL names it.\n'
+            fi
             if [ -n "$CHECKS" ] && [ -s "$CHECKS" ]; then
               printf '\nCI'"'"'s test stage, in order (run the ones you may):\n\n'
               sed 's/^/  /' "$CHECKS"
@@ -396,7 +455,8 @@ jobs:
           # names the exact command in the log.
           jq -r '.permission_denials[]? | "::warning::denied \(.tool_name): \(.tool_input.command // .tool_input.file_path // "" | tostring | .[0:300])"' \
             "$result" 2>/dev/null || true
-          changed=$(git status --porcelain)
+          # Coverage data the agent's own test runs wrote is not a change.
+          changed=$(git status --porcelain -- . ':(exclude,glob)**/.coverage' ':(exclude,glob)**/.coverage.*')
           # Its questions, at most ten, as a JSON list for the report.
           printf '%s\n' "$text" | sed -n 's/^QUESTION:[[:space:]]*//p' \
             | jq -R -s -c 'split("\n") | map(select(test("\\S"))) | .[0:10]' \
@@ -582,7 +642,8 @@ jobs:
           git config user.name "$bot"
           git config user.email "${bot_id}+${bot}@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git add -A
+          # Coverage data from CI's test stage is never part of the change.
+          git add -A -- . ':(exclude,glob)**/.coverage' ':(exclude,glob)**/.coverage.*'
           git commit -q -m "$SUBJECT"
           git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
           if [ "$OUTCOME" != "succeeded" ]; then

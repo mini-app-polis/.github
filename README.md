@@ -543,6 +543,14 @@ repository a target.
   repository without `uv.lock`. Each sets up the dependencies before the
   agent starts and allows its check commands (`uv run`, `pnpm run`,
   `npm run`, `terraform fmt` and `validate`, `python3 scripts/`).
+- **Postgres, when the caller asks.** `postgres: true` starts a pgvector
+  Postgres 16 on `localhost:5432` (database `postgres-db`, which must end
+  in `_test`) before the agent runs, as a `ci.yml` runs it as a service,
+  and sets `TEST_DATABASE_URL` for the agent and CI's test stage. It is a
+  `docker run` step, since `services:` cannot depend on an input.
+- **Coverage data is never committed.** `.coverage` and `.coverage.*` are
+  left out of what counts as a change and of the commit, whatever the
+  repository's `.gitignore` says.
 - **`dry_run`** proves the checkout, toolchain, CI's test stage on the
   unchanged branch, App and API key without calling the model, pushing or
   posting.
