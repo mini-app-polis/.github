@@ -1,3 +1,10 @@
+# [3.30.0](https://github.com/mini-app-polis/.github/compare/v3.29.3...v3.30.0) (2026-11-15)
+
+
+### Features
+
+* **agent:** start Postgres for a caller's tests on request, and never commit coverage data ([fa27bc0](https://github.com/mini-app-polis/.github/commit/fa27bc0eac2c822d1553a8eed59b0f38c3b8a230))
+
 ## [3.29.3](https://github.com/mini-app-polis/.github/compare/v3.29.2...v3.29.3) (2026-11-08)
 
 
