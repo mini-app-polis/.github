@@ -43,11 +43,19 @@
 # and opens no pull request, even if files were changed, and
 # task-manager-cog sends the task back to refining.
 #
+# **Done when answers.** A run that finishes the task ends its final
+# message with one `ANSWER:` line per Done when item, in the task's order,
+# each naming its evidence. A succeeded run reports them, and
+# task-manager-cog lists them, numbered, in the task's `Handed off:`
+# comment, the form its Review check reads item by item. A repair's
+# answers, when it gives them, replace the first run's.
+#
 # **The result always reports.** The last step runs whatever happened before
 # it, and posts how the run ended, what it cost (Claude Code's own figure)
-# and the pull request, or its questions, with the task-agent machine key, which may post a
-# result and nothing else. The API hands it to task-manager-cog, which
-# moves the task and, for a pull request, posts the `Handed off:` comment.
+# and the pull request with its Done when answers, or its questions, with
+# the task-agent machine key, which may post a result and nothing else. The
+# API hands it to task-manager-cog, which moves the task and, for a pull
+# request, posts the `Handed off:` comment.
 # A run killed before it can report is failed by
 # task-manager-cog's sweep once it is overdue.
 #
@@ -393,8 +401,19 @@ jobs:
             QUESTION: Should the old setting be read as a fallback for one release?
           - If the task cannot be done as written for another reason, change
             nothing and say why.
-          - Otherwise end your final message with one line, a conventional
-            commit subject for the change, for example:
+          - Otherwise end your final message with one ANSWER: line for each
+            item of the task's "Done when", in the task's order: the first
+            line answers its first item, the second its second, and so on,
+            one line per item and none skipped. Its items are its list items
+            when it has any, and its sentences otherwise. Each answer says
+            how the item is met and names the evidence: the test names, the
+            files changed, the check run. A person reads them as the
+            handoff, and a check matches them to the items by position.
+            For example, for a Done when of two items:
+            ANSWER: The sweep skips them: src/sweep.py; test_blocked_tasks_are_skipped in tests/unit/test_sweep.py.
+            ANSWER: The checks pass: uv run pytest (all tests), uv run ruff check, uv run mypy src/.
+          - Then one last line, a conventional commit subject for the
+            change, for example:
             COMMIT: fix(sweep): skip tasks waiting only on blockers
 
           The task:
@@ -462,6 +481,10 @@ jobs:
             | jq -R -s -c 'split("\n") | map(select(test("\\S"))) | .[0:10]' \
             > "$RUNNER_TEMP/questions.json"
           asked=$(jq length "$RUNNER_TEMP/questions.json")
+          # Its Done when answers, in order, at most thirty, each one line.
+          printf '%s\n' "$text" | sed -n 's/^ANSWER:[[:space:]]*//p' \
+            | jq -R -s -c 'split("\n") | map(select(test("\\S")) | .[0:2000]) | .[0:30]' \
+            > "$RUNNER_TEMP/answers.json"
           outcome=failed
           if [ "$subtype" = "error_max_budget_usd" ]; then
             outcome=capped
@@ -586,6 +609,15 @@ jobs:
             if [ -n "$repair_cost" ]; then
               cost=$(awk -v a="${cost:-0}" -v b="$repair_cost" 'BEGIN { printf "%.4f", a + b }')
             fi
+            # The repair's Done when answers, when it gave them, are the ones
+            # that describe the change as it is pushed.
+            jq -r '.result // empty' "$RUNNER_TEMP/repair.json" 2>/dev/null \
+              | sed -n 's/^ANSWER:[[:space:]]*//p' \
+              | jq -R -s -c 'split("\n") | map(select(test("\\S")) | .[0:2000]) | .[0:30]' \
+              > "$RUNNER_TEMP/repair-answers.json"
+            if [ "$(jq length "$RUNNER_TEMP/repair-answers.json" 2>/dev/null || echo 0)" -gt 0 ]; then
+              mv "$RUNNER_TEMP/repair-answers.json" "$RUNNER_TEMP/answers.json"
+            fi
           fi
           if [ "$outcome" = "succeeded" ] && [ "$CHECKS" = "failure" ]; then
             failed_check=$(sed -n 's/^FAILED (exit [0-9]*): //p' "$LOG" 2>/dev/null | tail -n 1)
@@ -688,13 +720,18 @@ jobs:
           if [ "$outcome" = "needs_refining" ]; then
             questions=$(cat "$RUNNER_TEMP/questions.json")
           fi
+          answers="[]"
+          if [ "$outcome" = "succeeded" ] && [ -s "$RUNNER_TEMP/answers.json" ]; then
+            answers=$(cat "$RUNNER_TEMP/answers.json")
+          fi
           body=$(jq -n \
             --arg run_id "$RUN_ID" --arg outcome "$outcome" --arg cost "$COST" \
             --arg pr "$PR_URL" --arg run_url "$RUN_URL" --arg reason "$reason" \
-            --argjson questions "$questions" \
+            --argjson questions "$questions" --argjson answers "$answers" \
             '{run_id: $run_id, outcome: $outcome, actions_run_url: $run_url}
              + (if $cost != "" then {cost_usd: ($cost | tonumber)} else {} end)
              + (if $outcome == "succeeded" then {pr_url: $pr} else {} end)
+             + (if $outcome == "succeeded" and ($answers | length) > 0 then {done_when_answers: $answers} else {} end)
              + (if $outcome == "needs_refining" then {questions: $questions} else {} end)
              + (if $reason != "" then {reason: ($reason | .[0:2000])} else {} end)')
 

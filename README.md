@@ -532,10 +532,16 @@ repository a target.
   The run reports `needs_refining` with those questions and pushes nothing,
   even if it changed files; task-manager-cog moves the task back to
   refining.
-- **Always reports** its outcome, cost and pull request (or questions) to
-  api-kaianolevine-com with the task-agent key, which may post a result
-  and nothing else. task-manager-cog posts a succeeded run's result on its
-  task as the `Handed off:` comment and moves the task to Review. The
+- **Answers the Done when.** An agent that finishes its task ends with one
+  `ANSWER:` line per Done when item, in the task's order, each naming its
+  evidence (tests, files, checks); a repair's answers, when it gives them,
+  replace the first run's.
+- **Always reports** its outcome, cost and pull request with its Done when
+  answers (or its questions) to api-kaianolevine-com with the task-agent
+  key, which may post a result and nothing else. task-manager-cog posts a
+  succeeded run's result on its task as the `Handed off:` comment, the
+  answers as a numbered list, one item per Done when item, which is what
+  its Review check reads, and moves the task to Review. The
   task closes when a `Landed:` comment confirms green CI on dev, from
   whoever confirms it.
 - **Toolchains** follow the repository's lock file: uv, pnpm, npm or
