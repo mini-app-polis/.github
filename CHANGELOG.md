@@ -1,3 +1,10 @@
+# [3.31.0](https://github.com/mini-app-polis/.github/compare/v3.30.0...v3.31.0) (2026-11-15)
+
+
+### Features
+
+* **agent:** answer each Done when item and report the answers with the result ([5172bfa](https://github.com/mini-app-polis/.github/commit/5172bfac01adcac2bd45e3a5e9ee8bd195afc143))
+
 # [3.30.0](https://github.com/mini-app-polis/.github/compare/v3.29.3...v3.30.0) (2026-11-15)
 
 
