@@ -26,6 +26,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
     commit-message:
       prefix: "ci(deps)"
 
@@ -41,5 +42,11 @@ updates:
     groups:
       release-tooling:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # npm is replaced by npm-stub through `overrides` (see the README beside
+    # the lockfile), so the lockfile holds a link with no version. Dependabot
+    # cannot update a link, and an advisory against npm fails the whole run.
+    ignore:
+      - dependency-name: "npm"
     commit-message:
       prefix: "ci(deps)"
