@@ -30,6 +30,211 @@ repository, or an LLM pass, for changes that do not cut a release and for
 re-grading everything at once. It calls `evaluate.yml`, so it sends the same
 request a release would.
 
+## The canonical pipeline
+
+One pipeline builds, tests, releases, deploys and evaluates every
+mini-app-polis repository. A repository subscribes to it with a thin
+caller and a profile; it does not copy stages. ecosystem-standards
+ADR-0017 records why it runs on GitHub Actions from this repository.
+
+The pipeline's settings that change over time (its current major, the
+canary repository and the soak period) live in `pipeline.yaml` at the
+root of this repository. Conformance rules and the
+release reconciler read them from there; nothing else restates them.
+
+### One commit, one run
+
+A commit's whole build is one workflow run. The pipeline is a single
+reusable workflow, `pipeline.yml`, and every stage below is a job of it,
+so the run's graph shows every stage of that commit with its result.
+Nothing a commit needs runs as a separate workflow chained to it: no
+`deployment_status`, `workflow_run` or `repository_dispatch` workflow
+carries a stage, and no platform builds or deploys from a branch on its
+own.
+
+A repository's caller is its `ci.yml`:
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Release tag to finish (set by the release reconciler)
+        type: string
+        required: false
+jobs:
+  pipeline:
+    uses: mini-app-polis/.github/.github/workflows/pipeline.yml@v4 # the current major in pipeline.yaml
+    with:
+      profile: python-service
+    secrets: inherit
+```
+
+Branch flow stays outside the run, as today: `promote.yml` keeps a
+`dev` → `main` pull request open, `automerge.yml` merges a pull request
+into `dev` once its checks pass, and releases to `main` are made by
+merging the promotion pull request by hand. `agent.yml` and the fleet
+jobs (`commons-update.yml`, `dependency-fix.yml`) are not builds and stay
+separate workflows.
+
+### Stage graph
+
+| Stage | Job | Runs on | Needs | Gates |
+|---|---|---|---|---|
+| Lint and type check | `lint` | every event | — | `build` |
+| Unit tests | `unit` | every event | — | `build` |
+| Integration tests | `integration` | every event | — | `build` |
+| Contract tests | `contract` | every event | — | `build` |
+| Security | `security` | every event | — | `build` |
+| Build | `build` | every event | `lint`, `unit`, `integration`, `contract`, `security` | everything after it |
+| Pre-release evaluation | `evaluate-pre` | push to `main` | `build` | `release` |
+| Release | `release` | push to `main`, and `workflow_dispatch` with `ref` | `evaluate-pre` | `deploy` on `main` |
+| Deploy | `deploy` | push to `dev` (development), push to `main` when `release` published (production) | `build`, and `release` on `main` | `verify` |
+| Post-deploy verify | `verify` | wherever `deploy` ran | `deploy` | `evaluate-post` |
+| Post-release evaluation | `evaluate-post` | push to `main` when `release` published | `verify`, `release` | — |
+
+Each type of test is its own stage, so a failure names the kind of test
+that failed. A stage a profile has no use for still appears in the run
+and is skipped with its reason in the job summary, never removed. The
+required status check is the `test` job, a gate over `lint`, `unit`,
+`integration`, `contract` and `security`; its name does not change when
+stages are added.
+
+On `dev`, a commit is built, tested, deployed to development and verified
+there. On `main`, a commit is built and tested again, evaluated before
+release, released, deployed to production behind the `production`
+environment, verified and evaluated after release. A pull request runs the
+stages up to `build` and deploys nothing.
+
+Release data reaches every later stage through job outputs in the same
+run: `evaluate-post` evaluates the version and commit `release` produced,
+never a branch name and never a guess at when a deploy finished.
+
+### Stage contracts
+
+Every stage declares its inputs, outputs and artifacts, and the check that
+makes running it twice on the same commit safe. Running any stage twice
+produces no second release, deploy or evaluation.
+
+| Stage | Inputs | Outputs and artifacts | Safe to re-run because |
+|---|---|---|---|
+| `lint`, `unit`, `integration`, `contract` | the commit; the profile's commands; for `integration`, the service containers the profile names; for `contract`, the contract suites the profile names and the development API | test reports in the job summary | they change nothing outside the run |
+| `security` | the commit; the profile's language and package manager | findings in the job summary | it changes nothing outside the run |
+| `build` | the commit; the profile's build | `artifact-name`, `artifact-digest`; the artifact (wheel, Lambda zip, container image or site bundle) and its SBOM, kept with the run | an artifact for this commit already in the run is reused, not rebuilt |
+| `evaluate-pre` | `repo`, `sha`, `phase: pre-release` | the evaluation id | the evaluator answers a repeated (repo, sha, phase) with the evaluation it already has |
+| `release` | the commit, or `ref` from the reconciler | `published` (true or false), `version`, `tag`, `sha` | a tag already on this commit is this commit's release: the stage finishes what is missing (the GitHub release, the package publish, the fleet notice) and reports it, rather than cutting another |
+| `deploy` | `artifact-digest`, `environment`, `version` | `deployed-version` | it reads what the target runs first and skips when that is already this version |
+| `verify` | `environment`, `version`, the profile's check | `verified` | it only reads the running service |
+| `evaluate-post` | `repo`, `version`, `sha`, `phase: post-release` | the evaluation id | the evaluator answers a repeated (repo, version, phase) with the evaluation it already has |
+
+Every later stage consumes the artifact `build` produced, by digest. No
+stage rebuilds it.
+
+Every job declares `timeout-minutes`. Network calls (registry pulls,
+package publish, deploys, API calls) retry with backoff. `release` and
+`deploy` run in per-repository concurrency groups that never cancel a run
+in progress; only the stages before `build` cancel superseded runs, and
+only off `main`.
+
+### Profiles
+
+A profile is a set of inputs: which stages have work, with what tools,
+producing what artifact, deployed where, verified how. A repository names
+its profile in its caller; `pipeline.yml` holds each profile's defaults,
+and the repository's inputs override them.
+
+| Profile | Tooling | Integration and contract | Artifact | Deploy | Verify |
+|---|---|---|---|---|---|
+| `python-service` | uv, ruff, mypy, pytest | Postgres service container where the repository's tests need it; contract suites it consumes | Lambda zip, or container image for a Railway worker | AWS Lambda functions, or Railway services | the function's or service's reported version |
+| `api-service` | uv, ruff, mypy, pytest | Postgres service container; the contract suites it provides and consumes | container image | Railway | `/health` reports the released version |
+| `python-library` | uv, ruff, mypy, pytest | contract suites against the development API where it ships them | wheel and sdist | published to PyPI by `release`, which also tells the fleet a release is out | the published version resolves on PyPI |
+| `astro-site` | Node with npm or pnpm, typecheck, build | the API contract suites the site consumes; end-to-end tests where it has them | site bundle | Cloudflare Pages, uploaded from the pipeline | the site serves the released version |
+| `npm-library` | Node with npm or pnpm, typecheck, lint, tests | contract suites where it ships them | npm package | published to the registry by `release` | the published version resolves |
+| `terraform-infra` | Terraform fmt and validate, the repository's consistency checks | the task contract suite | the reviewed plan | `terraform apply` of that plan | a fresh plan shows no changes |
+| `shared-workflows` | workflow static analysis, the pipeline's fixture repositories | — | — | the release moves the major tag | the fixtures pass at the new tag |
+
+`shared-workflows` is this repository. It has no `dev`: pull requests
+target `main`, and a merge to `main` releases.
+
+### Extension points
+
+A repository may add work only at these points, as inputs or as jobs in
+its caller that need the `pipeline` job:
+
+- **Extra checks** in `lint`, `unit` or `integration`, as commands the
+  profile runs in that stage (a schema check, `facts check`).
+- **Service containers and contract suites** for `integration` and
+  `contract`.
+- **Build and deploy targets**: the handler, architecture, function or
+  service names the profile deploys, read from the repository's inputs.
+- **Post-deploy work**: a caller job after `pipeline` for a step that
+  belongs after the new code is live (rebuilding generated pages). It runs
+  in the same run, so the one view holds.
+- **Scheduled runs**: a caller may add a `schedule` trigger for work the
+  pipeline already defines (a scheduled evaluation), not new stages.
+
+Anything else is drift, and the conformance rules report it.
+
+### Enforced and subscribed
+
+Two layers keep the pipeline whole.
+
+- **Enforced.** Organization rulesets, managed as code in infra, require
+  the security controls and the deterministic conformance check on `main`
+  and `dev` of every repository, through required workflows run from this
+  repository. A repository cannot remove or weaken them; a new repository
+  has them from its first pull request. The enforced checks map to the
+  catalog's security posture rules by reference.
+- **Subscribed.** Everything else in the stage graph reaches a repository
+  through its caller at the current major. Conformance rules require the
+  caller to be thin, at the current major, with no inline jobs beyond the
+  extension points and no deploy path outside the pipeline.
+
+### The release reconciler
+
+A release that stopped partway is finished inside the pipeline, not by
+hand. The release reconciler runs in AWS on the fleet's existing
+EventBridge schedule. On each pass, for each repository:
+
+1. It reads the newest release (its tag and commit), what the production
+   target reports it runs, and the evaluations recorded for that version.
+2. If a stage is missing (not deployed, not verified, not evaluated), it
+   finds the original run for that commit and re-runs its failed or
+   skipped jobs in that run, so the build stays one flow with one view.
+3. Only when the original run can no longer be re-run, it starts a new run
+   with `workflow_dispatch` and `ref` set to the release tag. That run's
+   summary links the original.
+4. A release that stays stuck unchanged alerts once, not on every pass.
+
+The reconciler never builds, releases or deploys anything itself: it only
+asks the pipeline to resume. A run started for `ref` skips the stages
+before `build`, reuses the tag in `release`, and continues from there.
+
+### Changing the pipeline
+
+The pipeline changes through this repository's own pull requests, which
+run workflow static analysis and the pipeline against one fixture
+repository per profile. A failing fixture blocks the release.
+
+- **Canary first.** A new major runs on the canary repository named in
+  `pipeline.yaml` first. It moves to the rest of the fleet after the soak
+  period in `pipeline.yaml` has passed with every stage exercised on `dev`
+  and `main`, including one reconciler recovery, and no failure caused by
+  the pipeline.
+- **Versions.** semantic-release cuts `vX.Y.Z` from the commit messages and
+  moves the major tag (see Versioning below). Callers pin the major. A
+  breaking change ships only in a new major; the previous major keeps
+  working through a deprecation window that ends when the whole fleet has
+  moved.
+- **Rollback.** Re-point the major tag at the previous release of that
+  major. Callers pick it up on their next run with no change of their own.
+
 ## Shared security workflow
 
 `.github/workflows/security.yml` is a reusable workflow that runs four

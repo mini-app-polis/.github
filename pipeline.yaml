@@ -1,0 +1,13 @@
+# The canonical pipeline's settings that change over time (README, "The
+# canonical pipeline"). Conformance rules and the release reconciler read
+# them from here; nothing else restates them.
+
+# The major every repository's caller pins: pipeline.yml@v<current_major>.
+current_major: 3
+
+# The repository a new major runs on first, before the rest of the fleet.
+canary: watcher-cog
+
+# Days a new major runs on the canary, with every stage exercised and no
+# pipeline-caused failure, before it moves to the fleet.
+soak_days: 7
