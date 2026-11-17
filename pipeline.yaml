@@ -11,3 +11,9 @@ canary: watcher-cog
 # Days a new major runs on the canary, with every stage exercised and no
 # pipeline-caused failure, before it moves to the fleet.
 soak_days: 7
+
+# The repositories whose CI has moved onto the canonical pipeline, or "all"
+# once every one has. The canonical-pipeline conformance rules (CD-041,
+# CD-042, CD-043) grade only these, so a repository is added here in the
+# same change that moves it. Missing or empty: none are graded.
+on_pipeline: []

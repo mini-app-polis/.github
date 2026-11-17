@@ -38,8 +38,8 @@ caller and a profile; it does not copy stages. ecosystem-standards
 ADR-0017 records why it runs on GitHub Actions from this repository.
 
 The pipeline's settings that change over time (its current major, the
-canary repository and the soak period) live in `pipeline.yaml` at the
-root of this repository. Conformance rules and the
+canary repository, the soak period and the repositories already moved
+onto it) live in `pipeline.yaml` at the root of this repository. Conformance rules and the
 release reconciler read them from there; nothing else restates them.
 
 ### One commit, one run
