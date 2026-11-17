@@ -1,0 +1,35 @@
+# Checks on this repository's own workflow files, run on every change to
+# them. Not part of the pipeline consumers call: it reads only this
+# repository's .github/workflows.
+#
+# timeouts: every job that runs steps declares timeout-minutes, so a hung
+# step stops at a known limit instead of holding a runner for six hours.
+name: workflow-checks
+
+on:
+  pull_request:
+    paths: [".github/workflows/**", "scripts/check-workflow-timeouts.py"]
+  push:
+    branches: [main]
+    paths: [".github/workflows/**", "scripts/check-workflow-timeouts.py"]
+
+permissions:
+  contents: read
+
+jobs:
+  timeouts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Every job declares timeout-minutes
+        run: |
+          python -m pip install --quiet pyyaml
+          python scripts/check-workflow-timeouts.py

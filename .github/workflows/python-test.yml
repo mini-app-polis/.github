@@ -20,6 +20,10 @@ name: python-test
 on:
   workflow_call:
     inputs:
+      timeout-minutes:
+        description: "How long the test job may run before it is stopped. Raise it for a suite that needs longer; a job with no limit runs for GitHub's six hours."
+        type: number
+        default: 30
       python-version:
         description: "Match the runtime the repo deploys to — for a Lambda cog, infra/worker.tf's `runtime`."
         type: string
@@ -53,17 +57,36 @@ on:
 permissions:
   contents: read
 
+env:
+  # Package managers retry their own registry fetches with backoff; these
+  # raise each one's attempt count so a registry blip is ridden out rather
+  # than failing the stage.
+  UV_HTTP_RETRIES: "5"
+  PIP_RETRIES: "5"
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: test-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
     env:
       WORKFLOW_VERSION: v3
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Inputs reach a shell through env, never expanded into the script.
       - name: Show the workflow version
+        env:
+          PYTHON_VERSION: ${{ inputs.python-version }}
         run: |
-          echo "python-test.yml ${WORKFLOW_VERSION}: python ${{ inputs.python-version }}"
+          echo "python-test.yml ${WORKFLOW_VERSION}: python ${PYTHON_VERSION}"
 
       - name: Test stage
         uses: mini-app-polis/.github/.github/actions/python-checks@v3

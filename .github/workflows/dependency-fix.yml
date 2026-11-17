@@ -84,6 +84,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # Package managers retry their own registry fetches with backoff; these
+  # raise each one's attempt count so a registry blip is ridden out rather
+  # than failing the stage.
+  UV_HTTP_RETRIES: "5"
+  PIP_RETRIES: "5"
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
   ORG: mini-app-polis
   BRANCH: security-fix/deps
   # The osv-scanner security.yml audits pnpm repositories with: keep the two
@@ -93,6 +101,10 @@ env:
 jobs:
   discover:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No checkout and no use of this run's token: the App's token lists the
+    # fleet.
+    permissions: {}
     outputs:
       repos: ${{ steps.list.outputs.repos }}
     steps:
@@ -107,14 +119,17 @@ jobs:
           fi
 
       # No `repositories` list: the token covers every repository the App
-      # is installed on, which is exactly the set it could fix.
+      # is installed on, which is exactly the set it could fix. It is only
+      # used to list that set, so it is held to `contents: read`; each
+      # write is made with a token minted later for one repository. That
+      # is why zizmor's github-app finding is ignored on the owner line.
       - name: Mint an App token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
-          owner: ${{ env.ORG }}
+          owner: ${{ env.ORG }} # zizmor: ignore[github-app]
           permission-contents: read
 
       # One matrix entry per repository: its name and which lock it has.
@@ -148,6 +163,11 @@ jobs:
     needs: discover
     if: needs.discover.outputs.repos != '[]'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # This repository's checkout only; the target is read and written with
+    # the App's token.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -155,13 +175,13 @@ jobs:
         include: ${{ fromJSON(needs.discover.outputs.repos) }}
     steps:
       # This repository, for the script.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: fleet
 
       - name: Mint an App token for ${{ matrix.repo }}
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
@@ -170,7 +190,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.ORG }}/${{ matrix.repo }}
           ref: dev
@@ -179,13 +199,13 @@ jobs:
 
       # The same Python and tooling as security.yml's dependency audit.
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
       - name: Set up uv
         if: matrix.kind == 'uv'
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           # The target's own `[tool.uv] required-version`, so the re-lock is
           # written by the uv its lock is pinned to. setup-uv looks in the
@@ -199,13 +219,13 @@ jobs:
       # at target/.
       - name: Set up Node
         if: matrix.kind == 'pnpm'
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
       - name: Set up pnpm
         if: matrix.kind == 'pnpm'
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: target/package.json
 
@@ -214,7 +234,7 @@ jobs:
       - name: Restore osv-scanner
         id: osv-cache
         if: matrix.kind == 'pnpm'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/fleet-tools/osv-scanner
           key: osv-scanner-${{ env.OSV_SCANNER_VERSION }}-linux-amd64
@@ -228,7 +248,7 @@ jobs:
           dir="${HOME}/.cache/fleet-tools/osv-scanner"
           mkdir -p "${dir}"
           api="https://api.github.com/repos/google/osv-scanner/releases/tags/v${OSV_SCANNER_VERSION}"
-          url="$(curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" "${api}" \
+          url="$(curl -sSfL --retry 5 --retry-connrefused -H "Authorization: Bearer ${GH_TOKEN}" "${api}" \
                  | jq -r '.assets[].browser_download_url
                           | select(test("linux[_-]amd64([.]tar[.]gz)?$"))' \
                  | head -1)"
@@ -237,8 +257,8 @@ jobs:
             exit 1
           fi
           case "${url}" in
-            *.tar.gz) curl -sSfL "${url}" | tar -xz -C "${dir}" osv-scanner ;;
-            *)        curl -sSfL "${url}" -o "${dir}/osv-scanner" ;;
+            *.tar.gz) curl -sSfL --retry 5 --retry-connrefused "${url}" | tar -xz -C "${dir}" osv-scanner ;;
+            *)        curl -sSfL --retry 5 --retry-connrefused "${url}" -o "${dir}/osv-scanner" ;;
           esac
           chmod +x "${dir}/osv-scanner"
 

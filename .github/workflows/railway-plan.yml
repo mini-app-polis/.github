@@ -62,11 +62,22 @@ on:
 permissions:
   contents: read
 
+env:
+  # Package managers retry their own registry fetches with backoff; these
+  # raise each one's attempt count so a registry blip is ridden out rather
+  # than failing the stage.
+  UV_HTTP_RETRIES: "5"
+  PIP_RETRIES: "5"
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
+
 jobs:
   plan:
     # Fork pull requests get no secrets, and must not plan with ours.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     concurrency:
@@ -77,17 +88,17 @@ jobs:
     outputs:
       changes: ${{ steps.plan.outputs.changes }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # pnpm only for a .railway/ that has moved to it; the version comes
       # from the packageManager field of .railway/package.json.
       - name: Set up pnpm
         if: hashFiles('.railway/pnpm-lock.yaml') != ''
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: .railway/package.json
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
 

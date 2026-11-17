@@ -1,0 +1,13 @@
+# zizmor's configuration for this repository (`zizmor .github/`).
+#
+# Third-party actions are pinned by commit SHA, with the version in a
+# trailing comment, and Dependabot moves the pins. The fleet's own
+# workflows and actions are the exception: they are versioned by this
+# repository's release, which moves the major tag, and a caller pinned to
+# that major is how a release reaches the fleet. So they are pinned by ref.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "mini-app-polis/*": ref-pin
+        "*": hash-pin

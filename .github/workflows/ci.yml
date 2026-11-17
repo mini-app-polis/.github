@@ -19,6 +19,8 @@ permissions:
 jobs:
   security:
     uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
     with:
       language: python
       package-manager: pip
@@ -35,6 +37,8 @@ jobs:
   # also the audit of what every repo's release installs.
   test:
     uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
     with:
       language: typescript
       sbom: false
@@ -65,6 +69,8 @@ jobs:
   evaluate:
     needs: [test, security]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # evaluate.yml checks nothing out and asks for no permission.
+    permissions: {}
     uses: ./.github/workflows/evaluate.yml
     secrets:
       api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}

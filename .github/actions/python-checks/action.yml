@@ -78,7 +78,7 @@ runs:
 
     - name: Install uv
       if: inputs.print-only != 'true'
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
     - name: Set up Python
       if: inputs.print-only != 'true'
@@ -89,7 +89,7 @@ runs:
 
     - name: Set up Terraform
       if: inputs.print-only != 'true' && inputs.terraform-dir != ''
-      uses: hashicorp/setup-terraform@v4
+      uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
       with:
         terraform_version: ${{ inputs.terraform-version }}
         # Plain terraform output; the wrapper only matters for steps that

@@ -11,8 +11,8 @@
 # registered in ecosystem.yaml, so the conformance run checks the
 # workflow once rather than once per consumer.
 #
-# Action majors match the rest of the fleet: checkout@v6, setup-uv@v7,
-# setup-node@v6, setup-python@v6.
+# Third-party actions are pinned by commit SHA, with the version in a
+# trailing comment; Dependabot moves the pins (.github/dependabot.yml).
 #
 # Usage, in a consumer's .github/workflows/ci.yml:
 #
@@ -76,6 +76,14 @@ permissions:
 # hour unauthenticated, shared by every runner on an address); the endpoint
 # needs no permission.
 env:
+  # Package managers retry their own registry fetches with backoff; these
+  # raise each one's attempt count so a registry blip is ridden out rather
+  # than failing the stage.
+  UV_HTTP_RETRIES: "5"
+  PIP_RETRIES: "5"
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
   GHSA_AUDIT_PY: |
       """Check pinned dependencies against GitHub's reviewed advisory database.
 
@@ -309,8 +317,14 @@ jobs:
   secret-scan:
     name: secret scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: security-secret-scan-${{ inputs.language }}-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -319,7 +333,7 @@ jobs:
       # outage then fails only a run whose cache is empty.
       - name: Restore gitleaks
         id: gitleaks-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/fleet-tools/gitleaks
           key: gitleaks-${{ inputs.gitleaks-version }}-linux-x64
@@ -332,7 +346,7 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.cache/fleet-tools/gitleaks
           url="https://github.com/gitleaks/gitleaks/releases/download"
-          curl -sSfL "${url}/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+          curl -sSfL --retry 5 --retry-connrefused "${url}/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             | tar -xz -C ~/.cache/fleet-tools/gitleaks gitleaks
 
       - name: Put gitleaks on PATH
@@ -351,12 +365,18 @@ jobs:
     name: dependency audit (python)
     if: inputs.language == 'python'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: security-dependency-audit-${{ inputs.language }}-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
         if: inputs.language == 'python'
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           # The newest Python the fleet runs: pip resolves the exported lock
           # here, and a lock resolved for a newer requires-python can pin
@@ -365,7 +385,7 @@ jobs:
 
       - name: Set up uv
         if: inputs.language == 'python' && inputs.package-manager == 'uv'
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
       - name: Audit Python dependencies
         if: inputs.language == 'python'
@@ -536,13 +556,19 @@ jobs:
     name: dependency audit (node)
     if: inputs.language == 'typescript'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: security-dependency-audit-node-${{ inputs.language }}-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Cached per version, as gitleaks is above.
       - name: Restore osv-scanner
         id: osv-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/fleet-tools/osv-scanner
           key: osv-scanner-${{ inputs.osv-scanner-version }}-linux-amd64
@@ -557,7 +583,7 @@ jobs:
           dir="${HOME}/.cache/fleet-tools/osv-scanner"
           mkdir -p "${dir}"
           api="https://api.github.com/repos/google/osv-scanner/releases/tags/v${OSV_VERSION}"
-          url="$(curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" "${api}" \
+          url="$(curl -sSfL --retry 5 --retry-connrefused -H "Authorization: Bearer ${GH_TOKEN}" "${api}" \
                  | jq -r '.assets[].browser_download_url
                           | select(test("linux[_-]amd64([.]tar[.]gz)?$"))' \
                  | head -1)"
@@ -567,8 +593,8 @@ jobs:
           fi
           echo "Installing ${url}"
           case "${url}" in
-            *.tar.gz) curl -sSfL "${url}" | tar -xz -C "${dir}" osv-scanner ;;
-            *)        curl -sSfL "${url}" -o "${dir}/osv-scanner" ;;
+            *.tar.gz) curl -sSfL --retry 5 --retry-connrefused "${url}" | tar -xz -C "${dir}" osv-scanner ;;
+            *)        curl -sSfL --retry 5 --retry-connrefused "${url}" -o "${dir}/osv-scanner" ;;
           esac
           chmod +x "${dir}/osv-scanner"
 
@@ -608,7 +634,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ !cancelled() && steps.osv.outputs.lockfile != '' }}
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -689,12 +715,18 @@ jobs:
   static-analysis:
     name: static analysis
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: security-static-analysis-${{ inputs.language }}-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -710,14 +742,20 @@ jobs:
   sbom:
     name: sbom
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: security-sbom-${{ inputs.language }}-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
     if: inputs.sbom
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Cached per version, as gitleaks is above.
       - name: Restore syft
         id: syft-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/fleet-tools/syft
           key: syft-${{ inputs.syft-version }}-linux
@@ -729,7 +767,7 @@ jobs:
         run: |
           set -euo pipefail
           url="https://raw.githubusercontent.com/anchore/syft/main/install.sh"
-          curl -sSfL "${url}" | sh -s -- -b "${HOME}/.cache/fleet-tools/syft" "v${SYFT_VERSION}"
+          curl -sSfL --retry 5 --retry-connrefused "${url}" | sh -s -- -b "${HOME}/.cache/fleet-tools/syft" "v${SYFT_VERSION}"
 
       - name: Put syft on PATH
         run: |
@@ -740,7 +778,7 @@ jobs:
         run: syft dir:. -o cyclonedx-json=sbom.cyclonedx.json
 
       - name: Retain SBOM
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-${{ github.sha }}
           path: sbom.cyclonedx.json

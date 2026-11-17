@@ -69,6 +69,7 @@ permissions:
 jobs:
   promote:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     # Two quick pushes to dev must not race to open two pull requests.
@@ -90,14 +91,14 @@ jobs:
       # given) and to the two permissions the job uses.
       - name: Mint an App token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
           permission-contents: read
           permission-pull-requests: write
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Both branches' history, to count what dev has that main lacks.
           fetch-depth: 0

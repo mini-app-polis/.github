@@ -29,8 +29,6 @@
 # the exact failure shape the fleet's delivery assertions exist to catch,
 # and it would be careless to reintroduce it here.
 #
-# Action majors match the rest of the fleet.
-#
 # Usage, after a consumer's CI and before its release:
 #
 #   jobs:
@@ -79,12 +77,19 @@ on:
         description: "The ci-validator machine key, an organisation-level secret. It holds one scope, evaluations.runs.create, and cannot write a finding — a leaked CI key can cause work to happen, but cannot forge the result of that work."
         required: true
 
-permissions:
-  contents: read
+# Nothing here uses the run's token: no checkout, and the request carries
+# the api-key secret. Empty, so a caller can grant it nothing; a called
+# workflow can narrow its caller's permissions but never widen them.
+permissions: {}
 
 jobs:
   evaluate:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: evaluate-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    permissions: {}
     steps:
       # evaluator-cog's release redeploys the evaluator itself, and Railway
       # takes longer to swap a container than curl's retries cover. Asking

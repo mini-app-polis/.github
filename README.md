@@ -140,7 +140,8 @@ Every job declares `timeout-minutes`. Network calls (registry pulls,
 package publish, deploys, API calls) retry with backoff. `release` and
 `deploy` run in per-repository concurrency groups that never cancel a run
 in progress; only the stages before `build` cancel superseded runs, and
-only off `main`.
+only off `main`. `workflow-checks.yml` fails a change to this repository
+that adds a job without `timeout-minutes`.
 
 ### Profiles
 
@@ -459,6 +460,7 @@ jobs:
 |---|---|---|
 | `python-version` | `3.11` | Match the runtime the repo deploys to |
 | `pytest-args` | `--cov=src --cov-report=term-missing` | Appended to pytest |
+| `timeout-minutes` | `30` | How long the test job may run; raise it for a longer suite |
 
 ## Shared release
 

@@ -17,11 +17,20 @@
 # decision rather than a bump.
 version: 2
 updates:
+  # Every third-party action here is pinned by commit SHA with its version
+  # in a trailing comment. Dependabot moves the SHA and the comment
+  # together. Sunday, so the week's pin bumps are waiting before Monday's
+  # npm run rather than landing alongside it.
+  #
+  # `/` alone covers .github/workflows and nothing else, so the composite
+  # actions' directories are listed too, or their pins would never move.
   - package-ecosystem: "github-actions"
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "weekly"
-      day: "monday"
+      day: "sunday"
     open-pull-requests-limit: 5
     groups:
       actions:

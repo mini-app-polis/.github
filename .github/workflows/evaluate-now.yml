@@ -47,16 +47,25 @@ jobs:
   # this one — and quietly grade .github instead of failing.
   check-inputs:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
     steps:
       - name: A repo scope names a repository
         if: ${{ inputs.scope == 'repo' && inputs.repo == '' }}
         run: |
           echo "FATAL: scope is 'repo' but no repository was named." >&2
           exit 1
-      - run: echo "Requesting ${{ inputs.scope }}${{ inputs.repo && format(' {0}', inputs.repo) || '' }} (${{ inputs.mode }})"
+      # `repo` is free text, so it reaches the shell through env rather than
+      # being expanded into the script.
+      - env:
+          SCOPE: ${{ inputs.scope }}
+          REPO: ${{ inputs.repo }}
+          MODE: ${{ inputs.mode }}
+        run: echo "Requesting ${SCOPE}${REPO:+ ${REPO}} (${MODE})"
 
   evaluate:
     needs: check-inputs
+    permissions: {}
     uses: ./.github/workflows/evaluate.yml
     with:
       scope: ${{ inputs.scope }}

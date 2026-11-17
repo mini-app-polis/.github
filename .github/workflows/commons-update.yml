@@ -89,6 +89,14 @@ permissions:
   contents: read
 
 env:
+  # Package managers retry their own registry fetches with backoff; these
+  # raise each one's attempt count so a registry blip is ridden out rather
+  # than failing the stage.
+  UV_HTTP_RETRIES: "5"
+  PIP_RETRIES: "5"
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
   ORG: mini-app-polis
   # The libraries this may roll out. A dispatch naming anything else fails.
   PACKAGES: miniapppolis-common-utils miniapppolis-identity
@@ -100,6 +108,10 @@ env:
 jobs:
   discover:
     runs-on: ubuntu-latest
+    # This repository's checkout only. Everything in the fleet is read and
+    # written with the App's token, never this one.
+    permissions:
+      contents: read
     timeout-minutes: 25
     outputs:
       package: ${{ steps.resolve.outputs.package }}
@@ -108,7 +120,7 @@ jobs:
       repos: ${{ steps.list.outputs.repos }}
     steps:
       # This repository, for the script.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: fleet
 
@@ -163,14 +175,17 @@ jobs:
           fi
 
       # No `repositories` list: the token covers every repository the App
-      # is installed on, which is exactly the set it could update.
+      # is installed on, which is exactly the set it could update. It is only
+      # used to list that set, so it is held to `contents: read`; each
+      # write is made with a token minted later for one repository. That
+      # is why zizmor's github-app finding is ignored on the owner line.
       - name: Mint an App token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
-          owner: ${{ env.ORG }}
+          owner: ${{ env.ORG }} # zizmor: ignore[github-app]
           permission-contents: read
 
       - name: List repositories whose dev lock uses the package
@@ -204,6 +219,8 @@ jobs:
     needs: discover
     if: needs.discover.outputs.repos != '[]'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 20
     # Two quick releases of one package must not race on one branch. The
     # later run waits; the bump itself refuses to replace a newer version
@@ -222,13 +239,13 @@ jobs:
       BRANCH: commons-update/${{ needs.discover.outputs.package }}
     steps:
       # This repository, for the scripts.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: fleet
 
       - name: Mint an App token for ${{ matrix.repo }}
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
@@ -237,7 +254,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.ORG }}/${{ matrix.repo }}
           ref: dev
@@ -245,12 +262,12 @@ jobs:
           path: target
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           # The target's own `[tool.uv] required-version`, so the re-lock is
           # written by the uv its lock is pinned to. setup-uv looks in the

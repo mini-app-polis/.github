@@ -199,9 +199,23 @@ on:
 permissions:
   contents: read
 
+env:
+  # Package managers retry their own registry fetches with backoff; these
+  # raise each one's attempt count so a registry blip is ridden out rather
+  # than failing the stage.
+  UV_HTTP_RETRIES: "5"
+  PIP_RETRIES: "5"
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
+
 jobs:
   agent:
     runs-on: ubuntu-24.04
+    # The branch push and the draft pull request use the App's token; this
+    # run's own token only checks the repository out.
+    permissions:
+      contents: read
     # Below task-manager-cog's AGENT_RUN_TIMEOUT_MINUTES, so a run it fails
     # as overdue has stopped.
     timeout-minutes: 60
@@ -241,7 +255,7 @@ jobs:
           slug=$(printf '%s' "$TASK_ID" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
           echo "branch=agent/${slug:-task}-${RUN_ID:0:8}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.ref_name }}
           persist-credentials: false
@@ -280,19 +294,19 @@ jobs:
 
       - name: Install uv
         if: hashFiles('uv.lock') != '' || hashFiles('facts.yaml') != ''
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
       - name: Install the repository's dependencies
         if: hashFiles('uv.lock') != ''
         run: uv sync --all-extras --locked
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
       - name: Install pnpm
         if: hashFiles('pnpm-lock.yaml') != ''
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Install the repository's dependencies (pnpm)
         if: hashFiles('pnpm-lock.yaml') != ''
@@ -302,7 +316,7 @@ jobs:
         if: hashFiles('package-lock.json') != ''
         run: npm ci
 
-      - uses: hashicorp/setup-terraform@v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         if: hashFiles('.terraform.lock.hcl') != ''
         with:
           terraform_version: "1.16.2"
@@ -312,7 +326,7 @@ jobs:
         if: hashFiles('.terraform.lock.hcl') != ''
         run: terraform init -backend=false -input=false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: hashFiles('uv.lock') == '' && hashFiles('scripts/*.py') != ''
         with:
           python-version: "3.12"
@@ -646,7 +660,7 @@ jobs:
       - name: Mint the agent App's token
         id: app-token
         if: ${{ inputs.dry_run || steps.settle.outputs.push == 'true' }}
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.AGENT_APP_CLIENT_ID }}
           private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
