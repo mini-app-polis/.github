@@ -222,6 +222,16 @@ The pipeline changes through this repository's own pull requests, which
 run workflow static analysis and the pipeline against one fixture
 repository per profile. A failing fixture blocks the release.
 
+- **Protection.** `main` takes a change only by pull request, with this
+  repository's security checks passing: the `main` ruleset, declared in
+  infra. No review is required, since the organisation has one member who
+  cannot approve their own pull request. `CODEOWNERS` names the owner of
+  the workflow and action paths and `pipeline.yaml`. GitHub Actions bypasses
+  the rule to push the release commit and move the major tag.
+- **Releases.** This repository releases with semantic-release on every
+  merge to `main` that has a releasable commit, as every other repository
+  does (see Versioning below).
+
 - **Canary first.** A new major runs on the canary repository named in
   `pipeline.yaml` first. It moves to the rest of the fleet after the soak
   period in `pipeline.yaml` has passed with every stage exercised on `dev`

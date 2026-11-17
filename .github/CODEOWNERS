@@ -1,0 +1,6 @@
+# Who answers for a change to the paths every repository's pipeline runs
+# (README, "Changing the pipeline"). Review is not required: the
+# organisation has one member, who cannot approve their own pull request.
+/.github/workflows/ @kaianolevine
+/.github/actions/ @kaianolevine
+/pipeline.yaml @kaianolevine
