@@ -1,3 +1,10 @@
+## [3.31.1](https://github.com/mini-app-polis/.github/compare/v3.31.0...v3.31.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* **security:** except picomatch GHSA-fc5q-39xc-vjpf in the release tooling until a fix is published ([569aef5](https://github.com/mini-app-polis/.github/commit/569aef5e9557264fd8785aabc74acb45dbd5304c))
+
 # [3.31.0](https://github.com/mini-app-polis/.github/compare/v3.30.0...v3.31.0) (2026-11-15)
 
 
