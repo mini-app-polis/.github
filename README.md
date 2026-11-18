@@ -10,7 +10,7 @@ workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 | `lint`, `unit`, `integration`, `contract`, `security`, gated by `test` | `stages-test.yml` — the canonical pipeline's stages before `build`, for any profile (see Test stages) |
 | `build` | `stages-build.yml` — the commit's one artifact and its SBOM, for any profile (see Build stage) |
 | `release` | `release.yml` — semantic-release from the fleet's locked tooling |
-| `deploy` | `lambda-deploy.yml` — take the build's Lambda zip (or build and prove one) and upload it |
+| `deploy` | `stages-deploy.yml` — put the build's artifact on the profile's target, unless it already runs that version (see Deploy stage); `lambda-deploy.yml` is its Lambda path, and still callable on its own |
 | `evaluate` | `evaluate.yml` — ask for the repository to be evaluated |
 
 Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
@@ -134,7 +134,7 @@ produces no second release, deploy or evaluation.
 | `build` | the commit; the profile's build | `artifact-name`, `artifact-digest`; the artifact (wheel, Lambda zip, container image or site bundle) and its SBOM, kept with the run | an artifact for this commit already in the run is reused, not rebuilt: it is checked against its seal and reported with the same digest |
 | `evaluate-pre` | `repo`, `sha`, `phase: pre-release` | the evaluation id | the evaluator answers a repeated (repo, sha, phase) with the evaluation it already has |
 | `release` | the commit, or `ref` from the reconciler | `published` (true or false), `version`, `tag`, `sha` | a tag already on this commit, or a release commit pushed on top of it, is this commit's release: the stage does not run semantic-release, finishes what is missing (the tag, the GitHub release, the major tag) and reports `published`, so the package publish and the fleet notice that run on it finish too, rather than cutting another. It cuts a release on `main` only |
-| `deploy` | `artifact-digest`, `environment`, `version` | `deployed-version` | it reads what the target runs first and skips when that is already this version |
+| `deploy` | `artifact-name`, `artifact-digest`, `environment` (`development` or `production`), `version` | `deployed-version`, `deployed` | it reads what the target runs first and skips when that is already this version; a failed deploy re-runs on its own and takes the same artifact by digest |
 | `verify` | `environment`, `version`, the profile's check | `verified` | it only reads the running service |
 | `evaluate-post` | `repo`, `version`, `sha`, `phase: post-release` | the evaluation id | the evaluator answers a repeated (repo, version, phase) with the evaluation it already has |
 
@@ -401,6 +401,141 @@ artifact for semantic-release, so a repository's publish step can ship it.
 building one, and refuses it unless `target.json` names the handler,
 architecture, Python and trigger the deploy is for.
 
+### Deploy stage
+
+`stages-deploy.yml` is the `deploy` stage: it takes the build's artifact by
+digest and puts it on the profile's target. Once a repository is on the
+pipeline its platform's branch auto-deploy is off (see Moving a
+repository's deploys onto the pipeline, below), and this stage is the only
+thing that changes what runs.
+
+| Profile | Target | How |
+|---|---|---|
+| `python-service` with `lambda-handler` | AWS Lambda | `lambda-deploy.yml` with the artifact's `lambda/worker.zip` (see Shared Lambda deploy) |
+| `api-service` | Railway | the artifact's image pushed to GHCR, and a new deployment of the Railway service that pulls it |
+| `astro-site` | Cloudflare Pages | `wrangler pages deploy` of the site bundle |
+| `python-library`, `npm-library` | none: skipped and says why | `release` publishes them |
+| `terraform-infra` | none yet: skipped and says why | its deploy is the apply of the reviewed plan, which needs the state backend and credentials; the repository's own Terraform workflow applies until the plan is a pipeline artifact |
+| `shared-workflows` | none: skipped and says why | the release moves the major tag |
+| `python-service` without `lambda-handler` | none yet: skipped and says why | a Railway worker would deploy an image, and this profile's artifact holds none |
+
+**Environments.** `development` deploys from `dev` and takes any version,
+usually the build's (`1.4.0+g0123456789ab`). `production` deploys from
+`main`, takes only a release's `X.Y.Z`, and runs in the GitHub Environment
+named `production`, so that environment's protection rules and secrets
+apply. `pipeline.yml` runs it on `main` only when `release` reports
+`published`. The stage refuses any other pairing (production from `dev`, a
+build version in production, development from a pull request) before it
+fetches anything.
+
+**Skip when already deployed.** Before deploying, the stage reads what the
+target runs and skips when that is already this version, with the reason in
+the job summary and as a notice. The decision is `deploy-decision.sh`, in
+the `deploy-decision` action, which `scripts/test-deploy-decision.sh` proves
+case by case: the same version is skipped (even from another build of it,
+which it says), a target that records no version is compared by the
+artifact's identity, and anything else deploys. What each target reports:
+
+| Target | What it runs | Read from |
+|---|---|---|
+| Lambda | the zip, by its CodeSha256 | `aws lambda get-function`. The deploy role can read it but cannot tag the function, so the function records no version |
+| Railway | the image, by its config digest | the GHCR tag `<environment>-deployed`, which the stage moves only after Railway reports the new deployment healthy |
+| Cloudflare Pages | the version and the artifact's digest | the deployment's commit message, `pipeline-deploy version=<version> artifact=<digest>`: the production deployment the project serves, or the newest successful deployment of the development branch |
+
+**Re-run on its own.** A failed deploy job is re-run with "Re-run failed
+jobs": it fetches the same artifact from the run by digest and rebuilds
+nothing, and because it reads the target first, a deploy that landed before
+the failure is not done twice.
+
+**Railway.** A Railway service on the pipeline runs an image, not a branch:
+its `.railway/railway.ts` declares the source as
+`image("ghcr.io/<owner>/<repo>:<environment>")`. The stage pushes the
+artifact's image to GHCR under its version (`1.4.0`, or `1.4.0_g0123456789ab`
+in development, since a tag cannot hold `+`) and checks the pushed config
+digest is the artifact's; moves the `<environment>` tag to it; asks Railway's
+public API, with the environment's project token, for a new deployment of
+the service; waits until Railway reports it `SUCCESS`; and only then moves
+`<environment>-deployed`, the record the next run reads. Why this path:
+
+- `railway up` uploads source for Railway to build, so what ran would not
+  be what was built and tested.
+- Pointing the service at a new image reference on each deploy would fight
+  the IaC: `railway-apply.yml` puts back the source `railway.ts` names on
+  its next apply. With one fixed tag per environment, the IaC says where
+  the service's image comes from and the pipeline says what that image is.
+
+**Cloudflare Pages.** The stage uploads the site bundle with the wrangler
+locked in `.github/actions/wrangler` (an exact version and its
+`package-lock.json`, moved by Dependabot), as the project's production
+branch (`main`) in production and as `dev` in development. A `dev` upload
+serves at `dev.<project>.pages.dev`, where infra points the sites' `dev.`
+domains. The upload carries the commit and the message above.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `profile` | required | The repository's profile |
+| `environment` | required | `development` or `production` |
+| `version` | required | `release`'s `version` in production; `build`'s `version` in development |
+| `artifact-name`, `artifact-digest` | empty | The build stage's outputs. Needed by every profile that deploys |
+| `target` | `live` | `fake` is the self-test's stand-in: it records in the run and deploys nowhere. Consumers leave it |
+| `timeout-minutes` | `30` | How long the deploy job may run |
+| `lambda-handler`, `lambda-architecture`, `lambda-trigger`, `python-version`, `lambda-strip` | as `stages-build.yml` | `python-service`: what the zip was built for; `lambda-deploy.yml` refuses an artifact built for anything else |
+| `aws-role-arn`, `aws-region`, `lambda-function-name` | empty | `python-service`: the function for this environment, from the cog's `terraform output` |
+| `railway-service` | empty | `api-service`: the service's name in the project the token is scoped to |
+| `image-repository` | `ghcr.io/<owner>/<repo>` | `api-service`: where the image is pushed and the service pulls from; on `ghcr.io` |
+| `railway-deploy-minutes` | `15` | `api-service`: how long to wait for Railway to report the deployment healthy |
+| `pages-project`, `cloudflare-account-id` | empty | `astro-site`: the Pages project and its account |
+| `pages-production-branch`, `pages-development-branch` | `main`, `dev` | `astro-site`: the branch each environment uploads as |
+| `node-version` | `22` | `astro-site`: the Node wrangler runs on |
+
+| Secret | Meaning |
+|---|---|
+| `railway-token` | `api-service`: a Railway project token scoped to this environment (`RAILWAY_TOKEN` for production, `RAILWAY_TOKEN_DEVELOPMENT` for development), never an account or workspace token |
+| `cloudflare-api-token` | `astro-site`: a token with Cloudflare Pages: Edit on the account |
+
+| Output | Meaning |
+|---|---|
+| `deployed-version` | The version the target runs after the stage, deployed now or already there; empty when the profile deploys nothing |
+| `deployed` | `true` when this run changed the target |
+
+The calling job grants `contents: read`, `id-token: write` (the Lambda
+deploy's OIDC role) and `packages: write` (the GHCR push) whatever its
+profile: GitHub checks a reusable workflow's permissions before any job's
+`if`. In `pipeline.yml`:
+
+```yaml
+  deploy:
+    needs: [build, release]
+    if: >-
+      always() && needs.build.result == 'success' &&
+      ((github.ref == 'refs/heads/dev' && github.event_name == 'push') ||
+       (github.ref == 'refs/heads/main' && needs.release.outputs.published == 'true'))
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: $/.github/workflows/stages-deploy.yml
+    with:
+      profile: ${{ inputs.profile }}
+      environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'development' }}
+      version: ${{ github.ref == 'refs/heads/main' && needs.release.outputs.version || needs.build.outputs.version }}
+      artifact-name: ${{ needs.build.outputs.artifact-name }}
+      artifact-digest: ${{ needs.build.outputs.artifact-digest }}
+      # and the repository's target inputs
+    secrets:
+      railway-token: ${{ github.ref == 'refs/heads/main' && secrets.RAILWAY_TOKEN || secrets.RAILWAY_TOKEN_DEVELOPMENT }}
+      cloudflare-api-token: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+```
+
+**What a running service reports.** On `main` the artifact is built from
+the commit `release` versions, before the release commit that writes the
+new version into the version files, so a service built from it reports the
+version that commit declared, not the release. That is why the skip check
+reads the target's own record of the artifact (its image, its zip, its
+upload) rather than the service's version endpoint, and why `verify`, which
+is to check that the service reports the released version, needs the build
+to carry that version first.
+
 ### Enforced and subscribed
 
 Two layers keep the pipeline whole.
@@ -470,6 +605,51 @@ reaches them before it is released.
 - **Rollback.** Re-point the major tag at the previous release of that
   major. Callers pick it up on their next run with no change of their own.
 
+#### Moving a repository's deploys onto the pipeline
+
+Until a repository is on the pipeline, its platform deploys it from a
+branch as today. Every switch below defaults to that, so nothing changes
+until a repository opts in, and a repository's auto-deploy goes off in the
+same change that moves its deploys onto the pipeline: the canary in
+`pipeline.yaml` first, then the rest after its soak. For one repository:
+
+1. **Environment and secrets.** In the repository, a `production`
+   environment, with `main` as its only deployment branch and any
+   protection rules wanted, and the target's secrets: `RAILWAY_TOKEN` and
+   `RAILWAY_TOKEN_DEVELOPMENT` for a Railway service,
+   `CLOUDFLARE_PAGES_API_TOKEN` for a Pages site, and for a Lambda the
+   deploy role it already has.
+2. **The caller.** Its `ci.yml` calls the pipeline with its profile and its
+   target inputs (`railway-service`; `pages-project` and
+   `cloudflare-account-id`; or the Lambda's), and drops its own deploy jobs.
+   `pipeline.yaml` lists it in `on_pipeline` in the same change.
+3. **Branch auto-deploy off, in IaC.**
+   - *Railway*: in `.railway/railway.ts`, the service's source moves from
+     `github("<org>/<repo>", { branch: "main", checkSuites: false })` to
+     `image("ghcr.io/<org>/<repo>:production", { autoUpdates: { type: "disabled" } })`,
+     and its `build` settings go (Railway no longer builds it). A service
+     with no `github()` source has no branch to deploy from, and
+     `autoUpdates` off means Railway never moves it to a newer tag on its
+     own. Development, which `railway.ts` does not manage yet (Railway
+     refuses a development-scoped plan), moves to
+     `image("ghcr.io/<org>/<repo>:development")` the same way once it can;
+     until then the development service is changed once on its dashboard,
+     recorded in the pull request. Railway must be able to pull the GHCR
+     package: public, or with registry credentials on the service.
+   - *Cloudflare Pages*: in mini-app-polis/infra, set the project's
+     `git_deployments = false` (see that repository's README, "Turning a
+     Pages project's Git builds off"). Its Git connection, domains and
+     variables stay; only the builds on push stop.
+   - *Lambda*: nothing to turn off. The cogs already deploy from CI, not
+     from a branch.
+4. **Order.** Merge the IaC changes before the caller change reaches
+   `main`. If the caller lands first, a release is deployed twice, by the
+   platform and by the pipeline: harmless, but not one deploy. After that a
+   push to `dev` deploys development from the pipeline, and the next
+   release deploys production behind `production`.
+5. **Back out.** Revert the caller and the IaC changes; the platform deploys
+   from the branch again.
+
 ### Testing the pipeline
 
 `ci.yml`'s `test` job calls `self-test.yml`, on every pull request and every
@@ -498,7 +678,10 @@ reports holds a pull request open for good.
   and takes the artifact by digest with `fetch-artifact`
   (`self-test-build.yml`), and `artifact-digest check` runs
   `scripts/test-artifact-digest.sh`, which plants a digest mismatch and
-  every other way an artifact can be wrong. The `fixture` job runs the release stage twice on one commit,
+  every other way an artifact can be wrong. The same `build` job then runs
+  `stages-deploy.yml` against the fixture's stand-in target, to development
+  and to production, twice each, and `deploy decision check` runs
+  `scripts/test-deploy-decision.sh`. The `fixture` job runs the release stage twice on one commit,
   re-runs it after each way it can stop partway, and, for the Python fixtures, the local `python-checks` action with
   every check in one job as `python-test.yml` runs it (not
   `python-test.yml` itself, which runs the published action and so would
@@ -516,9 +699,12 @@ reports holds a pull request open for good.
   calls the development API, skips against every one, and a fixture needs
   no secret and reaches no network beyond package and container registries.
   The build stage uploads only to the run, and the `api-service` image is
-  saved to a tarball, never pushed. Deploy and
-  evaluation stages do not run against a fixture until they can do so with
-  no effect outside the run.
+  saved to a tarball, never pushed. The deploy stage runs with
+  `target: fake`: it takes the artifact by digest and makes every decision a
+  live deploy makes, but its target is a record kept in the run as an
+  artifact, so it reads and changes nothing outside the run and needs no
+  secret. Evaluation stages do not run against a fixture until they can do
+  so with no effect outside the run.
 - **One gate.** The `gate` job in `self-test.yml` passes only if every
   other job there passed. It is the check `main` requires, and its name
   does not change as fixtures or stages are added.
@@ -561,7 +747,9 @@ the fixtures in the same job:
   proves it for every fixture.
 - `deploy` reads what the target runs first; against a fixture its target
   is a stand-in that only records, and the second run must skip with the
-  version already there.
+  version already there. The `build` job in `self-test.yml` proves it for
+  every fixture and both environments; a profile with nothing to deploy
+  must report nothing deployed.
 - `verify` only reads, so it needs no more than to pass twice.
 - `evaluate-pre` and `evaluate-post` run dry against a fixture, and the
   second request for the same (repo, sha, phase), or (repo, version,
@@ -589,7 +777,8 @@ For that, `pipeline.yml` needs a `working-directory` input that every stage
 honours, as `stages-test.yml` does now (with the `postgres-image` the
 `stages` job passes `api-service` today becoming that profile's default), and every stage that
 reaches outside the run (release, deploy, evaluate) needs a mode the
-fixtures run it in that has no effect outside the run. A stage the profile
+fixtures run it in that has no effect outside the run (deploy has one,
+`target: fake`). A stage the profile
 has no use for is skipped with its reason, as the stages before `build`
 already are, which replaces the `pending` job. `gate` keeps its name and needs the new job.
 A new profile adds a directory under `fixtures/` and an entry in the
@@ -1007,6 +1196,11 @@ sweep) `needs: deploy`.
 | `python-version` | `3.11` | As `runtime` in `infra/worker.tf` |
 | `strip` | *(none)* | Top-level paths to drop from the zip because the cog never imports them. boto3 is always dropped |
 | `role-arn`, `region`, `function-name` | *(required)* | From the cog's `terraform output` |
+| `version` | empty | The version being deployed, for the summary and the deploy decision |
+| `environment` | empty | The GitHub Environment the job runs in; the deploy stage passes `production` for a production deploy |
+| `skip-if-deployed` | `false` | Read the function's CodeSha256 first and skip when it is already this zip. The deploy stage sets it |
+
+Its outputs are `deployed-version` and `deployed`, as the deploy stage's.
 
 ### Three guards, because one was not enough
 
@@ -1096,6 +1290,16 @@ where a mistake in the file should show up first.
 | `allow-destroy` | apply | `label` | `label`: destructive changes need the `allow-destroy` label. `always`: they always apply |
 | `blocked-window` | apply | *(none)* | `<DD> <HH>-<HH>` UTC, hours inclusive, in which the apply refuses to run. db-ops passes `"02 09-10"`, its drill window |
 | `blocked-window-reason` | apply | *(generic)* | Printed when the apply refuses |
+
+**Branch deploys are a setting in `railway.ts`.** A service whose source is
+`github("<org>/<repo>", { branch: "main", checkSuites: false })` is
+deployed by Railway on every push to that branch, which is how the fleet
+deploys today. A service on the canonical pipeline declares
+`image("ghcr.io/<org>/<repo>:<environment>", { autoUpdates: { type: "disabled" } })`
+instead: Railway then deploys only when the pipeline's deploy stage asks,
+and only the image the stage put under that tag (see Deploy stage, and
+Moving a repository's deploys onto the pipeline). The change is planned and
+applied like any other.
 
 Pinned here, so a bump is one change for the fleet: Railway CLI 5.68.0.
 Both install the IaC SDK from `.railway/package.json`
