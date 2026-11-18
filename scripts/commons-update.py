@@ -368,7 +368,16 @@ def cmd_bump(args: argparse.Namespace) -> int:
             pin = f"{package}=={version}"
             unserved = False
             for attempt in range(1, args.attempts + 1):
-                proc = uv(["lock", "--upgrade-package", pin], repo)
+                # --refresh-package: setup-uv restores a uv cache that can
+                # hold PyPI's index page for the package from before this
+                # release, and uv trusts that page for its cache lifetime. A
+                # stale page reads as the pin conflicting with the declared
+                # range when the dependency has extras, which looks like a
+                # real block and is not retried.
+                proc = uv(
+                    ["lock", "--upgrade-package", pin, "--refresh-package", package],
+                    repo,
+                )
                 if proc.returncode == 0:
                     break
                 # uv wraps its messages to the terminal width.
