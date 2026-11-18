@@ -5,7 +5,9 @@
   "description": "Pipeline fixture for the npm-library profile. private: npm refuses to publish it.",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit --noUnusedLocals --noUnusedParameters --noFallthroughCasesInSwitch",
+    "test": "node --test \"test/*.test.mjs\""
   },
   "devDependencies": {
     "typescript": "7.0.2"

@@ -1,0 +1,44 @@
+# Installs the uv release the pipeline pins (`uv_version` in pipeline.yaml),
+# and optionally a Python with it. The stages use it wherever they need uv
+# outside python-checks, which reads the same pin through the same script.
+#
+# A repository's own `[tool.uv] required-version` is a range; the pin is one
+# release inside it. A repository whose range leaves the pin fails at its
+# first uv command, which is the signal to move one or the other.
+#
+# Usage, as a step:
+#
+#   - uses: $/.github/actions/setup-uv
+#     with:
+#       python-version: "3.14"
+
+name: setup-uv
+description: Install the fleet's pinned uv, and optionally a Python.
+
+inputs:
+  python-version:
+    description: "A Python for uv to install. Empty installs none."
+    default: ""
+
+outputs:
+  version:
+    description: "The uv release installed."
+    value: ${{ steps.pin.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: pin
+      shell: bash
+      run: echo "version=$("$GITHUB_ACTION_PATH/uv-version.sh")" >> "$GITHUB_OUTPUT"
+
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        version: ${{ steps.pin.outputs.version }}
+
+    - name: Set up Python
+      if: inputs.python-version != ''
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: uv python install "$PYTHON_VERSION"

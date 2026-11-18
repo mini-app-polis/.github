@@ -17,3 +17,12 @@ paths:
       # action from that same tag. actionlint does not know the form and
       # reads it as an action reference with no ref.
       - 'specifying action "\$/\.github/actions/semantic-release" in invalid format because ref is missing'
+  .github/workflows/stages-test.yml:
+    ignore:
+      # The same `$/` form as release.yml, for the stages' actions and for
+      # the security workflow they call, so a caller pinned to a tag runs
+      # every part of the stages from that tag. actionlint reads the action
+      # form as a reference with no ref, and the workflow form as neither a
+      # remote nor a local workflow.
+      - 'specifying action "\$/\.github/actions/(python-checks|setup-uv)" in invalid format because ref is missing'
+      - 'reusable workflow call "\$/\.github/workflows/security\.yml" at "uses" is not following the format'
