@@ -47,6 +47,9 @@ inputs:
   print-only:
     description: "\"true\": run nothing; write the commands to the `commands` file."
     default: "false"
+  working-directory:
+    description: "The directory, within the checkout, holding the repository to check. For this repository's own fixtures; callers leave it."
+    default: "."
 
 outputs:
   log:
@@ -74,6 +77,7 @@ runs:
         TYPECHECK: ${{ inputs.typecheck }}
         TF_DIR: ${{ inputs.terraform-dir }}
         COMMANDS: ${{ steps.paths.outputs.commands }}
+      working-directory: ${{ inputs.working-directory }}
       run: '"$GITHUB_ACTION_PATH/checks.sh" --print > "$COMMANDS"'
 
     - name: Install uv
@@ -105,4 +109,5 @@ runs:
         TYPECHECK: ${{ inputs.typecheck }}
         TF_DIR: ${{ inputs.terraform-dir }}
         LOG: ${{ steps.paths.outputs.log }}
+      working-directory: ${{ inputs.working-directory }}
       run: '"$GITHUB_ACTION_PATH/checks.sh"'

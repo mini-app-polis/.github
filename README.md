@@ -221,11 +221,12 @@ before `build`, reuses the tag in `release`, and continues from there.
 
 The pipeline changes through this repository's own pull requests, which
 run workflow static analysis and the pipeline against one fixture
-repository per profile. A failing fixture blocks the release.
+repository per profile (see Testing the pipeline below). A failing fixture
+blocks the release.
 
 - **Protection.** `main` takes a change only by pull request, with this
-  repository's security checks passing: the `main` ruleset, declared in
-  infra. No review is required, since the organisation has one member who
+  repository's security checks and the self-test's `test / gate` passing:
+  the `main` ruleset, declared in infra. No review is required, since the organisation has one member who
   cannot approve their own pull request. `CODEOWNERS` names the owner of
   the workflow and action paths and `pipeline.yaml`. The release pushes
   its version commit and moves the major tag as the promote App, the
@@ -247,6 +248,103 @@ repository per profile. A failing fixture blocks the release.
   moved.
 - **Rollback.** Re-point the major tag at the previous release of that
   major. Callers pick it up on their next run with no change of their own.
+
+### Testing the pipeline
+
+`ci.yml`'s `test` job calls `self-test.yml`, on every pull request and every
+push to `main`. `release` needs `test`, so anything that fails there blocks
+the release. Nothing in it is path-filtered: a required check that never
+reports holds a pull request open for good.
+
+- **Static analysis.** `workflow-checks.yml` runs actionlint (with a pinned
+  shellcheck), zizmor and `scripts/check-workflow-timeouts.py` over
+  `.github`. Each tool is pinned to one release and checked against its
+  SHA-256 before it runs. zizmor runs offline and fails on any
+  high-severity finding; the medium and low findings already present are
+  printed and do not fail. actionlint fails on any error. The two places it
+  misreads, and why, are in `.github/actionlint.yaml`; shellcheck's style
+  notes are left out.
+- **Fixtures.** `fixtures/<profile>/` holds one minimal repository per
+  profile in the Profiles table, with only what that profile's existing
+  stages need to run green. Each runs the security stage
+  (`security.yml`), the test stage where one exists for its tooling (the
+  local `python-checks` action, not `python-test.yml`, which runs the
+  published action and so would test what is already released), and the
+  release stage twice on one commit. The `shared-workflows` fixture also
+  runs the static analysis above on its own workflows. Every stage of a
+  profile that no job runs yet is named in the run, with its reason, by
+  the `not run yet` job, so a gap shows rather than passing in silence.
+- **No side effects.** A fixture never publishes a package, tags a fleet
+  repository, deploys or posts an evaluation. The release stage runs only
+  as a dry run, in a scratch repository whose one remote is a bare
+  repository beside it, with a `.releaserc.json` that lists no publishing
+  plugin. Python fixtures carry the `Private :: Do Not Upload` classifier
+  and Node fixtures are `private`, so a registry refuses them even if
+  something tried. Deploy and evaluation stages do not run against a
+  fixture until they can do so with no effect outside the run.
+- **One gate.** The `gate` job in `self-test.yml` passes only if every
+  other job there passed. It is the check `main` requires, and its name
+  does not change as fixtures or stages are added.
+
+`security.yml`, `workflow-checks.yml` and the `python-checks` action take a
+`working-directory` input for this: the directory, inside the checkout,
+holding the repository to check. Consumers leave it at its default, the
+checkout itself.
+
+#### Running a stage twice
+
+Every stage contract above says why a second run on the same commit
+changes nothing. Today the fixtures prove it for `release`:
+`scripts/check-release-rerun.sh` runs the release on a fixture's
+unreleased commit and sees the version it would cut, records that release
+as a tag, runs the release again on the same commit, and fails unless the
+second run finds nothing to release and the remote still holds one tag.
+The first run is what keeps the second from passing vacuously. The stages
+before `build` change nothing outside the run, so running them twice is
+safe by construction.
+
+As each later stage lands it adds its own proof here, run twice against
+the fixtures in the same job:
+
+- `build` reuses the artifact already in the run for this commit, and the
+  second run reports the same digest.
+- `deploy` reads what the target runs first; against a fixture its target
+  is a stand-in that only records, and the second run must skip with the
+  version already there.
+- `verify` only reads, so it needs no more than to pass twice.
+- `evaluate-pre` and `evaluate-post` run dry against a fixture, and the
+  second request for the same (repo, sha, phase), or (repo, version,
+  phase), must be answered with the evaluation already recorded.
+- `release` from the reconciler, with `ref` set to a tag already on the
+  commit, finishes what is missing and cuts nothing.
+
+#### Pointing it at pipeline.yml
+
+Once `pipeline.yml` exists, the `fixture-security`, `fixture` and `pending`
+jobs in `self-test.yml` become one matrix job over the profiles that calls
+it:
+
+```yaml
+  fixture:
+    name: fixture (${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [python-service, api-service, python-library, astro-site, npm-library, terraform-infra, shared-workflows]
+    uses: ./.github/workflows/pipeline.yml
+    with:
+      profile: ${{ matrix.profile }}
+      working-directory: fixtures/${{ matrix.profile }}
+```
+
+For that, `pipeline.yml` needs a `working-directory` input that every stage
+honours, as `security.yml` and `python-checks` do now, and every stage that
+reaches outside the run (release, deploy, evaluate) needs a mode the
+fixtures run it in that has no effect outside the run. A stage the profile
+has no use for is skipped with its reason, as the stage graph says, which
+replaces the `pending` job. `gate` keeps its name and needs the new job.
+A new profile adds a directory under `fixtures/` and an entry in the
+matrix.
 
 ## Shared security workflow
 
@@ -286,6 +384,7 @@ the second is the directory inside it.
 | `gitleaks-version` | `8.28.0` | Pinned gitleaks release |
 | `syft-version` | `1.29.1` | Pinned syft release |
 | `self-test` | `false` | Also prove the GitHub advisory pass against known advisories. This repo's own CI turns it on; consumers leave it off |
+| `working-directory` | `.` | The directory, within the checkout, holding the repository to check. For this repo's fixtures; consumers leave it. The secret scan reads the whole checkout's history whatever it says |
 
 ### Advisory sources
 

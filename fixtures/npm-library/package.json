@@ -1,0 +1,13 @@
+{
+  "name": "fixture-npm-library",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pipeline fixture for the npm-library profile. private: npm refuses to publish it.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}

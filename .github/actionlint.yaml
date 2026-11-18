@@ -1,0 +1,19 @@
+# actionlint's configuration for this repository.
+#
+# Each ignore below is one known false positive, matched to one file and to
+# the exact message, so a real finding of the same kind elsewhere still fails.
+paths:
+  .github/workflows/evaluate.yml:
+    ignore:
+      # github.job_workflow_sha is a real context property (the commit of the
+      # reusable workflow a job is running), and evaluate.yml reads it on
+      # purpose; actionlint's list of github context properties does not
+      # have it yet.
+      - 'property "job_workflow_sha" is not defined in object type'
+  .github/workflows/release.yml:
+    ignore:
+      # `uses: $/...` resolves to this repository at the commit of the
+      # workflow that is running, so a caller pinned to a tag gets the
+      # action from that same tag. actionlint does not know the form and
+      # reads it as an action reference with no ref.
+      - 'specifying action "\$/\.github/actions/semantic-release" in invalid format because ref is missing'
