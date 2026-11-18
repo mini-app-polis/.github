@@ -22,6 +22,22 @@
 # Run by hand from the Actions tab, it is a dry run of this repository's
 # own next release, and nothing else: it changes nothing.
 #
+# It releases on main only, one run at a time per repository (the
+# concurrency group below never cancels a release in progress). A commit
+# that already has a release is not released again: the action finishes what
+# that release is missing (its tag, its GitHub release, the major tag) and
+# reports it, so re-running a release that failed partway completes it. The
+# job's outputs say what happened:
+#
+#   published  "true" when the commit has a release after this run, cut now
+#              or before; a caller's publish and notice jobs run on it
+#   version    X.Y.Z
+#   tag        vX.Y.Z (empty when nothing was released, as before)
+#   sha        the commit the tag is on
+#
+# The release reconciler passes `ref`, a release tag on main, to finish that
+# release in a new run; it is checked out and never cut again.
+#
 # In the same run as the build stage (stages-build.yml), a caller passes the
 # build's `artifact-name` and `artifact-digest`. The release then downloads
 # that artifact, refuses it unless the digest matches, and points
@@ -63,6 +79,10 @@ on:
         description: "The build stage's artifact-digest output (sha256:<hex>). The artifact is refused unless it matches."
         type: string
         default: ""
+      ref:
+        description: "A vX.Y.Z tag on main to finish rather than the run's commit: the release reconciler's `ref`. Empty: the run's commit."
+        type: string
+        default: ""
     secrets:
       app-client-id:
         description: "A GitHub App's client ID. With app-private-key, the release checks out and pushes as that App: for a repository whose main ruleset lets only the App past its pull-request rule."
@@ -71,9 +91,18 @@ on:
         description: The private key of the App named by app-client-id.
         required: false
     outputs:
+      published:
+        description: "\"true\" when the commit has a release after this run, cut by it or cut before and finished by it; \"false\" otherwise and on a dry run."
+        value: ${{ jobs.release.outputs.published }}
+      version:
+        description: The release's version, X.Y.Z, or empty.
+        value: ${{ jobs.release.outputs.version }}
       tag:
-        description: The v* tag this run released, or empty when it released nothing.
+        description: The release's vX.Y.Z tag, or empty when the commit has none.
         value: ${{ jobs.release.outputs.tag }}
+      sha:
+        description: The commit the release tag is on, or empty.
+        value: ${{ jobs.release.outputs.sha }}
   workflow_dispatch:
 
 permissions:
@@ -102,7 +131,10 @@ jobs:
       issues: write
       pull-requests: write
     outputs:
+      published: ${{ steps.release.outputs.published }}
+      version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
     env:
       # Read in a step's `if`, which cannot read secrets directly.
       APP_CLIENT_ID: ${{ secrets.app-client-id }}
@@ -128,6 +160,9 @@ jobs:
           # version.
           fetch-depth: 0
           token: ${{ steps.app.outputs.token || github.token }}
+          # The reconciler's release tag, when it names one; otherwise the
+          # run's commit.
+          ref: ${{ inputs.ref }}
 
       # Both or neither: a name with no digest would take an artifact
       # nothing vouches for.
@@ -167,3 +202,4 @@ jobs:
           node-version: ${{ inputs.node-version || '22' }}
           git-author-name: ${{ inputs.git-author-name }}
           git-author-email: ${{ inputs.git-author-email }}
+          ref: ${{ inputs.ref }}

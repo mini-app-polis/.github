@@ -133,7 +133,7 @@ produces no second release, deploy or evaluation.
 | `security` | the commit; the profile's language and package manager | findings in the job summary | it changes nothing outside the run |
 | `build` | the commit; the profile's build | `artifact-name`, `artifact-digest`; the artifact (wheel, Lambda zip, container image or site bundle) and its SBOM, kept with the run | an artifact for this commit already in the run is reused, not rebuilt: it is checked against its seal and reported with the same digest |
 | `evaluate-pre` | `repo`, `sha`, `phase: pre-release` | the evaluation id | the evaluator answers a repeated (repo, sha, phase) with the evaluation it already has |
-| `release` | the commit, or `ref` from the reconciler | `published` (true or false), `version`, `tag`, `sha` | a tag already on this commit is this commit's release: the stage finishes what is missing (the GitHub release, the package publish, the fleet notice) and reports it, rather than cutting another |
+| `release` | the commit, or `ref` from the reconciler | `published` (true or false), `version`, `tag`, `sha` | a tag already on this commit, or a release commit pushed on top of it, is this commit's release: the stage does not run semantic-release, finishes what is missing (the tag, the GitHub release, the major tag) and reports `published`, so the package publish and the fleet notice that run on it finish too, rather than cutting another. It cuts a release on `main` only |
 | `deploy` | `artifact-digest`, `environment`, `version` | `deployed-version` | it reads what the target runs first and skips when that is already this version |
 | `verify` | `environment`, `version`, the profile's check | `verified` | it only reads the running service |
 | `evaluate-post` | `repo`, `version`, `sha`, `phase: post-release` | the evaluation id | the evaluator answers a repeated (repo, version, phase) with the evaluation it already has |
@@ -499,7 +499,7 @@ reports holds a pull request open for good.
   (`self-test-build.yml`), and `artifact-digest check` runs
   `scripts/test-artifact-digest.sh`, which plants a digest mismatch and
   every other way an artifact can be wrong. The `fixture` job runs the release stage twice on one commit,
-  and, for the Python fixtures, the local `python-checks` action with
+  re-runs it after each way it can stop partway, and, for the Python fixtures, the local `python-checks` action with
   every check in one job as `python-test.yml` runs it (not
   `python-test.yml` itself, which runs the published action and so would
   test what is already released). The `shared-workflows` fixture also
@@ -536,7 +536,18 @@ changes nothing. Today the fixtures prove it for `release`:
 unreleased commit and sees the version it would cut, records that release
 as a tag, runs the release again on the same commit, and fails unless the
 second run finds nothing to release and the remote still holds one tag.
-The first run is what keeps the second from passing vacuously. `lint`,
+The first run is what keeps the second from passing vacuously; alongside
+each run, the action's `release-state.sh` must say `release` on the
+unreleased commit and `finish` with that tag on the released one.
+`scripts/check-release-resume.sh` proves the re-run of a release that
+stopped partway, in the same kind of scratch repository: a release commit
+pushed with no tag (and a later release refusing until it is tagged), a tag
+with no GitHub release, a major tag never moved, an older release finished
+without dragging the major tag back, and the reconciler's `ref`, from any
+branch, as a release tag on `main` only. Each re-run must leave exactly one
+tag and one release commit per version, and a second re-run must change
+nothing. The GitHub release is made through the API, which cannot run
+there, so the proof stops at `release-state.sh` asking for it. `lint`,
 `unit` and `integration` change nothing outside the run, so running them
 twice is safe by construction. `contract` writes only fixed rows that the
 development API upserts; it is not run twice here because no fixture may
@@ -555,8 +566,6 @@ the fixtures in the same job:
 - `evaluate-pre` and `evaluate-post` run dry against a fixture, and the
   second request for the same (repo, sha, phase), or (repo, version,
   phase), must be answered with the evaluation already recorded.
-- `release` from the reconciler, with `ref` set to a tag already on the
-  commit, finishes what is missing and cuts nothing.
 
 #### Pointing it at pipeline.yml
 
@@ -857,8 +866,89 @@ semantic-release install and run with the action:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-Both expose `tag`: the `v*` tag the run released, or empty when it
-released nothing.
+Both expose the release stage's outputs:
+
+| Output | Meaning |
+|---|---|
+| `published` | `true` when the commit has a release on the remote after the run: cut by it, or cut by an earlier run and finished by this one. `false` when there is nothing to release, and on every dry run |
+| `version` | `X.Y.Z`, or empty |
+| `tag` | `vX.Y.Z`, or empty when the commit has no release, as before. Now also set on a run that finished an earlier release, so a job that runs on it (a deploy) runs on the re-run too |
+| `sha` | The commit the tag is on: the release commit, where `@semantic-release/git` makes one |
+| `resumed` | Action only: `true` when an earlier run cut the release and this one finished it |
+
+### Main only, one at a time
+
+The release cuts a release on `main` only. On any other ref it refuses
+before semantic-release runs, unless it is a dry run, or `ref` names a
+`vX.Y.Z` tag on `main`, which it finishes and never cuts again.
+`release.yml`'s job runs in the concurrency group
+`release-<owner>/<repo>`, which never cancels a release in progress; a
+repository that calls the action from its own job gives that job the same
+group.
+
+### Re-running a release
+
+Running the release again on a released commit cuts nothing, and running
+it again after it failed partway finishes it. Before semantic-release, the
+action's `release-state.sh` looks for this commit's release: a `vX.Y.Z`
+tag on it, or the release commit `@semantic-release/git` pushed on top of
+it (`chore(release): X.Y.Z [skip ci]`). When there is one, semantic-release
+does not run, and the action finishes what that release is missing:
+
+| Stopped after | A re-run |
+|---|---|
+| the release commit, before the tag | tags the release commit and pushes the tag, makes the GitHub release, moves the major tag |
+| the tag, before the GitHub release | makes the GitHub release from the release commit's notes, moves the major tag |
+| the GitHub release, before the major tag | moves the major tag |
+
+The tag is never moved once pushed, and the major tag moves only onto the
+newest release of its major, in a repository that already keeps major tags,
+so finishing an old release never drags it back. While a release commit has
+no tag, a release of a later commit refuses rather than cut that version a
+second time; re-running the stopped run finishes it. A dry run says what it
+would finish and does nothing.
+
+`release-state.sh` decides what is missing and changes nothing;
+`finish-release.sh` does the git half; the GitHub release is one `gh release
+create`. `scripts/check-release-resume.sh` proves the first two against a
+scratch repository (see Running a stage twice).
+
+### Publishing and notices after the release
+
+A package publish or a fleet notice that semantic-release itself runs (an
+`@semantic-release/exec` `publishCmd` or `successCmd`) does not run again on
+a re-run, because semantic-release does not. A repository whose release
+publishes something puts that publish, and any notice after it, in steps of
+its own after the release step, on `published`:
+
+```yaml
+      - uses: mini-app-polis/.github/.github/actions/semantic-release@v3
+        id: release
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish to PyPI
+        if: steps.release.outputs.published == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          # Already there: an earlier run published it.
+          if curl -sf "https://pypi.org/pypi/miniapppolis-common-utils/${VERSION}/json" >/dev/null; then
+            echo "miniapppolis-common-utils ${VERSION} is already on PyPI."
+            exit 0
+          fi
+          git checkout "${TAG}"
+          uv build && uv publish --trusted-publishing always
+```
+
+Each such step makes itself safe to repeat, since `published` is `true` on
+every re-run of a released commit: a publish skips a version the registry
+already has (or uses the registry's own skip, such as `uv publish
+--check-url https://pypi.org/simple/`), and a notice is one its receiver takes twice without harm (a
+`repository_dispatch` that re-locks onto a version already locked changes
+nothing). A caller of `release.yml` does the same in a job that needs the
+release job and runs `if: needs.release.outputs.published == 'true'`,
+checking out `needs.release.outputs.tag`.
 
 ### Inputs
 
@@ -870,6 +960,7 @@ released nothing.
 | `git-author-email` | empty | Author and committer email, used with `git-author-name` |
 | `artifact-name`, `artifact-digest` | empty | Workflow only: the build stage's outputs. The release takes that artifact, refuses it on a digest mismatch, and sets `PIPELINE_ARTIFACT_DIR` to it for semantic-release (see Build stage) |
 | `github-token` | the job's token | Action only: the token semantic-release pushes and creates the release with |
+| `ref` | empty | A `vX.Y.Z` tag on `main` to finish rather than the run's commit: the release reconciler's `ref`. `release.yml` checks it out. Never cut again |
 
 Run by hand from the Actions tab, `release.yml` is a dry run of this
 repository's own next release.
@@ -1252,8 +1343,10 @@ installed on it and its `dev` lock resolves the package.
 Consumers pin a major — `evaluate.yml@v3`, `security.yml@v2` — and that tag
 moves. semantic-release cuts `v3.0.1` from the commit messages, and
 `scripts/move-major-tag.sh` runs as its `successCmd` to force-push `v3` onto
-it. A run with no releasable commits never reaches that script, so the major
-tag correctly stays put.
+it (the work is the release action's `move-major-tag.sh`, which the action
+also runs when a re-run finds a release whose major tag never moved). A run
+with no releasable commits never reaches that script, so the major tag
+correctly stays put.
 
 | Tag | Contains |
 |---|---|

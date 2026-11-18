@@ -17,6 +17,12 @@
 # Step 1 is what keeps step 3 from passing vacuously: a run that cannot see a
 # release at all would also report nothing.
 #
+# Alongside each run, the action's release-state.sh must agree: `release`
+# on the unreleased commit, and on the released one `finish` with that tag,
+# so the action does not run semantic-release there at all. What the action
+# then finishes, after a release that stopped partway, is
+# check-release-resume.sh's proof.
+#
 # Usage: scripts/check-release-rerun.sh <fixture dir> <release tooling dir>
 #   The tooling dir is .github/actions/semantic-release after `npm ci` there.
 set -euo pipefail
@@ -50,6 +56,12 @@ git push --quiet origin main
 # request it would stop before analysing anything, and any token in reach is
 # one it has no use for. Without them it reads the branch from git, as it
 # does on a workstation.
+release_state() {
+  env -u TARGET_REF -u DRY_RUN -u GITHUB_RELEASE_EXISTS -u MAJOR_TAGS \
+    GITHUB_REF=refs/heads/main GITHUB_RELEASE_EXISTS=true \
+    bash "${tooling}/release-state.sh" | tee "$1"
+}
+
 release() {
   env -u CI -u GITHUB_ACTIONS -u GITHUB_EVENT_NAME -u GITHUB_REF \
       -u GITHUB_HEAD_REF -u GITHUB_BASE_REF -u GITHUB_TOKEN -u GH_TOKEN \
@@ -61,6 +73,12 @@ release "${scratch}/first.log"
 echo "::endgroup::"
 if ! grep -q "the next release version is 1.0.0" "${scratch}/first.log"; then
   echo "::error::The first dry run did not find the release it should have."
+  exit 1
+fi
+git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
+release_state "${scratch}/first.state"
+if ! grep -qx "state=release" "${scratch}/first.state"; then
+  echo "::error::release-state.sh would not release the unreleased commit."
   exit 1
 fi
 
@@ -77,6 +95,11 @@ fi
 if grep -qi "next release version is" "${scratch}/second.log" \
    || ! grep -q "There are no relevant changes, so no new version is released." "${scratch}/second.log"; then
   echo "::error::Running the release again on a released commit would release again."
+  exit 1
+fi
+release_state "${scratch}/second.state"
+if ! grep -qx "state=finish" "${scratch}/second.state" || ! grep -qx "tag=v1.0.0" "${scratch}/second.state"; then
+  echo "::error::release-state.sh does not take v1.0.0 for this commit's release."
   exit 1
 fi
 tags="$(git ls-remote --tags origin | wc -l)"
