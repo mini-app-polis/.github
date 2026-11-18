@@ -37,16 +37,18 @@ jobs:
   # fixture (self-test.yml). The release needs this job, so a failing
   # fixture or a new high-severity workflow finding blocks the release.
   #
-  # id-token and packages write reach it only because GitHub checks a
-  # reusable workflow's permissions before any job's `if`: the deploy
-  # stage's live Lambda and Railway paths ask for them, and the self-test
-  # runs that stage against a stand-in that never takes those paths.
+  # id-token, packages and statuses write reach it only because GitHub
+  # checks a reusable workflow's permissions before any job's `if`: the
+  # deploy and verify stages' live paths (the Lambda, GHCR, the commit
+  # status that records a verify) ask for them, and the self-test runs those
+  # stages against stand-ins that never take those paths.
   test:
     uses: ./.github/workflows/self-test.yml
     permissions:
       contents: read
       id-token: write
       packages: write
+      statuses: write
 
   # CD-025: needs the security job, not just the work job. A release that
   # lists only `test` goes out whether or not the scan passed.

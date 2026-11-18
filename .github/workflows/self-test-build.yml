@@ -20,13 +20,24 @@
 #            "Running a stage twice"). A profile with nothing to deploy
 #            must say so and report no deployed version.
 #
+#   verify   stages-verify.yml with `target: fake` after each environment's
+#            deploys: its stand-in service serves what the deploy stand-in
+#            recorded, so development and production verify, and production
+#            verifies again (it only reads, so it must pass twice). Then
+#            once more with the stand-in serving another version: that run
+#            must time out, fail its job, tell the stand-in Discord and
+#            record the release as not verified. A profile with nothing to
+#            verify must say so, and a library verifies only in production.
+#
 # Nothing leaves the run: the artifact and its SBOM are uploaded to the run,
 # and the api-service image is saved to a tarball, never pushed. The deploy's
 # stand-in is a record kept as an artifact of the run; it reads no target,
-# holds no secret and pushes nothing. The deploy jobs are granted id-token
-# and packages write only because GitHub checks a reusable workflow's
-# permissions before any job's `if`: stages-deploy.yml asks for them for
-# its live Lambda and Railway paths, which a fake target never takes.
+# holds no secret and pushes nothing. The verify stand-in is a service on
+# the job's own loopback, and its record is an artifact of the run, not a
+# commit status. The deploy and verify jobs are granted id-token, packages
+# and statuses write only because GitHub checks a reusable workflow's
+# permissions before any job's `if`: the stages ask for them for their live
+# paths, which a fake target never takes.
 name: self-test-build
 
 on:
@@ -280,5 +291,166 @@ jobs:
               for run in "${DEV_FIRST}" "${DEV_AGAIN}" "${PROD_FIRST}" "${PROD_AGAIN}"; do
                 expect "nothing to deploy" "${run}" "false/"
               done ;;
+          esac
+          [ "${failures}" -eq 0 ]
+
+  # ---- verify ---------------------------------------------------------------
+
+  verify-development:
+    needs: [versions, deploy-development-again]
+    uses: ./.github/workflows/stages-verify.yml
+    permissions:
+      contents: read
+      statuses: write
+      packages: read
+      id-token: write
+    with:
+      profile: ${{ inputs.profile }}
+      environment: development
+      version: ${{ needs.versions.outputs.development }}
+      build-version: ${{ needs.versions.outputs.development }}
+      target: fake
+      lambda-handler: ${{ inputs.lambda-handler }}
+      working-directory: fixtures/${{ inputs.profile }}
+
+  verify-production:
+    needs: [versions, deploy-production-again]
+    uses: ./.github/workflows/stages-verify.yml
+    permissions:
+      contents: read
+      statuses: write
+      packages: read
+      id-token: write
+    with:
+      profile: ${{ inputs.profile }}
+      environment: production
+      version: ${{ needs.versions.outputs.production }}
+      build-version: ${{ needs.versions.outputs.development }}
+      target: fake
+      lambda-handler: ${{ inputs.lambda-handler }}
+      working-directory: fixtures/${{ inputs.profile }}
+
+  verify-production-again:
+    needs: [versions, verify-production]
+    uses: ./.github/workflows/stages-verify.yml
+    permissions:
+      contents: read
+      statuses: write
+      packages: read
+      id-token: write
+    with:
+      profile: ${{ inputs.profile }}
+      environment: production
+      version: ${{ needs.versions.outputs.production }}
+      build-version: ${{ needs.versions.outputs.development }}
+      target: fake
+      lambda-handler: ${{ inputs.lambda-handler }}
+      working-directory: fixtures/${{ inputs.profile }}
+
+  # The stand-in serves a version that is neither the release nor what the
+  # build declares, so the poll can never match: short timings keep the
+  # wait to seconds. Its job fails as a live one would; expect-failure keeps
+  # that from failing this run, and `verify` below reads `outcome` to prove
+  # it did fail. It runs after the match cases, so the production record it
+  # leaves is the newest.
+  verify-mismatch:
+    needs: [versions, verify-production-again]
+    uses: ./.github/workflows/stages-verify.yml
+    permissions:
+      contents: read
+      statuses: write
+      packages: read
+      id-token: write
+    with:
+      profile: ${{ inputs.profile }}
+      environment: production
+      version: ${{ needs.versions.outputs.production }}
+      build-version: ${{ needs.versions.outputs.development }}
+      target: fake
+      fake-serves: 0.0.0-not-this-release
+      expect-failure: true
+      verify-timeout-seconds: 6
+      poll-initial-seconds: 1
+      poll-max-seconds: 2
+      lambda-handler: ${{ inputs.lambda-handler }}
+      working-directory: fixtures/${{ inputs.profile }}
+
+  # A match verifies, twice; a mismatch times out, fails its job, tells the
+  # errors channel and leaves the release recorded as not verified.
+  verify:
+    needs: [versions, verify-development, verify-production, verify-production-again, verify-mismatch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      PROFILE: ${{ inputs.profile }}
+      PROD: ${{ needs.versions.outputs.production }}
+      DEV_RESULT: ${{ needs.verify-development.outputs.verified }}/${{ needs.verify-development.outputs.outcome }}
+      PROD_RESULT: ${{ needs.verify-production.outputs.verified }}/${{ needs.verify-production.outputs.outcome }}
+      AGAIN_RESULT: ${{ needs.verify-production-again.outputs.verified }}/${{ needs.verify-production-again.outputs.outcome }}
+      MISMATCH_RESULT: ${{ needs.verify-mismatch.outputs.verified }}/${{ needs.verify-mismatch.outputs.outcome }}
+    steps:
+      - name: Take the stand-in's records
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: verify-record-${{ inputs.profile }}-*
+          path: ${{ runner.temp }}/verify-records
+
+      - name: Verified on a match, failed and recorded on a mismatch
+        env:
+          RECORDS: ${{ runner.temp }}/verify-records
+        run: |
+          set -euo pipefail
+          failures=0
+          expect() {
+            if [ "$2" = "$3" ]; then echo "ok: $1 ($2)"; else echo "::error::$1: $2, wanted $3 (verified/outcome)"; failures=$((failures + 1)); fi
+          }
+          # Found by its context, not its folder: download-artifact unpacks a
+          # lone matching artifact straight into the path, with no folder
+          # named after it (a library has only a production record).
+          record() {
+            local f
+            while IFS= read -r f; do
+              if jq -e --arg c "pipeline/verify ($1)" '.context == $c' "$f" > /dev/null 2>&1; then
+                echo "$f"
+                return
+              fi
+            done < <(find "${RECORDS}" -name record.json 2> /dev/null)
+          }
+          check() {
+            if jq -e "$2" "$3" > /dev/null; then echo "ok: $1"; else echo "::error::$1: $(cat "$3")"; failures=$((failures + 1)); fi
+          }
+          dev_record="$(record development)"
+          prod_record="$(record production)"
+          case "${PROFILE}" in
+            python-service|api-service|astro-site|python-library|npm-library)
+              case "${PROFILE}" in
+                python-library|npm-library)
+                  expect "development: nothing published to verify" "${DEV_RESULT}" "skipped/success"
+                  [ -z "${dev_record}" ] && echo "ok: no development record" || { echo "::error::a library left a development record"; failures=$((failures + 1)); } ;;
+                *)
+                  expect "development verifies" "${DEV_RESULT}" "true/success"
+                  if [ -n "${dev_record}" ]; then
+                    check "development is recorded verified" '.state == "success" and .context == "pipeline/verify (development)" and (.discord | length) == 0' "${dev_record}"
+                  else
+                    echo "::error::no development record"; failures=$((failures + 1))
+                  fi ;;
+              esac
+              expect "production verifies" "${PROD_RESULT}" "true/success"
+              expect "production verifies again" "${AGAIN_RESULT}" "true/success"
+              expect "a mismatch times out and fails" "${MISMATCH_RESULT}" "false/failure"
+              if [ -n "${prod_record}" ]; then
+                check "the mismatch is recorded not verified" \
+                  ".state == \"failure\" and .context == \"pipeline/verify (production)\" and .version == \"${PROD}\" and (.description | startswith(\"not verified ${PROD}\"))" "${prod_record}"
+                check "the errors channel was told, once, naming the version" \
+                  "(.discord | length) == 1 and (.discord[0].content | contains(\"${PROD}\") and contains(\"0.0.0-not-this-release\")) and .discord[0].allowed_mentions.parse == []" "${prod_record}"
+              else
+                echo "::error::no production record"; failures=$((failures + 1))
+              fi ;;
+            *)
+              for run in "${DEV_RESULT}" "${PROD_RESULT}" "${AGAIN_RESULT}" "${MISMATCH_RESULT}"; do
+                expect "nothing to verify" "${run}" "skipped/success"
+              done
+              [ -z "${dev_record}${prod_record}" ] && echo "ok: nothing recorded" || { echo "::error::${PROFILE} left a verify record"; failures=$((failures + 1)); } ;;
           esac
           [ "${failures}" -eq 0 ]

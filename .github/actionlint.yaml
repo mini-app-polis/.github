@@ -41,3 +41,8 @@ paths:
       # and for the Lambda deploy it delegates to.
       - 'specifying action "\$/\.github/actions/(deploy-decision|fetch-artifact|wrangler)" in invalid format because ref is missing'
       - 'reusable workflow call "\$/\.github/workflows/lambda-deploy\.yml" at "uses" is not following the format'
+  .github/workflows/stages-verify.yml:
+    ignore:
+      # The same `$/` form as stages-test.yml, for the verify stage's
+      # actions.
+      - 'specifying action "\$/\.github/actions/(fetch-artifact|verify-decision)" in invalid format because ref is missing'
