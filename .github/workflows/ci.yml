@@ -1,5 +1,6 @@
-# This repo runs the shared workflow against itself on every pull request,
-# so a change to security.yml is exercised before any consumer picks it up.
+# This repo runs the shared workflow against itself on every pull request
+# and every push to dev or main, so a change to security.yml is exercised
+# before any consumer picks it up.
 #
 # Job names are canonical per ecosystem-standards CD-026: security, test,
 # release. `test` is self-test.yml, because that is what it is: the work job
@@ -13,7 +14,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, dev]
 
 permissions:
   contents: read

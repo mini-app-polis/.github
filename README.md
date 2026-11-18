@@ -167,8 +167,10 @@ and the repository's inputs override them.
 | `terraform-infra` | Terraform fmt and validate, the repository's consistency checks | the task contract suite | the reviewed plan, made where credentials are (`build` skips and says so) | `terraform apply` of that plan | a fresh plan shows no changes |
 | `shared-workflows` | workflow static analysis, the pipeline's fixture repositories | — | — | the release moves the major tag | the fixtures pass at the new tag |
 
-`shared-workflows` is this repository. It has no `dev`: pull requests
-target `main`, and a merge to `main` releases.
+`shared-workflows` is this repository. It works like the rest of the
+fleet: changes land on `dev`, where every push runs the self-tests, and
+reach `main` through the promotion pull request; a merge to `main`
+releases.
 
 ### Extension points
 
@@ -436,10 +438,12 @@ before `build`, reuses the tag in `release`, and continues from there.
 
 ### Changing the pipeline
 
-The pipeline changes through this repository's own pull requests, which
-run workflow static analysis and the pipeline against one fixture
+The pipeline changes on this repository's `dev` branch and reaches `main`
+through the promotion pull request. Every push to `dev` and every pull
+request runs workflow static analysis and the pipeline against one fixture
 repository per profile (see Testing the pipeline below). A failing fixture
-blocks the release.
+blocks the release. Callers pin a tag cut from `main`, so nothing on `dev`
+reaches them before it is released.
 
 - **Protection.** `main` takes a change only by pull request, with this
   repository's security checks and the self-test's `test / gate` passing:
