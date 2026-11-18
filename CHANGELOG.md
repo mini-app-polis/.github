@@ -1,3 +1,10 @@
+# [3.38.0](https://github.com/mini-app-polis/.github/compare/v3.37.1...v3.38.0) (2026-11-18)
+
+
+### Features
+
+* **ruleset:** add the organization ruleset's required workflow ([e455264](https://github.com/mini-app-polis/.github/commit/e45526403b757e31c97d2371488ea12d02da371a))
+
 ## [3.37.1](https://github.com/mini-app-polis/.github/compare/v3.37.0...v3.37.1) (2026-11-18)
 
 
