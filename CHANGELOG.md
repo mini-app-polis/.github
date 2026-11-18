@@ -1,3 +1,10 @@
+## [3.31.2](https://github.com/mini-app-polis/.github/compare/v3.31.1...v3.31.2) (2026-11-18)
+
+
+### Bug Fixes
+
+* **release:** ask the App only for the permissions it holds ([666187e](https://github.com/mini-app-polis/.github/commit/666187ee575b45ed6a6570ce7c45bb9da03a75eb))
+
 ## [3.31.1](https://github.com/mini-app-polis/.github/compare/v3.31.0...v3.31.1) (2026-11-17)
 
 
