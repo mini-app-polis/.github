@@ -1,3 +1,10 @@
+# [3.32.0](https://github.com/mini-app-polis/.github/compare/v3.31.2...v3.32.0) (2026-11-18)
+
+
+### Features
+
+* **pipeline:** add the test stages as one reusable workflow with a test gate ([f88ee07](https://github.com/mini-app-polis/.github/commit/f88ee07d31ca02bd14c0df0c788d959e145c7d4b))
+
 ## [3.31.2](https://github.com/mini-app-polis/.github/compare/v3.31.1...v3.31.2) (2026-11-18)
 
 
