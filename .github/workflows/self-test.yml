@@ -12,7 +12,9 @@
 # The build stage uploads its artifact and SBOM to this run only, and saves
 # the api-service image to a tarball rather than pushing it. The deploy
 # stage runs with `target: fake`: its target is a record kept in this run,
-# so it reads and changes nothing outside it. The release
+# so it reads and changes nothing outside it. The verify stage runs with
+# `target: fake` too: it polls a stand-in service on the job's loopback,
+# posts its alarm there, and keeps its record in this run. The release
 # stage runs only as a dry run, in a scratch repository whose one remote is
 # a bare repository beside it; its re-run proof tags and pushes only there. No fixture names a contract suite, so the
 # contract stage, which calls the development API, skips against every one
@@ -92,16 +94,18 @@ jobs:
   # The build stage (stages-build.yml) against each profile's fixture, run
   # twice on one commit, and its artifact taken by digest as release and
   # deploy take it; then the deploy stage (stages-deploy.yml) against the
-  # stand-in target, to each environment twice (self-test-build.yml says
-  # how). terraform-infra and shared-workflows build nothing and say why,
-  # and they and the libraries deploy nothing and say why. The
+  # stand-in target, to each environment twice, and the verify stage
+  # (stages-verify.yml) against a stand-in service, verifying what was
+  # deployed and failing on a version that was not (self-test-build.yml
+  # says how). terraform-infra and shared-workflows build nothing and say
+  # why, and they and the libraries deploy nothing and say why. The
   # python-service fixture's handler is invoked on a schedule, so its Lambda
   # zip gets the import check rather than the queue probe.
   #
-  # id-token and packages write are granted only because GitHub checks a
-  # reusable workflow's permissions before any job's `if`: stages-deploy.yml
-  # asks for them for the live Lambda and Railway paths, which the stand-in
-  # never takes.
+  # id-token, packages and statuses write are granted only because GitHub
+  # checks a reusable workflow's permissions before any job's `if`: the
+  # deploy and verify stages ask for them for their live paths (the Lambda,
+  # GHCR and the commit status), which the stand-ins never take.
   build:
     name: build (${{ matrix.profile }})
     strategy:
@@ -120,6 +124,7 @@ jobs:
       contents: read
       id-token: write
       packages: write
+      statuses: write
     with:
       profile: ${{ matrix.profile }}
       lambda-handler: ${{ matrix.lambda-handler }}
@@ -155,6 +160,22 @@ jobs:
           persist-credentials: false
       - name: Every guard and skip case decides as it should
         run: bash scripts/test-deploy-decision.sh
+
+  # The verify stage's decisions and probes, case by case: what counts as the
+  # release, the backoff, a poll that verifies on a match and times out on
+  # anything else, and each probe against a local stand-in for its target.
+  verify-decision:
+    name: verify decision check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every compare, poll and probe case decides as it should
+        run: bash scripts/test-verify-decision.sh
 
   # The shared-workflows profile's lint stage is the static analysis above,
   # run on the fixture's workflows instead of this repository's.
@@ -230,9 +251,9 @@ jobs:
 
   # The stages of each profile that no fixture job runs yet, each with the
   # reason, as a notice on the run and a table in this job's summary. The
-  # stages up to build, and deploy, are not listed: `stages` and `build` run
-  # all of them for every profile, and each says itself when the profile has
-  # nothing for it. `release` runs in `fixture`, twice on one commit and re-run
+  # stages up to build, deploy and verify are not listed: `stages` and
+  # `build` run all of them for every profile, and each says itself when the
+  # profile has nothing for it. `release` runs in `fixture`, twice on one commit and re-run
   # after it stops partway, the reconciler's `ref` included.
   pending:
     name: not run yet (${{ matrix.profile }})
@@ -243,13 +264,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { profile: python-service, stages: "evaluate-pre verify evaluate-post" }
-          - { profile: api-service, stages: "evaluate-pre verify evaluate-post" }
-          - { profile: python-library, stages: "evaluate-pre verify evaluate-post" }
-          - { profile: astro-site, stages: "evaluate-pre verify evaluate-post" }
-          - { profile: npm-library, stages: "evaluate-pre verify evaluate-post" }
-          - { profile: terraform-infra, stages: "evaluate-pre verify evaluate-post" }
-          - { profile: shared-workflows, stages: "evaluate-pre verify evaluate-post" }
+          - { profile: python-service, stages: "evaluate-pre evaluate-post" }
+          - { profile: api-service, stages: "evaluate-pre evaluate-post" }
+          - { profile: python-library, stages: "evaluate-pre evaluate-post" }
+          - { profile: astro-site, stages: "evaluate-pre evaluate-post" }
+          - { profile: npm-library, stages: "evaluate-pre evaluate-post" }
+          - { profile: terraform-infra, stages: "evaluate-pre evaluate-post" }
+          - { profile: shared-workflows, stages: "evaluate-pre evaluate-post" }
     steps:
       - name: Name each stage not run, and why
         env:
@@ -280,7 +301,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [workflow-checks, security-typescript, stages, build, artifact-digest, deploy-decision, fixture-workflows, fixture, pending]
+    needs: [workflow-checks, security-typescript, stages, build, artifact-digest, deploy-decision, verify-decision, fixture-workflows, fixture, pending]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}

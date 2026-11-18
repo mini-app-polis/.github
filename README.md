@@ -135,7 +135,7 @@ produces no second release, deploy or evaluation.
 | `evaluate-pre` | `repo`, `sha`, `phase: pre-release` | the evaluation id | the evaluator answers a repeated (repo, sha, phase) with the evaluation it already has |
 | `release` | the commit, or `ref` from the reconciler | `published` (true or false), `version`, `tag`, `sha` | a tag already on this commit, or a release commit pushed on top of it, is this commit's release: the stage does not run semantic-release, finishes what is missing (the tag, the GitHub release, the major tag) and reports `published`, so the package publish and the fleet notice that run on it finish too, rather than cutting another. It cuts a release on `main` only |
 | `deploy` | `artifact-name`, `artifact-digest`, `environment` (`development` or `production`), `version` | `deployed-version`, `deployed` | it reads what the target runs first and skips when that is already this version; a failed deploy re-runs on its own and takes the same artifact by digest |
-| `verify` | `environment`, `version`, the profile's check | `verified` | it only reads the running service |
+| `verify` | `environment`, `version` (deploy's `deployed-version`), `build-version`, `sha` (release's `sha` in production), the profile's check | `verified` (`true`, `false`, or `skipped` when the profile has nothing to verify); a commit status, `pipeline/verify (<environment>)`, on `sha` | it only reads the target, and its record is a commit status, of which the newest of a context is the one that counts |
 | `evaluate-post` | `repo`, `version`, `sha`, `phase: post-release` | the evaluation id | the evaluator answers a repeated (repo, version, phase) with the evaluation it already has |
 
 Every later stage consumes the artifact `build` produced, by digest,
@@ -159,13 +159,13 @@ and the repository's inputs override them.
 
 | Profile | Tooling | Integration and contract | Artifact | Deploy | Verify |
 |---|---|---|---|---|---|
-| `python-service` | uv, ruff, mypy, pytest | Postgres service container where the repository's tests need it; contract suites it consumes | wheel and sdist, with the Lambda zip when it names a handler | AWS Lambda functions, or Railway services | the function's or service's reported version |
-| `api-service` | uv, ruff, mypy, pytest | Postgres service container; the contract suites it provides and consumes | container image | Railway | `/health` reports the released version |
+| `python-service` | uv, ruff, mypy, pytest | Postgres service container where the repository's tests need it; contract suites it consumes | wheel and sdist, with the Lambda zip when it names a handler | AWS Lambda functions, or Railway services | the function is active, its last update succeeded, and its code is the release's zip |
+| `api-service` | uv, ruff, mypy, pytest | Postgres service container; the contract suites it provides and consumes | container image | Railway | the deploy record holds the release's image, `/health` answers, and `/version` reports the release or the version its build declares |
 | `python-library` | uv, ruff, mypy, pytest | contract suites against the development API where it ships them | wheel and sdist | published to PyPI by `release`, which also tells the fleet a release is out | the published version resolves on PyPI |
-| `astro-site` | Node with npm or pnpm, typecheck, build | the API contract suites the site consumes; end-to-end tests where it has them | site bundle | Cloudflare Pages, uploaded from the pipeline | the site serves the released version |
+| `astro-site` | Node with npm or pnpm, typecheck, build | the API contract suites the site consumes; end-to-end tests where it has them | site bundle | Cloudflare Pages, uploaded from the pipeline | the site answers, and the upload Pages serves is the release's version and artifact |
 | `npm-library` | Node with npm or pnpm, typecheck, lint, tests | contract suites where it ships them | npm package | published to the registry by `release` | the published version resolves |
-| `terraform-infra` | Terraform fmt and validate, the repository's consistency checks | the task contract suite | the reviewed plan, made where credentials are (`build` skips and says so) | `terraform apply` of that plan | a fresh plan shows no changes |
-| `shared-workflows` | workflow static analysis, the pipeline's fixture repositories | — | — | the release moves the major tag | the fixtures pass at the new tag |
+| `terraform-infra` | Terraform fmt and validate, the repository's consistency checks | the task contract suite | the reviewed plan, made where credentials are (`build` skips and says so) | `terraform apply` of that plan | a fresh plan shows no changes (not yet: `verify` skips and says so) |
+| `shared-workflows` | workflow static analysis, the pipeline's fixture repositories | — | — | the release moves the major tag | the fixtures passed before the release (`verify` skips and says so) |
 
 `shared-workflows` is this repository. It works like the rest of the
 fleet: changes land on `dev`, where every push runs the self-tests, and
@@ -532,9 +532,123 @@ the commit `release` versions, before the release commit that writes the
 new version into the version files, so a service built from it reports the
 version that commit declared, not the release. That is why the skip check
 reads the target's own record of the artifact (its image, its zip, its
-upload) rather than the service's version endpoint, and why `verify`, which
-is to check that the service reports the released version, needs the build
-to carry that version first.
+upload) rather than the service's version endpoint, and why `verify` reads
+that record too (see Verify stage).
+
+### Verify stage
+
+`stages-verify.yml` is the `verify` stage: after `deploy`, it asks the
+target, and only reads it, whether it runs this release. It asks again with
+backoff until the answer is yes or the time is up. A timeout fails the job,
+posts to the Discord errors channel and records the release as not
+verified.
+
+**What "verified" means.** A service built on `main` reports the version
+its commit declared, which is the version before this release (see Deploy
+stage, "What a running service reports"). On `dev`, every build of a commit
+reports the same declared version, and a service that pulls an image has no
+Git commit to report. So the stage does not take a service's word for the
+release alone. For each target it reads the deploy record, which ties the
+release to the exact artifact, and then asks the running target itself:
+
+| Target | Verified when | What it rules out |
+|---|---|---|
+| Railway (`api-service`) | the GHCR deploy record `<environment>-deployed` holds the image pushed for this version (the deploy stage moves it only after Railway reports that deployment healthy), and then, at `url`, `/health` answers `{"status": "ok"}` and `/version` reports one of: the release, the build's version, or what the build declares (the build's version without its `+g` part) | a record left on another image; a service down or unhealthy at its public address; an older build still answering (on `main`, the previous deploy reports an older declared version) |
+| Lambda (`python-service`) | `get-function-configuration` reports the function `Active`, its `LastUpdateStatus` `Successful`, and its `CodeSha256` that of the artifact's zip | an update still in progress or failed; any other code |
+| Cloudflare Pages (`astro-site`) | the site at `url` answers, and the deployment Pages serves in the environment carries `pipeline-deploy version=<this version> artifact=<this digest>` | a site that does not answer; a Git build or another upload being served |
+| PyPI (`python-library`), npm (`npm-library`) | the published version resolves on the registry, in production. In development nothing is published, and the stage skips and says so | a release whose publish did not land |
+| `terraform-infra`, `shared-workflows` | nothing: the stage skips and says why | |
+
+The service check is the one that still leans on what the build declares.
+Once a service reports the build it is running (its build's version, with
+the `+g` part, or the release itself), the same check matches that exactly
+and nothing in this stage changes. `/health` is polled because it is the
+fleet's liveness probe: it answers with no auth and no database query, so
+the stage touches no dependency of the service.
+
+**Polling.** The decisions are `verify-decision.sh` in the `verify-decision`
+action: which versions count, how a report compares, the backoff (from
+`poll-initial-seconds`, doubling, capped at `poll-max-seconds`), and the
+poll, which gives up once waiting again would pass
+`verify-timeout-seconds`. What each target reports is `probe.sh` beside
+it. `scripts/test-verify-decision.sh` proves both case by case, the probes
+against a local server standing in for each target.
+
+**The record.** Verified or not, the stage writes a commit status on `sha`,
+the release's commit in production: context `pipeline/verify (<environment>)`,
+`success` or `failure`, with the version and the reason in its description
+and the run as its link. It is read by ref, so the release reconciler reads
+it from the release tag
+(`GET /repos/<owner>/<repo>/commits/<tag>/statuses`, newest of the context
+first). A commit status was chosen over a GitHub deployment status, which
+would need a deployment the pipeline does not make, and over a check run,
+which `GITHUB_TOKEN` can only attach to whatever check suite it lands in.
+Re-running the stage writes a newer status, and the newest is the one that
+counts.
+
+**The alarm.** On a timeout the stage posts the repository, version,
+environment, reason and run to the `discord-webhook-url` secret, the errors
+channel's webhook. The fleet keeps that webhook as
+`DISCORD_WEBHOOK_URL_ERRORS`, the name the API reads it by; it must also be
+a GitHub secret of the organisation for workflows to use it. Without it the
+stage warns that it could not post, and still fails.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `profile` | required | The repository's profile |
+| `environment` | required | `development` or `production`, where `deploy` ran |
+| `version` | required | The deploy stage's `deployed-version` |
+| `build-version` | empty | The build stage's `version`; empty: `version` |
+| `sha` | the run's commit | The commit the record is written on: `release`'s `sha` in production |
+| `target` | `live` | `fake` is the self-test's stand-in. Consumers leave it, and `expect-failure` and `fake-serves`, which only it takes |
+| `timeout-minutes` | `20` | How long the verify job may run |
+| `verify-timeout-seconds` | `600` | How long to keep asking the target |
+| `poll-initial-seconds`, `poll-max-seconds` | `5`, `60` | The backoff between attempts |
+| `url` | empty | `api-service`: the service's base URL in the environment (required). `astro-site`: the site's URL; empty, the project's `pages.dev` address for the environment |
+| `health-path`, `version-path` | `/health`, `/version` | `api-service`: where it answers |
+| `image-repository` | `ghcr.io/<owner>/<repo>` | `api-service`: as the deploy stage's |
+| `artifact-name`, `artifact-digest` | empty | `python-service`: the zip to compare. `astro-site`: the digest the served upload must carry |
+| `lambda-handler`, `aws-role-arn`, `aws-region`, `lambda-function-name` | empty | `python-service`: as the deploy stage's. The deploy role can read the function's configuration |
+| `pages-project`, `cloudflare-account-id`, `pages-development-branch` | empty, empty, `dev` | `astro-site`: as the deploy stage's |
+| `package-name` | from `pyproject.toml` or `package.json` | Libraries: the registry name |
+| `npm-registry` | `https://registry.npmjs.org` | `npm-library`: where `release` publishes |
+
+| Secret | Meaning |
+|---|---|
+| `cloudflare-api-token` | `astro-site`: the deploy stage's Cloudflare token will do |
+| `discord-webhook-url` | The errors channel's webhook: `DISCORD_WEBHOOK_URL_ERRORS` |
+
+The calling job grants `contents: read`, `statuses: write` (the record),
+`packages: read` (the GHCR deploy record) and `id-token: write` (the Lambda's
+OIDC role), whatever its profile. In `pipeline.yml`:
+
+```yaml
+  verify:
+    needs: [build, release, deploy]
+    if: always() && needs.deploy.result == 'success'
+    permissions:
+      contents: read
+      statuses: write
+      packages: read
+      id-token: write
+    uses: $/.github/workflows/stages-verify.yml
+    with:
+      profile: ${{ inputs.profile }}
+      environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'development' }}
+      version: ${{ needs.deploy.outputs.deployed-version || needs.release.outputs.version }}
+      build-version: ${{ needs.build.outputs.version }}
+      sha: ${{ github.ref == 'refs/heads/main' && needs.release.outputs.sha || github.sha }}
+      artifact-name: ${{ needs.build.outputs.artifact-name }}
+      artifact-digest: ${{ needs.build.outputs.artifact-digest }}
+      url: ${{ github.ref == 'refs/heads/main' && vars.API_URL_PRODUCTION || vars.API_URL_DEVELOPMENT }}
+      # and the repository's target inputs, as for deploy
+    secrets:
+      cloudflare-api-token: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+      discord-webhook-url: ${{ secrets.DISCORD_WEBHOOK_URL_ERRORS }}
+```
+
+`evaluate-post` needs `verify` and runs only when it reports `verified`
+`true` (or `skipped`).
 
 ### Enforced and subscribed
 
@@ -681,7 +795,12 @@ reports holds a pull request open for good.
   every other way an artifact can be wrong. The same `build` job then runs
   `stages-deploy.yml` against the fixture's stand-in target, to development
   and to production, twice each, and `deploy decision check` runs
-  `scripts/test-deploy-decision.sh`. The `fixture` job runs the release stage twice on one commit,
+  `scripts/test-deploy-decision.sh`. Then it runs `stages-verify.yml`
+  against a stand-in service serving what the deploy stand-in recorded: it
+  must verify in each environment, twice in production, and, with the
+  stand-in serving another version, time out, fail its job, post to the
+  stand-in Discord and record the release as not verified. `verify decision
+  check` runs `scripts/test-verify-decision.sh`. The `fixture` job runs the release stage twice on one commit,
   re-runs it after each way it can stop partway, and, for the Python fixtures, the local `python-checks` action with
   every check in one job as `python-test.yml` runs it (not
   `python-test.yml` itself, which runs the published action and so would
@@ -703,7 +822,10 @@ reports holds a pull request open for good.
   `target: fake`: it takes the artifact by digest and makes every decision a
   live deploy makes, but its target is a record kept in the run as an
   artifact, so it reads and changes nothing outside the run and needs no
-  secret. Evaluation stages do not run against a fixture until they can do
+  secret. The verify stage runs with `target: fake` too: it polls a
+  stand-in service on the job's own loopback, posts its alarm there, and
+  keeps its record as an artifact of the run instead of a commit status.
+  Evaluation stages do not run against a fixture until they can do
   so with no effect outside the run.
 - **One gate.** The `gate` job in `self-test.yml` passes only if every
   other job there passed. It is the check `main` requires, and its name
@@ -750,7 +872,10 @@ the fixtures in the same job:
   version already there. The `build` job in `self-test.yml` proves it for
   every fixture and both environments; a profile with nothing to deploy
   must report nothing deployed.
-- `verify` only reads, so it needs no more than to pass twice.
+- `verify` only reads, so it needs no more than to pass twice. The `build`
+  job in `self-test.yml` runs it twice in production for every fixture,
+  after a run to development, and then once against a version that is not
+  the release, which must fail.
 - `evaluate-pre` and `evaluate-post` run dry against a fixture, and the
   second request for the same (repo, sha, phase), or (repo, version,
   phase), must be answered with the evaluation already recorded.
@@ -776,9 +901,9 @@ Once `pipeline.yml` exists, the `stages`, `build`, `fixture` and `pending` jobs 
 For that, `pipeline.yml` needs a `working-directory` input that every stage
 honours, as `stages-test.yml` does now (with the `postgres-image` the
 `stages` job passes `api-service` today becoming that profile's default), and every stage that
-reaches outside the run (release, deploy, evaluate) needs a mode the
-fixtures run it in that has no effect outside the run (deploy has one,
-`target: fake`). A stage the profile
+reaches outside the run (release, deploy, verify, evaluate) needs a mode the
+fixtures run it in that has no effect outside the run (deploy and verify
+have one, `target: fake`). A stage the profile
 has no use for is skipped with its reason, as the stages before `build`
 already are, which replaces the `pending` job. `gate` keeps its name and needs the new job.
 A new profile adds a directory under `fixtures/` and an entry in the

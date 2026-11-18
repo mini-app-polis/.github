@@ -1,0 +1,737 @@
+# The pipeline's `verify` stage, for any profile: after `deploy`, ask the
+# target, read-only, whether it runs this release, polling with backoff
+# until it says so or the time is up (README, "Verify stage").
+#
+#   api-service      the deploy record (GHCR <environment>-deployed holds the
+#                    image pushed for this version), then the service at
+#                    `url`: /health answers {"status": "ok"} and /version
+#                    reports this version, or the version its build declares
+#   python-service   the Lambda function: Active, its last update
+#                    Successful, and its code the artifact's zip (CodeSha256)
+#   astro-site       the site at `url` answers, and the deployment Pages
+#                    serves carries this version and this artifact
+#   python-library,  the published version resolves on PyPI or npm; in
+#   npm-library      development nothing is published, and it says so
+#   terraform-infra, nothing yet, and says why
+#   shared-workflows
+#
+# It only reads the target. /health is the fleet's liveness probe, which
+# answers with no auth and no database query, so polling it touches no
+# dependency of the service.
+#
+# The result is recorded either way as a commit status, context
+# "pipeline/verify (<environment>)", on `sha` (the release's commit in
+# production): success when verified, failure when not. A later run, or the
+# release reconciler, reads it from the release tag. When the target does
+# not verify in time the stage also posts to the Discord errors channel
+# through the `discord-webhook-url` secret, and fails.
+#
+# `target: fake` is for this repository's self-test and nothing else. The
+# target is a stand-in HTTP service started in the job, serving the version
+# the deploy stage's stand-in recorded; the Discord post goes to the
+# stand-in, and the record is an artifact of the run. Nothing outside the
+# run is read or written. `expect-failure` (fake only) lets the self-test
+# prove the stage fails on a mismatch without failing its own run.
+#
+# pipeline.yml calls this as one job after `deploy`:
+#
+#   jobs:
+#     verify:
+#       needs: [build, release, deploy]
+#       if: always() && needs.deploy.result == 'success'
+#       permissions:
+#         contents: read
+#         statuses: write
+#         packages: read
+#         id-token: write
+#       uses: mini-app-polis/.github/.github/workflows/stages-verify.yml@v3
+#       with:
+#         profile: api-service
+#         environment: production
+#         version: ${{ needs.deploy.outputs.deployed-version }}
+#         build-version: ${{ needs.build.outputs.version }}
+#         sha: ${{ needs.release.outputs.sha }}
+#         url: ${{ vars.API_URL_PRODUCTION }}
+#       secrets:
+#         discord-webhook-url: ${{ secrets.DISCORD_WEBHOOK_URL_ERRORS }}
+#
+# The caller grants statuses: write (the record), packages: read (the GHCR
+# deploy record) and id-token: write (the Lambda's OIDC role) whatever its
+# profile: GitHub checks a reusable workflow's permissions before any job's
+# `if`.
+#
+# The actions are named with `$/`, which resolves to this repository at the
+# commit of this file, so a caller pinned to a tag gets every part of the
+# stage from that same tag.
+
+name: stages-verify
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "The repository's profile (README, \"Profiles\")."
+        type: string
+        required: true
+      environment:
+        description: "development or production: where deploy ran."
+        type: string
+        required: true
+      version:
+        description: "The version deployed: the deploy stage's deployed-version (the release's X.Y.Z in production, the build's version in development)."
+        type: string
+        required: true
+      build-version:
+        description: "The build stage's version (X.Y.Z+g<sha>). A service built before the release commit reports what that commit declares; this says what that is. Empty: version."
+        type: string
+        default: ""
+      sha:
+        description: "The commit the record is written on: the release's sha in production. Empty: the commit of this run."
+        type: string
+        default: ""
+      target:
+        description: "live, or fake: the self-test's stand-in. Consumers leave it."
+        type: string
+        default: "live"
+      expect-failure:
+        description: "fake only: the stand-in is meant not to verify; the job still fails, but does not fail the run. Consumers leave it."
+        type: boolean
+        default: false
+      fake-serves:
+        description: "fake only: the version the stand-in reports. Empty: the version the deploy stage's stand-in recorded."
+        type: string
+        default: ""
+      timeout-minutes:
+        description: "How long the verify job may run."
+        type: number
+        default: 20
+      verify-timeout-seconds:
+        description: "How long to keep asking the target before giving up."
+        type: number
+        default: 600
+      poll-initial-seconds:
+        description: "The first wait between attempts; it doubles each attempt."
+        type: number
+        default: 5
+      poll-max-seconds:
+        description: "The longest wait between attempts."
+        type: number
+        default: 60
+      url:
+        description: "api-service: the service's base URL in this environment (required). astro-site: the site's URL; empty: the project's pages.dev address for the environment."
+        type: string
+        default: ""
+      health-path:
+        description: "api-service: the liveness probe, which must answer {\"status\": \"ok\"} and touch no dependency."
+        type: string
+        default: "/health"
+      version-path:
+        description: "api-service: where the service reports {\"version\": ...}."
+        type: string
+        default: "/version"
+      image-repository:
+        description: "api-service: as the deploy stage's; where the deploy record is. Empty: ghcr.io/<owner>/<repository>, lower-cased."
+        type: string
+        default: ""
+      artifact-name:
+        description: "python-service: the build stage's artifact-name, for the zip's CodeSha256."
+        type: string
+        default: ""
+      artifact-digest:
+        description: "python-service: the build stage's artifact-digest. astro-site: checked against the deployment Pages serves."
+        type: string
+        default: ""
+      lambda-handler:
+        description: "python-service: as the deploy stage's. Empty: no Lambda, and nothing to verify."
+        type: string
+        default: ""
+      aws-role-arn:
+        description: "python-service: the function's CI deploy role, which may read the function's configuration."
+        type: string
+        default: ""
+      aws-region:
+        description: "python-service: the function's region."
+        type: string
+        default: ""
+      lambda-function-name:
+        description: "python-service: the function, for this environment."
+        type: string
+        default: ""
+      pages-project:
+        description: "astro-site: the Cloudflare Pages project."
+        type: string
+        default: ""
+      cloudflare-account-id:
+        description: "astro-site: the Cloudflare account holding the project."
+        type: string
+        default: ""
+      pages-development-branch:
+        description: "astro-site: the branch development deploys are uploaded as."
+        type: string
+        default: "dev"
+      package-name:
+        description: "python-library, npm-library: the package's registry name. Empty: read from pyproject.toml or package.json."
+        type: string
+        default: ""
+      npm-registry:
+        description: "npm-library: the registry the release publishes to."
+        type: string
+        default: "https://registry.npmjs.org"
+      working-directory:
+        description: "Where, in the checkout, the repository is (for the package name). For this repository's fixtures; consumers leave it."
+        type: string
+        default: "."
+    secrets:
+      cloudflare-api-token:
+        description: "astro-site: a Cloudflare API token that can read the Pages project (the deploy stage's token will do)."
+        required: false
+      discord-webhook-url:
+        description: "The Discord errors channel's webhook (the fleet's DISCORD_WEBHOOK_URL_ERRORS). Without it a timeout still fails, and says it could not post."
+        required: false
+    outputs:
+      verified:
+        description: "\"true\" when the target runs this release, \"false\" when it did not say so in time, \"skipped\" when the profile has nothing to verify."
+        value: ${{ jobs.verify.outputs.verified }}
+      outcome:
+        description: "The verify job's status (success or failure), for the self-test, which runs a case meant to fail."
+        value: ${{ jobs.verify.outputs.outcome }}
+
+permissions:
+  contents: read
+
+jobs:
+  # What there is to verify, and whether the inputs name it. Nothing is
+  # read and no secret is used here.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      kind: ${{ steps.kind.outputs.kind }}
+      probe: ${{ steps.kind.outputs.probe }}
+      reason: ${{ steps.kind.outputs.reason }}
+    steps:
+      - name: Decide what to verify
+        id: kind
+        env:
+          PROFILE: ${{ inputs.profile }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ inputs.target }}
+          EXPECT_FAILURE: ${{ inputs.expect-failure }}
+          FAKE_SERVES: ${{ inputs.fake-serves }}
+          HANDLER: ${{ inputs.lambda-handler }}
+          URL: ${{ inputs.url }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+          ROLE: ${{ inputs.aws-role-arn }}
+          REGION: ${{ inputs.aws-region }}
+          FUNCTION: ${{ inputs.lambda-function-name }}
+          PAGES_PROJECT: ${{ inputs.pages-project }}
+          CF_ACCOUNT: ${{ inputs.cloudflare-account-id }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          case "${ENVIRONMENT}" in development|production) ;; *) fail "environment is '${ENVIRONMENT}': it is development or production." ;; esac
+          case "${TARGET}" in live|fake) ;; *) fail "target is '${TARGET}': it is live or fake." ;; esac
+          if [ "${TARGET}" != fake ] && { [ "${EXPECT_FAILURE}" = true ] || [ -n "${FAKE_SERVES}" ]; }; then
+            fail "expect-failure and fake-serves are for the self-test's stand-in (target: fake) only."
+          fi
+
+          reason=""
+          case "${PROFILE}" in
+            python-service)
+              if [ -n "${HANDLER}" ]; then kind=lambda
+              else
+                kind=none
+                reason="No lambda-handler: the deploy stage deployed nothing for this python-service, so there is nothing to verify."
+              fi ;;
+            api-service) kind=railway ;;
+            astro-site) kind=pages ;;
+            python-library|npm-library)
+              if [ "${ENVIRONMENT}" = development ]; then
+                kind=none
+                reason="A library is published only by a release, on main; development has no published version to check."
+              elif [ "${PROFILE}" = python-library ]; then kind=pypi
+              else kind=npm
+              fi ;;
+            terraform-infra)
+              kind=none
+              reason="Its check is a fresh plan showing no changes, which needs the state backend and the providers' credentials. Until the plan is a pipeline artifact, the repository's own Terraform workflow is where that is seen." ;;
+            shared-workflows)
+              kind=none
+              reason="Nothing is deployed: the release moves the major tag, and the fixtures ran against this commit before it was released." ;;
+            *) fail "Unknown profile '${PROFILE}'. The profiles are listed in the README, under \"Profiles\"." ;;
+          esac
+
+          if [ "${kind}" != none ]; then
+            [ -n "${VERSION}" ] || fail "No version: pass the deploy stage's deployed-version."
+            if [ "${TARGET}" = live ]; then
+              missing=""
+              case "${kind}" in
+                railway) [ -n "${URL}" ] || missing="url" ;;
+                pages) [ -n "${PAGES_PROJECT}" ] && [ -n "${CF_ACCOUNT}" ] || missing="pages-project and cloudflare-account-id" ;;
+                lambda) [ -n "${ROLE}" ] && [ -n "${REGION}" ] && [ -n "${FUNCTION}" ] && [ -n "${ARTIFACT_NAME}" ] && [ -n "${ARTIFACT_DIGEST}" ] \
+                  || missing="aws-role-arn, aws-region, lambda-function-name, artifact-name and artifact-digest" ;;
+              esac
+              [ -z "${missing}" ] || fail "${PROFILE} verifies ${kind}: pass ${missing}."
+            fi
+          fi
+
+          # What the poll asks. The stand-in is a service, whatever the
+          # profile, so the self-test drives the same poll, record, alarm
+          # and failure as a live run.
+          case "${kind}" in
+            railway) probe=http ;;
+            none) probe="" ;;
+            *) probe="${kind}" ;;
+          esac
+          [ "${TARGET}" = fake ] && [ "${kind}" != none ] && probe=http
+          {
+            echo "kind=${kind}"
+            echo "probe=${probe}"
+            echo "reason=${reason}"
+          } >> "$GITHUB_OUTPUT"
+          echo "${PROFILE} in ${ENVIRONMENT}: ${kind} (${TARGET}), asked by the ${probe:-no} probe"
+
+  verify:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # Only the self-test's planned failure: the job fails as a live one
+    # would, and the self-test reads `outcome` to prove it did, but its own
+    # run stays green.
+    continue-on-error: ${{ inputs.target == 'fake' && inputs.expect-failure }}
+    permissions:
+      contents: read
+      statuses: write # the record: a commit status on the release's commit
+      packages: read # api-service: the GHCR deploy record
+      id-token: write # python-service: the Lambda's OIDC role
+    outputs:
+      verified: ${{ steps.result.outputs.verified }}
+      outcome: ${{ steps.outcome.outputs.outcome }}
+    env:
+      KIND: ${{ needs.plan.outputs.kind }}
+      TARGET: ${{ inputs.target }}
+      PROFILE: ${{ inputs.profile }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+      BUILD_VERSION: ${{ inputs.build-version }}
+    steps:
+      - name: Nothing to verify
+        if: needs.plan.outputs.kind == 'none'
+        env:
+          REASON: ${{ needs.plan.outputs.reason }}
+        run: |
+          echo "::notice title=verify skipped (${PROFILE}, ${ENVIRONMENT})::${REASON}"
+          printf '### verify: skipped (%s, %s)\n\n%s\n' "${PROFILE}" "${ENVIRONMENT}" "${REASON}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- python-service: the zip the function should be running -----------
+
+      - name: "Lambda: take the build stage's artifact"
+        id: artifact
+        if: needs.plan.outputs.kind == 'lambda' && inputs.target == 'live'
+        uses: $/.github/actions/fetch-artifact
+        with:
+          name: ${{ inputs.artifact-name }}
+          digest: ${{ inputs.artifact-digest }}
+
+      - name: "Lambda: what the function should run"
+        id: zip
+        if: steps.artifact.outputs.path != ''
+        env:
+          DIR: ${{ steps.artifact.outputs.path }}
+        run: |
+          set -euo pipefail
+          zip="${DIR}/lambda/worker.zip"
+          [ -f "${zip}" ] || { echo "::error::The artifact has no lambda/worker.zip."; exit 1; }
+          # Lambda reports CodeSha256, the base64 SHA-256 of the zip.
+          echo "code-sha256=$(openssl dgst -sha256 -binary "${zip}" | base64)" >> "$GITHUB_OUTPUT"
+
+      - name: "Lambda: assume the deploy role, which may read the function"
+        if: needs.plan.outputs.kind == 'lambda' && inputs.target == 'live'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # ---- api-service: the deploy record ----------------------------------
+      #
+      # The deploy stage moves <environment>-deployed to the image only after
+      # Railway reports that deployment healthy. A service on the pipeline
+      # pulls an image, so its /version has no commit to report, and a dev
+      # build reports the same version as every other build of that commit's
+      # declared version: the record is what says which image is serving.
+      - name: "Railway: the deploy record holds this version's image"
+        id: record
+        if: needs.plan.outputs.kind == 'railway' && inputs.target == 'live'
+        env:
+          REPOSITORY: ${{ inputs.image-repository }}
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          repo="${REPOSITORY:-ghcr.io/${GITHUB_REPOSITORY}}"
+          repo="${repo,,}"
+          export REGISTRY_AUTH_FILE="${RUNNER_TEMP}/ghcr-auth.json"
+          skopeo login ghcr.io --username "${ACTOR}" --password-stdin <<< "${TOKEN}" > /dev/null
+          config_of() {
+            local raw digest
+            raw="$(skopeo inspect --raw --retry-times 3 "docker://$1")" || return 1
+            # An index (a multi-platform push) names the image per platform.
+            if jq -e '.manifests' <<< "${raw}" > /dev/null; then
+              digest="$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")][0].digest // empty' <<< "${raw}")"
+              raw="$(skopeo inspect --raw --retry-times 3 "docker://${1%:*}@${digest}")" || return 1
+            fi
+            jq -r '.config.digest // empty' <<< "${raw}"
+          }
+          record="${repo}:${ENVIRONMENT}-deployed"
+          pushed="${repo}:${VERSION//+/_}"
+          ok=false
+          if ! deployed="$(config_of "${record}" 2> "${RUNNER_TEMP}/record.err")"; then
+            reason="The deploy record ${record} could not be read: $(tail -n1 "${RUNNER_TEMP}/record.err")"
+          elif ! wanted="$(config_of "${pushed}" 2> "${RUNNER_TEMP}/record.err")"; then
+            reason="${pushed}, the image deployed for ${VERSION}, could not be read: $(tail -n1 "${RUNNER_TEMP}/record.err")"
+          elif [ -z "${deployed}" ] || [ "${deployed}" != "${wanted}" ]; then
+            reason="The deploy record ${record} holds ${deployed:-nothing}, not ${pushed} (${wanted})."
+          else
+            ok=true
+            reason="${record} holds ${pushed} (${wanted})."
+          fi
+          echo "ok=${ok}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+          echo "${reason}"
+
+      # ---- The stand-in (target: fake) ---------------------------------------
+      #
+      # A small HTTP service in this job: /health and /version as the fleet's
+      # APIs answer them, reporting the version the deploy stage's stand-in
+      # recorded (or `fake-serves`), and a /discord that keeps what is posted
+      # to it.
+      - name: "Stand-in: read what the deploy stage's stand-in runs"
+        if: needs.plan.outputs.kind != 'none' && inputs.target == 'fake'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fake-target-${{ inputs.profile }}-${{ inputs.environment }}
+          path: ${{ runner.temp }}/fake-target
+
+      - name: "Stand-in: serve it"
+        id: fake
+        if: needs.plan.outputs.kind != 'none' && inputs.target == 'fake'
+        env:
+          FAKE_SERVES: ${{ inputs.fake-serves }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/fake-verify"
+          mkdir -p "${dir}"
+          record="$(find "${RUNNER_TEMP}/fake-target" -name record.json -print -quit 2> /dev/null || true)"
+          # A library has no deploy record: the stand-in registry has the
+          # version that was released.
+          serves="${FAKE_SERVES:-$( [ -n "${record}" ] && jq -r '.version' "${record}" || echo "${VERSION}")}"
+          port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+          cat > "${dir}/stand-in.py" <<'PY'
+          import json, os, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          serves, posts = sys.argv[2], sys.argv[3]
+          class Handler(BaseHTTPRequestHandler):
+              def answer(self, code, body):
+                  data = json.dumps(body).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+              def do_GET(self):
+                  if self.path == "/health":
+                      self.answer(200, {"status": "ok"})
+                  elif self.path == "/version":
+                      self.answer(200, {"version": serves, "commit": None})
+                  else:
+                      self.answer(404, {"error": "not found"})
+              def do_POST(self):
+                  body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                  if self.path != "/discord":
+                      return self.answer(404, {"error": "not found"})
+                  with open(posts, "ab") as f:
+                      f.write(body.rstrip(b"\n") + b"\n")
+                  self.send_response(204)
+                  self.end_headers()
+          HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+          PY
+          nohup python3 "${dir}/stand-in.py" "${port}" "${serves}" "${dir}/discord.jsonl" > "${dir}/server.log" 2>&1 &
+          for _ in $(seq 1 50); do
+            curl -s -o /dev/null "http://127.0.0.1:${port}/health" && break
+            sleep 0.2
+          done
+          {
+            echo "url=http://127.0.0.1:${port}"
+            echo "dir=${dir}"
+          } >> "$GITHUB_OUTPUT"
+          echo "The stand-in serves ${serves} on port ${port}."
+
+      # ---- Libraries: the package's name -----------------------------------
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: (needs.plan.outputs.kind == 'pypi' || needs.plan.outputs.kind == 'npm') && inputs.package-name == ''
+        with:
+          persist-credentials: false
+
+      - name: "Library: the package's name"
+        id: package
+        if: needs.plan.outputs.kind == 'pypi' || needs.plan.outputs.kind == 'npm'
+        working-directory: ${{ inputs.package-name == '' && inputs.working-directory || '.' }}
+        env:
+          NAME: ${{ inputs.package-name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NAME}" ]; then
+            if [ "${KIND}" = pypi ]; then
+              NAME="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["name"])')"
+            else
+              NAME="$(jq -r '.name // empty' package.json)"
+            fi
+          fi
+          [ -n "${NAME}" ] || { echo "::error::No package name: pass package-name."; exit 1; }
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "${KIND}: ${NAME} ${VERSION}"
+
+      # ---- What to ask, and what counts --------------------------------------
+
+      - name: What counts as verified
+        id: check
+        if: needs.plan.outputs.kind != 'none'
+        env:
+          PROBE: ${{ needs.plan.outputs.probe }}
+          URL: ${{ inputs.url }}
+          FAKE_URL: ${{ steps.fake.outputs.url }}
+          CODE_SHA: ${{ steps.zip.outputs.code-sha256 }}
+          PAGES_PROJECT: ${{ inputs.pages-project }}
+          DEV_BRANCH: ${{ inputs.pages-development-branch }}
+          HAS_CF_TOKEN: ${{ secrets.cloudflare-api-token != '' }}
+        run: |
+          set -euo pipefail
+          url="${URL}"
+          want=""
+          case "${PROBE}" in
+            # A service: the action works out what its build may report
+            # from version and build-version.
+            http) [ "${TARGET}" = fake ] && url="${FAKE_URL}" ;;
+            lambda) want="Active/Successful:${CODE_SHA}" ;;
+            pages)
+              if [ "${HAS_CF_TOKEN}" != true ]; then
+                echo "::error::No cloudflare-api-token: pass the Cloudflare token as the stage's secret."
+                exit 1
+              fi
+              if [ -z "${url}" ]; then
+                if [ "${ENVIRONMENT}" = production ]; then url="https://${PAGES_PROJECT}.pages.dev"
+                else url="https://${DEV_BRANCH}.${PAGES_PROJECT}.pages.dev"; fi
+              fi
+              # The upload carries the version deployed exactly.
+              want="${VERSION}" ;;
+            pypi|npm) want="${VERSION}" ;;
+            *) echo "::error::No check for probe '${PROBE}'."; exit 1 ;;
+          esac
+          {
+            echo "url=${url}"
+            echo "want=${want}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ask the target until it runs this version
+        id: poll
+        if: needs.plan.outputs.kind != 'none' && steps.record.outputs.ok != 'false'
+        uses: $/.github/actions/verify-decision
+        env:
+          VERIFY_URL: ${{ steps.check.outputs.url }}
+          VERIFY_HEALTH_PATH: ${{ inputs.health-path }}
+          VERIFY_VERSION_PATH: ${{ inputs.version-path }}
+          VERIFY_FUNCTION: ${{ inputs.lambda-function-name }}
+          VERIFY_PACKAGE: ${{ steps.package.outputs.name }}
+          VERIFY_VERSION: ${{ inputs.version }}
+          VERIFY_REGISTRY: ${{ inputs.npm-registry }}
+          VERIFY_ENVIRONMENT: ${{ inputs.environment }}
+          VERIFY_CF_ACCOUNT: ${{ inputs.cloudflare-account-id }}
+          VERIFY_PAGES_PROJECT: ${{ inputs.pages-project }}
+          VERIFY_PAGES_DEV_BRANCH: ${{ inputs.pages-development-branch }}
+          VERIFY_ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.cloudflare-api-token }}
+        with:
+          kind: ${{ needs.plan.outputs.probe }}
+          want: ${{ steps.check.outputs.want }}
+          version: ${{ inputs.version }}
+          build-version: ${{ inputs.build-version }}
+          timeout-seconds: ${{ inputs.verify-timeout-seconds }}
+          initial-seconds: ${{ inputs.poll-initial-seconds }}
+          max-seconds: ${{ inputs.poll-max-seconds }}
+
+      # ---- The result: recorded either way, and the alarm when not ---------
+
+      - name: Verified or not
+        id: outcome-of-check
+        if: always() && needs.plan.outputs.kind != 'none'
+        env:
+          RECORD_OK: ${{ steps.record.outputs.ok }}
+          RECORD_REASON: ${{ steps.record.outputs.reason }}
+          POLL_VERIFIED: ${{ steps.poll.outputs.verified }}
+          POLL_REASON: ${{ steps.poll.outputs.reason }}
+          SHA: ${{ inputs.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          verified=false
+          if [ "${RECORD_OK}" = false ]; then
+            reason="${RECORD_REASON}"
+          elif [ "${POLL_VERIFIED}" = true ]; then
+            verified=true
+            reason="${POLL_REASON}${RECORD_REASON:+ ${RECORD_REASON}}"
+          elif [ "${POLL_VERIFIED}" = false ]; then
+            reason="${POLL_REASON}"
+          else
+            reason="The stage stopped before it could ask the target; see the steps above."
+          fi
+          if [ "${verified}" = true ]; then
+            state=success
+            description="verified ${VERSION}"
+          else
+            state=failure
+            description="not verified ${VERSION}: ${reason}"
+          fi
+          {
+            echo "verified=${verified}"
+            echo "reason=${reason}"
+            echo "state=${state}"
+            # A commit status description holds 140 characters.
+            echo "description=${description:0:140}"
+            echo "context=pipeline/verify (${ENVIRONMENT})"
+            echo "sha=${SHA}"
+          } >> "$GITHUB_OUTPUT"
+          echo "${state}: ${reason}"
+
+      # The errors channel hears of it from here, in words, as well as from
+      # the failed run. Not posting is a warning, not a second failure: the
+      # job fails either way.
+      - name: Tell the Discord errors channel
+        id: discord
+        if: always() && steps.outcome-of-check.outputs.verified == 'false'
+        env:
+          WEBHOOK: ${{ inputs.target == 'fake' && format('{0}/discord', steps.fake.outputs.url) || secrets.discord-webhook-url }}
+          REASON: ${{ steps.outcome-of-check.outputs.reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK}" ] || [ "${WEBHOOK}" = /discord ]; then
+            echo "::warning::No discord-webhook-url: the errors channel was not told. Pass DISCORD_WEBHOOK_URL_ERRORS as the stage's secret."
+            exit 0
+          fi
+          content="$(printf '**verify failed**: %s %s is not verified in %s.\n%s\n%s' \
+            "${GITHUB_REPOSITORY}" "${VERSION}" "${ENVIRONMENT}" "${REASON}" "${RUN_URL}")"
+          # No mentions, whatever the reason text holds.
+          if jq -cn --arg c "${content:0:1900}" '{content: $c, allowed_mentions: {parse: []}}' \
+              | curl -sS --fail-with-body --retry 3 --retry-all-errors --max-time 30 \
+                  -H "Content-Type: application/json" --data-binary @- "${WEBHOOK}" > /dev/null; then
+            echo "posted=true" >> "$GITHUB_OUTPUT"
+            echo "Posted to the errors channel."
+          else
+            echo "::warning::The post to the Discord errors channel failed."
+          fi
+
+      # The record a later run and the release reconciler read: the newest
+      # status of this context on the release's commit, which the release
+      # tag names. Re-running the stage writes it again, and the newest wins.
+      - name: Record the result on the commit
+        if: always() && steps.outcome-of-check.outputs.state != '' && inputs.target == 'live'
+        env:
+          TOKEN: ${{ github.token }}
+          STATE: ${{ steps.outcome-of-check.outputs.state }}
+          CONTEXT: ${{ steps.outcome-of-check.outputs.context }}
+          DESCRIPTION: ${{ steps.outcome-of-check.outputs.description }}
+          SHA: ${{ steps.outcome-of-check.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          jq -cn --arg state "${STATE}" --arg context "${CONTEXT}" --arg description "${DESCRIPTION}" --arg url "${RUN_URL}" \
+            '{state: $state, context: $context, description: $description, target_url: $url}' \
+            | curl -sS --fail-with-body --retry 5 --retry-all-errors --max-time 30 \
+                -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                --data-binary @- "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${SHA}" > /dev/null
+          echo "${CONTEXT} on ${SHA}: ${STATE}"
+
+      # The stand-in's record: the same fields, and what the stand-in
+      # Discord was sent, kept in the run as an artifact. Overwritten by the
+      # next verify of the same profile and environment, as a commit status
+      # is replaced by the next of its context.
+      - name: "Stand-in: record the result"
+        if: always() && steps.outcome-of-check.outputs.state != '' && inputs.target == 'fake'
+        env:
+          DIR: ${{ steps.fake.outputs.dir }}
+          STATE: ${{ steps.outcome-of-check.outputs.state }}
+          CONTEXT: ${{ steps.outcome-of-check.outputs.context }}
+          DESCRIPTION: ${{ steps.outcome-of-check.outputs.description }}
+          SHA: ${{ steps.outcome-of-check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${DIR}"
+          discord="[]"
+          [ -s "${DIR}/discord.jsonl" ] && discord="$(jq -cs '.' "${DIR}/discord.jsonl")"
+          jq -n --arg state "${STATE}" --arg context "${CONTEXT}" --arg description "${DESCRIPTION}" \
+            --arg sha "${SHA}" --arg version "${VERSION}" --argjson discord "${discord}" \
+            '{state: $state, context: $context, description: $description, sha: $sha, version: $version, discord: $discord}' \
+            > "${DIR}/record.json"
+          cat "${DIR}/record.json"
+
+      - name: "Stand-in: keep the record in the run"
+        if: always() && steps.outcome-of-check.outputs.state != '' && inputs.target == 'fake'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-record-${{ inputs.profile }}-${{ inputs.environment }}
+          path: ${{ steps.fake.outputs.dir }}/record.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+      - name: Result
+        id: result
+        if: always()
+        env:
+          NOTHING: ${{ needs.plan.outputs.kind == 'none' }}
+          VERIFIED: ${{ steps.outcome-of-check.outputs.verified }}
+          REASON: ${{ steps.outcome-of-check.outputs.reason }}
+          REPORTED: ${{ steps.poll.outputs.reported }}
+          CONTEXT: ${{ steps.outcome-of-check.outputs.context }}
+          SHA: ${{ steps.outcome-of-check.outputs.sha }}
+          POSTED: ${{ steps.discord.outputs.posted }}
+        run: |
+          set -euo pipefail
+          if [ "${NOTHING}" = true ]; then
+            echo "verified=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          verified="${VERIFIED:-false}"
+          echo "verified=${verified}" >> "$GITHUB_OUTPUT"
+          {
+            printf '### verify: %s (%s in %s, %s)\n\n' \
+              "$([ "${verified}" = true ] && echo verified || echo 'not verified')" "${PROFILE}" "${ENVIRONMENT}" "${TARGET}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Build | \`${BUILD_VERSION:-same}\` |"
+            echo "| Target reports | \`${REPORTED:-nothing}\` |"
+            echo "| Why | ${REASON:-the stage stopped early} |"
+            echo "| Recorded | \`${CONTEXT:-not recorded}\` on \`${SHA:-?}\` |"
+            [ "${verified}" = true ] || echo "| Errors channel | $([ "${POSTED}" = true ] && echo posted || echo 'not posted') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when not verified
+        if: always() && needs.plan.outputs.kind != 'none' && steps.result.outputs.verified != 'true'
+        env:
+          REASON: ${{ steps.outcome-of-check.outputs.reason }}
+        run: |
+          echo "::error title=verify failed (${PROFILE}, ${ENVIRONMENT})::${VERSION} is not verified: ${REASON:-the stage stopped early}"
+          exit 1
+
+      # Last, so it sees every step above, the failure included.
+      - name: Outcome
+        id: outcome
+        if: always()
+        env:
+          STATUS: ${{ job.status }}
+        run: echo "outcome=${STATUS}" >> "$GITHUB_OUTPUT"

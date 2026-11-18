@@ -1,0 +1,100 @@
+# The verify stage's poll (README, "Verify stage"): ask the target what it
+# runs, with backoff, until it reports one of the wanted values or the time
+# is up. The decisions are verify-decision.sh beside this file and what each
+# kind of target reports is probe.sh; scripts/test-verify-decision.sh proves
+# both. It only reads, and never fails itself: it reports `verified`, so the
+# stage can record the result and raise the alarm before it fails the job.
+#
+# The probe reads its inputs from the environment of the step that uses
+# this action (VERIFY_URL, VERIFY_FUNCTION and the rest, as probe.sh lists
+# them), so a value is never spliced into a command.
+#
+# Usage:
+#
+#   - uses: $/.github/actions/verify-decision
+#     id: poll
+#     env:
+#       VERIFY_URL: ${{ inputs.url }}
+#     with:
+#       kind: http
+#       version: ${{ inputs.version }}
+#       build-version: ${{ inputs.build-version }}
+#   # then steps.poll.outputs.verified is "true" or "false"
+
+name: verify-decision
+description: Poll a deployed target, read-only, until it reports the wanted version or the time is up.
+
+inputs:
+  kind:
+    description: "What to ask: http, pages, lambda, pypi or npm (probe.sh)."
+    required: true
+  want:
+    description: "Space-separated values the target may report and count as verified. Empty: what verify-decision.sh wants gives for version and build-version, the versions a service may report."
+    default: ""
+  version:
+    description: "With want empty: the version deployed."
+    default: ""
+  build-version:
+    description: "With want empty: the build stage's version."
+    default: ""
+  timeout-seconds:
+    description: "Give up once waiting again would pass this."
+    default: "600"
+  initial-seconds:
+    description: "The first wait between attempts; it doubles each attempt."
+    default: "5"
+  max-seconds:
+    description: "The longest wait between attempts."
+    default: "60"
+
+outputs:
+  verified:
+    description: "\"true\" when the target reported a wanted value, \"false\" when the time ran out."
+    value: ${{ steps.poll.outputs.verified }}
+  reported:
+    description: "What the target last reported; empty when it never answered."
+    value: ${{ steps.poll.outputs.reported }}
+  reason:
+    description: "Why, in one line."
+    value: ${{ steps.poll.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - id: poll
+      shell: bash
+      env:
+        KIND: ${{ inputs.kind }}
+        WANT: ${{ inputs.want }}
+        VERSION: ${{ inputs.version }}
+        BUILD_VERSION: ${{ inputs.build-version }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        INITIAL_SECONDS: ${{ inputs.initial-seconds }}
+        MAX_SECONDS: ${{ inputs.max-seconds }}
+      run: |
+        set -euo pipefail
+        tool="${GITHUB_ACTION_PATH}/verify-decision.sh"
+        probe="${GITHUB_ACTION_PATH}/probe.sh"
+        if [ -z "${WANT}" ]; then
+          WANT="$("${tool}" wants "${VERSION}" "${BUILD_VERSION}" | tr '\n' ' ')"
+        fi
+        echo "Wanted: ${WANT}"
+        status=0
+        out="$("${tool}" poll "${TIMEOUT_SECONDS}" "${INITIAL_SECONDS}" "${MAX_SECONDS}" "${WANT}" -- "${probe}" "${KIND}")" || status=$?
+        verdict="$(sed -n 1p <<< "${out}")"
+        reported="$(sed -n 2p <<< "${out}")"
+        reason="$(sed -n 3p <<< "${out}")"
+        if [ "${status}" -eq 0 ] && [ "${verdict}" = verified ]; then
+          echo "verified=true" >> "${GITHUB_OUTPUT}"
+        elif [ "${status}" -eq 1 ] && [ "${verdict}" = timeout ]; then
+          echo "verified=false" >> "${GITHUB_OUTPUT}"
+        else
+          # A usage error is the stage's fault, not the target's.
+          echo "::error::verify-decision.sh poll exited ${status}: ${out}"
+          exit 1
+        fi
+        {
+          echo "reported=${reported}"
+          echo "reason=${reason}"
+        } >> "${GITHUB_OUTPUT}"
+        echo "${verdict}: ${reason}"
