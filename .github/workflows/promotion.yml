@@ -1,0 +1,24 @@
+# This repository's own dev → main promotion: keeps a pull request open
+# whenever dev has something to release, as every fleet repository's
+# promote.yml does. It calls the local promote.yml, the shared workflow
+# itself, so a change to it is used here first. (Named promotion.yml because
+# promote.yml is that shared workflow.)
+name: promotion
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    uses: ./.github/workflows/promote.yml
+    permissions:
+      contents: read
+    # The pull request is opened as the promote GitHub App, whose
+    # credentials are org secrets.
+    secrets:
+      PROMOTE_APP_CLIENT_ID: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+      PROMOTE_APP_PRIVATE_KEY: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
