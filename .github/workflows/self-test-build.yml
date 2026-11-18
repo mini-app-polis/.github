@@ -1,0 +1,137 @@
+# The build stage against one fixture, for self-test.yml: build it, build it
+# again in the same run, and take the artifact by digest as a later stage
+# would. It is a workflow of its own because a matrix of reusable-workflow
+# calls keeps only one leg's outputs, and each check here needs its own
+# fixture's.
+#
+#   first    stages-build.yml on the fixture.
+#   again    stages-build.yml on the same commit. It must take the artifact
+#            already in the run, not rebuild it, and report the same digest
+#            (README, "Running a stage twice").
+#   consume  The fetch-artifact action with first's name and digest, as
+#            release and deploy use it. A profile with nothing to build must
+#            have said so and reported no artifact.
+#
+# Nothing leaves the run: the artifact and its SBOM are uploaded to the run,
+# and the api-service image is saved to a tarball, never pushed.
+name: self-test-build
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "The fixture's profile; the fixture is fixtures/<profile>."
+        type: string
+        required: true
+      lambda-handler:
+        description: "python-service: the fixture's handler, so the Lambda zip is built."
+        type: string
+        default: ""
+      lambda-trigger:
+        description: "python-service: what invokes the fixture's handler."
+        type: string
+        default: "sqs"
+
+permissions:
+  contents: read
+
+jobs:
+  first:
+    uses: ./.github/workflows/stages-build.yml
+    permissions:
+      contents: read
+    with:
+      profile: ${{ inputs.profile }}
+      working-directory: fixtures/${{ inputs.profile }}
+      lambda-handler: ${{ inputs.lambda-handler }}
+      lambda-trigger: ${{ inputs.lambda-trigger }}
+
+  again:
+    needs: first
+    uses: ./.github/workflows/stages-build.yml
+    permissions:
+      contents: read
+    with:
+      profile: ${{ inputs.profile }}
+      working-directory: fixtures/${{ inputs.profile }}
+      lambda-handler: ${{ inputs.lambda-handler }}
+      lambda-trigger: ${{ inputs.lambda-trigger }}
+
+  consume:
+    needs: [first, again]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      PROFILE: ${{ inputs.profile }}
+      NAME: ${{ needs.first.outputs.artifact-name }}
+      DIGEST: ${{ needs.first.outputs.artifact-digest }}
+      AGAIN_NAME: ${{ needs.again.outputs.artifact-name }}
+      AGAIN_DIGEST: ${{ needs.again.outputs.artifact-digest }}
+      AGAIN_REUSED: ${{ needs.again.outputs.reused }}
+    steps:
+      # For the local actions; nothing is built from it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The second build took the first's artifact
+        id: check
+        run: |
+          set -euo pipefail
+          case "${PROFILE}" in
+            terraform-infra|shared-workflows)
+              if [ -n "${NAME}${DIGEST}${AGAIN_NAME}${AGAIN_DIGEST}" ]; then
+                echo "::error::${PROFILE} has nothing to build, but the build reported an artifact."
+                exit 1
+              fi
+              echo "${PROFILE}: no artifact, as the profile has none."
+              echo "consume=false" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
+          if [ -z "${NAME}" ] || [ -z "${DIGEST}" ]; then
+            echo "::error::${PROFILE} reported no artifact."
+            exit 1
+          fi
+          if [ "${AGAIN_REUSED}" != true ]; then
+            echo "::error::The second build on the same commit did not take the artifact already in the run."
+            exit 1
+          fi
+          if [ "${AGAIN_NAME}" != "${NAME}" ] || [ "${AGAIN_DIGEST}" != "${DIGEST}" ]; then
+            echo "::error::The second build reported ${AGAIN_NAME} ${AGAIN_DIGEST}; the first ${NAME} ${DIGEST}."
+            exit 1
+          fi
+          echo "${NAME}: built once, ${DIGEST} both times."
+          echo "consume=true" >> "$GITHUB_OUTPUT"
+
+      - name: Take the artifact by digest
+        id: artifact
+        if: steps.check.outputs.consume == 'true'
+        uses: ./.github/actions/fetch-artifact
+        with:
+          name: ${{ needs.first.outputs.artifact-name }}
+          digest: ${{ needs.first.outputs.artifact-digest }}
+
+      # What each profile's artifact must hold for the stage after it.
+      - name: It holds what the profile builds
+        if: steps.check.outputs.consume == 'true'
+        env:
+          DIR: ${{ steps.artifact.outputs.path }}
+        run: |
+          set -euo pipefail
+          cat "${DIR}/SHA256SUMS"
+          need() {
+            if ! compgen -G "${DIR}/$1" > /dev/null; then
+              echo "::error::${PROFILE}'s artifact has no $1."
+              exit 1
+            fi
+          }
+          case "${PROFILE}" in
+            python-library) need 'dist/*.whl'; need 'dist/*.tar.gz' ;;
+            python-service) need 'dist/*.whl'; need 'dist/*.tar.gz'; need lambda/worker.zip; need lambda/target.json ;;
+            api-service) need image/image.tar; need image/image-id ;;
+            astro-site) need site/site.tar.gz ;;
+            npm-library) need 'package/*.tgz' ;;
+            *) echo "::error::No expectation for ${PROFILE}."; exit 1 ;;
+          esac

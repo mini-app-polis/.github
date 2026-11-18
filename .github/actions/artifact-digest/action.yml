@@ -1,0 +1,45 @@
+# Seals the build stage's artifact directory, or checks one against its
+# seal, and gives the artifact's digest (README, "Build stage"). The work is
+# artifact-digest.sh beside this file, which fetch-artifact also runs, so
+# the build and every stage after it compute the digest the same way.
+#
+# Usage, as a step:
+#
+#   - uses: $/.github/actions/artifact-digest
+#     id: seal
+#     with:
+#       mode: seal
+#       directory: ${{ runner.temp }}/artifact
+
+name: artifact-digest
+description: Seal a build artifact's directory with SHA256SUMS, or check it against its seal, and output its digest.
+
+inputs:
+  mode:
+    description: "seal: write SHA256SUMS over the directory. check: fail unless the directory matches its SHA256SUMS."
+    required: true
+  directory:
+    description: "The artifact's directory."
+    required: true
+
+outputs:
+  digest:
+    description: "sha256:<hex>, the SHA-256 of the directory's SHA256SUMS."
+    value: ${{ steps.digest.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - id: digest
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        DIRECTORY: ${{ inputs.directory }}
+      run: |
+        set -euo pipefail
+        case "${MODE}" in
+          seal|check) ;;
+          *) echo "::error::mode must be seal or check, got '${MODE}'."; exit 1 ;;
+        esac
+        digest="$("${GITHUB_ACTION_PATH}/artifact-digest.sh" "${MODE}" "${DIRECTORY}")"
+        echo "digest=${digest}" >> "${GITHUB_OUTPUT}"

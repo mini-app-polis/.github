@@ -5,7 +5,8 @@
   "description": "Pipeline fixture for the astro-site profile. private: npm refuses to publish it.",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit false --rootDir src --outDir dist"
   },
   "devDependencies": {
     "typescript": "7.0.2"

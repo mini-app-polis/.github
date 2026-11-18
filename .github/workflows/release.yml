@@ -19,12 +19,20 @@
 #         pull-requests: write
 #       uses: mini-app-polis/.github/.github/workflows/release.yml@v3
 #
-# The action is referenced with `$/`, which resolves to this repository at
-# the commit of this workflow that is running, so a caller pinned to a tag
-# gets the action and lockfile from that same tag.
-#
 # Run by hand from the Actions tab, it is a dry run of this repository's
 # own next release, and nothing else: it changes nothing.
+#
+# In the same run as the build stage (stages-build.yml), a caller passes the
+# build's `artifact-name` and `artifact-digest`. The release then downloads
+# that artifact, refuses it unless the digest matches, and points
+# PIPELINE_ARTIFACT_DIR at it for semantic-release, so a repository's
+# publish step (an @semantic-release/exec publishCmd) ships the artifact that
+# was built and tested rather than building again. Without them nothing
+# changes: the release runs as it always has.
+#
+# The actions are named with `$/`, which resolves to this repository at
+# the commit of this workflow that is running, so a caller pinned to a tag
+# gets them, and the release tooling's lockfile, from that same tag.
 
 name: release
 
@@ -45,6 +53,14 @@ on:
         default: ""
       git-author-email:
         description: Author and committer email for the release commit. Used only with git-author-name.
+        type: string
+        default: ""
+      artifact-name:
+        description: "The build stage's artifact-name output. With artifact-digest, the release takes that artifact and sets PIPELINE_ARTIFACT_DIR to it for semantic-release's publish step."
+        type: string
+        default: ""
+      artifact-digest:
+        description: "The build stage's artifact-digest output (sha256:<hex>). The artifact is refused unless it matches."
         type: string
         default: ""
     secrets:
@@ -112,6 +128,34 @@ jobs:
           # version.
           fetch-depth: 0
           token: ${{ steps.app.outputs.token || github.token }}
+
+      # Both or neither: a name with no digest would take an artifact
+      # nothing vouches for.
+      - name: Check the build artifact inputs
+        if: inputs.artifact-name != '' || inputs.artifact-digest != ''
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+        run: |
+          if [ -z "${ARTIFACT_NAME}" ] || [ -z "${ARTIFACT_DIGEST}" ]; then
+            echo "::error::artifact-name and artifact-digest go together: pass both of the build stage's outputs, or neither."
+            exit 1
+          fi
+
+      - name: Take the build stage's artifact
+        id: artifact
+        if: inputs.artifact-name != '' && inputs.artifact-digest != ''
+        uses: $/.github/actions/fetch-artifact
+        with:
+          name: ${{ inputs.artifact-name }}
+          digest: ${{ inputs.artifact-digest }}
+
+      # Outside the checkout, so the release commit cannot pick it up.
+      - name: Hand the artifact to semantic-release
+        if: steps.artifact.outputs.path != ''
+        env:
+          ARTIFACT_DIR: ${{ steps.artifact.outputs.path }}
+        run: echo "PIPELINE_ARTIFACT_DIR=${ARTIFACT_DIR}" >> "$GITHUB_ENV"
 
       - name: Release
         id: release

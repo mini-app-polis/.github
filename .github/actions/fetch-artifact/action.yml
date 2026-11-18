@@ -1,0 +1,80 @@
+# How a stage after `build` takes the build's artifact: download it from this
+# run by name and fail unless its digest is the one `build` reported. A stage
+# that uses this never rebuilds what it ships, and never ships something
+# other than what was built and tested (README, "Build stage").
+#
+# The digest check is artifact-digest.sh in the sibling artifact-digest
+# action, run by path: a composite action cannot name a sibling action in
+# its own repository, only one in the caller's workspace.
+#
+# Usage, as a step in a job that needs the build:
+#
+#   - uses: $/.github/actions/fetch-artifact
+#     id: artifact
+#     with:
+#       name: ${{ needs.build.outputs.artifact-name }}
+#       digest: ${{ needs.build.outputs.artifact-digest }}
+#   # then read ${{ steps.artifact.outputs.path }}
+
+name: fetch-artifact
+description: Download the build stage's artifact from this run and fail unless its digest matches.
+
+inputs:
+  name:
+    description: "The artifact's name: the build stage's artifact-name output."
+    required: true
+  digest:
+    description: "The artifact's digest: the build stage's artifact-digest output (sha256:<hex>)."
+    required: true
+  path:
+    description: "Where to put it. Empty: a directory of its own under the runner's temporary directory."
+    default: ""
+
+outputs:
+  path:
+    description: "The directory holding the verified artifact."
+    value: ${{ steps.where.outputs.path }}
+  digest:
+    description: "The digest verified, the same as the digest input."
+    value: ${{ steps.verify.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    # Fail on a malformed request before downloading anything.
+    - id: where
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        DIGEST: ${{ inputs.digest }}
+        TARGET: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        if [ -z "${NAME}" ]; then
+          echo "::error::No artifact name: pass the build stage's artifact-name output."
+          exit 1
+        fi
+        if ! [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::'${DIGEST}' is not a digest of the form sha256:<64 hex digits>: pass the build stage's artifact-digest output."
+          exit 1
+        fi
+        echo "path=${TARGET:-${RUNNER_TEMP}/fetched-artifact/${NAME}}" >> "${GITHUB_OUTPUT}"
+
+    # By name, so a missing artifact fails here rather than leaving an empty
+    # directory for the digest check to misreport.
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ steps.where.outputs.path }}
+
+    - id: verify
+      shell: bash
+      env:
+        DIRECTORY: ${{ steps.where.outputs.path }}
+        DIGEST: ${{ inputs.digest }}
+        NAME: ${{ inputs.name }}
+      run: |
+        set -euo pipefail
+        digest="$("${GITHUB_ACTION_PATH}/../artifact-digest/artifact-digest.sh" verify "${DIRECTORY}" "${DIGEST}")"
+        echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+        echo "${NAME}: ${digest} verified"

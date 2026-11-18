@@ -1,6 +1,11 @@
 # A fixture for the python-library profile: the smallest repository the
 # profile's stages run green against. It is never packaged, published or
-# deployed; the classifier below makes PyPI refuse an upload outright.
+# deployed; the classifier below makes PyPI refuse an upload outright. The
+# build stage builds its wheel and sdist, which go no further than the run.
+[build-system]
+requires = ["uv_build>=0.9,<1"]
+build-backend = "uv_build"
+
 [project]
 name = "fixture-python-library"
 version = "0.0.0"
