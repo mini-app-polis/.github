@@ -51,3 +51,8 @@ paths:
       # The same `$/` form as stages-test.yml, for the evaluation stages'
       # action.
       - 'specifying action "\$/\.github/actions/evaluate-decision" in invalid format because ref is missing'
+  .github/workflows/required.yml:
+    ignore:
+      # The same `$/` form as stages-test.yml, so the organization ruleset's
+      # copy at the current major's tag calls security.yml from that tag.
+      - 'reusable workflow call "\$/\.github/workflows/security\.yml" at "uses" is not following the format'

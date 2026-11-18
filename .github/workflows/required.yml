@@ -1,0 +1,82 @@
+# The organization's required workflow: the security controls every
+# repository on the canonical pipeline inherits and cannot skip.
+#
+# It is not called by any repository. infra's organization ruleset
+# (`pipeline-main`) requires it on every pull request into the default
+# branch of each repository listed in pipeline.yaml's `on_pipeline`, read
+# from this repository at the current major's tag. GitHub runs it in the
+# target repository's context, from here, so a repository cannot remove or
+# edit it; the ruleset blocks the merge until it passes.
+#
+# GitHub runs ruleset workflows only on pull_request, pull_request_target
+# and merge_group events, never on events made with a workflow's
+# GITHUB_TOKEN, so the ruleset targets only the default branch, which every
+# change reaches through the promotion pull request. The release's own
+# commit is pushed as the promote App, the ruleset's one bypass.
+#
+# The same controls run inside every repository's own pipeline as the
+# `security` stage; this run is the copy the repository does not own. The
+# SBOM is a build artifact made by the pipeline, not a gate, so it is not
+# made here. Ruleset workflows cannot use the CodeQL actions, so static
+# analysis is semgrep, as in security.yml.
+
+name: required
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: required-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The target repository has no profile input here, so its language is
+  # read from its files, the way stages-test.yml maps a profile: Python
+  # where there is a pyproject.toml, Node where there is a package.json,
+  # and otherwise the Python audit with pip, which finds no dependencies
+  # and says so while the secret scan and static analysis still run.
+  language:
+    name: detect language
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      language: ${{ steps.detect.outputs.language }}
+      package-manager: ${{ steps.detect.outputs.package-manager }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect the language
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ -f pyproject.toml ]; then
+            language=python
+            if [ -f uv.lock ]; then pm=uv; else pm=pip; fi
+          elif [ -f package.json ]; then
+            language=typescript; pm=npm
+          else
+            language=python; pm=pip
+          fi
+          echo "Auditing as ${language} (${pm})."
+          {
+            echo "language=${language}"
+            echo "package-manager=${pm}"
+          } >> "$GITHUB_OUTPUT"
+
+  security:
+    needs: language
+    uses: $/.github/workflows/security.yml
+    permissions:
+      contents: read
+    with:
+      language: ${{ needs.language.outputs.language }}
+      package-manager: ${{ needs.language.outputs.package-manager }}
+      sbom: false
