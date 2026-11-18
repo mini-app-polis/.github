@@ -1,3 +1,16 @@
+# [3.36.0](https://github.com/mini-app-polis/.github/compare/v3.35.0...v3.36.0) (2026-11-18)
+
+
+### Bug Fixes
+
+* **self-test:** find the verify record by its context, not its folder ([8ae8403](https://github.com/mini-app-polis/.github/commit/8ae8403a8ec324dfaec6838cebb452f07a1ea193))
+* **verify:** show the self-test's planned failure as a passed step, not a failed job ([18753c6](https://github.com/mini-app-polis/.github/commit/18753c6f5422b97bcc62e35b8cc02606116cdf03))
+
+
+### Features
+
+* **pipeline:** add the verify stage, polling the deployed target until it runs the release ([c89f6fc](https://github.com/mini-app-polis/.github/commit/c89f6fca51901d1ff71e3b31a8ff165f86b1e75e))
+
 # [3.35.0](https://github.com/mini-app-polis/.github/compare/v3.34.0...v3.35.0) (2026-11-18)
 
 
