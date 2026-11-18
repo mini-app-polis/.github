@@ -1,3 +1,10 @@
+# [3.35.0](https://github.com/mini-app-polis/.github/compare/v3.34.0...v3.35.0) (2026-11-18)
+
+
+### Features
+
+* **pipeline:** add the deploy stage, deploying the build's artifact once per version ([f79298e](https://github.com/mini-app-polis/.github/commit/f79298ef17eea74d67a1f4892084a807aa3dd665))
+
 # [3.34.0](https://github.com/mini-app-polis/.github/compare/v3.33.0...v3.34.0) (2026-11-18)
 
 
