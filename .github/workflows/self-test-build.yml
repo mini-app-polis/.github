@@ -405,7 +405,18 @@ jobs:
           expect() {
             if [ "$2" = "$3" ]; then echo "ok: $1 ($2)"; else echo "::error::$1: $2, wanted $3 (verified/outcome)"; failures=$((failures + 1)); fi
           }
-          record() { find "${RECORDS}" -path "*verify-record-${PROFILE}-$1/record.json" -print -quit 2> /dev/null || true; }
+          # Found by its context, not its folder: download-artifact unpacks a
+          # lone matching artifact straight into the path, with no folder
+          # named after it (a library has only a production record).
+          record() {
+            local f
+            while IFS= read -r f; do
+              if jq -e --arg c "pipeline/verify ($1)" '.context == $c' "$f" > /dev/null 2>&1; then
+                echo "$f"
+                return
+              fi
+            done < <(find "${RECORDS}" -name record.json 2> /dev/null)
+          }
           check() {
             if jq -e "$2" "$3" > /dev/null; then echo "ok: $1"; else echo "::error::$1: $(cat "$3")"; failures=$((failures + 1)); fi
           }
