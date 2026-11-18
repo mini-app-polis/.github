@@ -1,0 +1,157 @@
+# The evaluation stages' request and wait (README, "Evaluation stages"): ask
+# api-kaianolevine-com to evaluate one commit in one release phase, and,
+# when asked to wait, read the outcome back with backoff until it decides
+# or the time is up. The decisions are evaluate-decision.sh beside this
+# file; scripts/test-evaluate-decision.sh proves them against stand-in.py.
+# It never fails over what it found: it reports `result`, so the stage can
+# write its summary before it fails the job.
+#
+# The API's address and key come from the environment of the step that
+# uses this action (EVALUATE_API_URL, EVALUATE_API_KEY), so the key is
+# never an input and never spliced into a command.
+#
+# For the self-test only: with EVALUATE_STAND_IN set to a scenario and
+# EVALUATE_STAND_IN_PORT to a port, the action first starts stand-in.py on
+# that port of the job's loopback, and EVALUATE_API_URL must be that
+# address. It refuses to start one for any other address.
+#
+# Usage:
+#
+#   - uses: $/.github/actions/evaluate-decision
+#     id: evaluate
+#     env:
+#       EVALUATE_API_URL: ${{ inputs.api-url }}
+#       EVALUATE_API_KEY: ${{ secrets.api-key }}
+#     with:
+#       phase: pre-release
+#       repo: ${{ github.event.repository.name }}
+#       org: ${{ github.repository_owner }}
+#       sha: ${{ github.sha }}
+#       ref: ${{ github.ref_name }}
+#       wait: "true"
+#   # then steps.evaluate.outputs.result is pass, blocked, timeout, ...
+
+name: evaluate-decision
+description: Ask for a deterministic evaluation of one commit in one release phase, and optionally wait for its outcome.
+
+inputs:
+  phase:
+    description: "pre-release or post-release."
+    required: true
+  repo:
+    description: "Repository name, without the org."
+    required: true
+  org:
+    description: "Owning GitHub org."
+    required: true
+  sha:
+    description: "The full commit sha to evaluate."
+    required: true
+  ref:
+    description: "The branch or tag the commit is on, for the record; the sha is what is read."
+    required: true
+  wait:
+    description: "\"true\": read the outcome until it decides or the time is up. \"false\": ask, and report the request."
+    default: "false"
+  timeout-seconds:
+    description: "With wait: give up once waiting again would pass this."
+    default: "900"
+  initial-seconds:
+    description: "With wait: the first wait between reads; it doubles each read."
+    default: "10"
+  max-seconds:
+    description: "With wait: the longest wait between reads."
+    default: "60"
+
+outputs:
+  result:
+    description: "not-requested (the API did not accept the request), requested (accepted, and not waited for), or with wait: pass, blocked, timeout or unsupported."
+    value: ${{ steps.evaluate.outputs.result }}
+  message-id:
+    description: "The queue message the request became; empty when it was not accepted."
+    value: ${{ steps.evaluate.outputs.message-id }}
+  run-id:
+    description: "With wait: the run the outcome was read from; empty while nothing had arrived."
+    value: ${{ steps.evaluate.outputs.run-id }}
+  reason:
+    description: "Why, in one line."
+    value: ${{ steps.evaluate.outputs.reason }}
+  answer:
+    description: "With wait: the file holding the last outcome the API answered."
+    value: ${{ steps.evaluate.outputs.answer }}
+
+runs:
+  using: composite
+  steps:
+    - id: evaluate
+      shell: bash
+      env:
+        PHASE: ${{ inputs.phase }}
+        REPO: ${{ inputs.repo }}
+        ORG: ${{ inputs.org }}
+        SHA: ${{ inputs.sha }}
+        REF: ${{ inputs.ref }}
+        WAIT: ${{ inputs.wait }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        INITIAL_SECONDS: ${{ inputs.initial-seconds }}
+        MAX_SECONDS: ${{ inputs.max-seconds }}
+      run: |
+        set -euo pipefail
+        tool="${GITHUB_ACTION_PATH}/evaluate-decision.sh"
+        put() { echo "$1=$2" >> "${GITHUB_OUTPUT}"; }
+
+        if [ -n "${EVALUATE_STAND_IN:-}" ]; then
+          port="${EVALUATE_STAND_IN_PORT:-}"
+          if ! [[ "${port}" =~ ^[0-9]+$ ]] || [ "${EVALUATE_API_URL:-}" != "http://127.0.0.1:${port}" ]; then
+            echo "::error::The stand-in runs only on the loopback address EVALUATE_API_URL names."
+            exit 1
+          fi
+          record="${RUNNER_TEMP}/evaluate-stand-in.jsonl"
+          nohup python3 "${GITHUB_ACTION_PATH}/stand-in.py" "${port}" "${EVALUATE_STAND_IN}" "${record}" \
+            > "${RUNNER_TEMP}/evaluate-stand-in.log" 2>&1 &
+          for _ in $(seq 1 50); do
+            curl -s -o /dev/null "${EVALUATE_API_URL}/health" && break
+            sleep 0.2
+          done
+          echo "The stand-in answers '${EVALUATE_STAND_IN}' at ${EVALUATE_API_URL}; its record is ${record}."
+        fi
+
+        # A bad phase or sha is the stage's fault, not the API's.
+        body="$("${tool}" body "${PHASE}" "${REPO}" "${ORG}" "${SHA}" "${REF}")"
+
+        # The outcome is read only from evaluations that started after this
+        # moment, so a re-run decides on the evaluation it asked for, not on
+        # one an earlier attempt left behind.
+        since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if ! message_id="$("${tool}" request "${body}" 2> "${RUNNER_TEMP}/evaluate-request.err")"; then
+          reason="$(tail -n1 "${RUNNER_TEMP}/evaluate-request.err")"
+          put result not-requested
+          put reason "${reason}"
+          echo "not requested: ${reason}"
+          exit 0
+        fi
+        put message-id "${message_id}"
+        echo "Requested ${PHASE} evaluation of ${ORG}/${REPO}@${SHA}: message ${message_id:-not named}"
+
+        if [ "${WAIT}" != true ]; then
+          put result requested
+          put reason "The API accepted the request (message ${message_id:-not named}); the evaluation runs after this job."
+          exit 0
+        fi
+
+        answer="${RUNNER_TEMP}/evaluate-answer.json"
+        put answer "${answer}"
+        status=0
+        out="$(EVALUATE_ANSWER_FILE="${answer}" "${tool}" poll "${TIMEOUT_SECONDS}" "${INITIAL_SECONDS}" "${MAX_SECONDS}" \
+          "${REPO}" "${SHA}" "${PHASE}" "${since}")" || status=$?
+        verdict="$(sed -n 1p <<< "${out}")"
+        case "${status}:${verdict}" in
+          0:pass|1:blocked|3:timeout|4:unsupported) ;;
+          *)
+            echo "::error::evaluate-decision.sh poll exited ${status}: ${out}"
+            exit 1 ;;
+        esac
+        put result "${verdict}"
+        put run-id "$(sed -n 2p <<< "${out}")"
+        put reason "$(sed -n 3p <<< "${out}")"
+        echo "${verdict}: $(sed -n 3p <<< "${out}")"

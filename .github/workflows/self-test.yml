@@ -18,15 +18,15 @@
 # stage runs only as a dry run, in a scratch repository whose one remote is
 # a bare repository beside it; its re-run proof tags and pushes only there. No fixture names a contract suite, so the
 # contract stage, which calls the development API, skips against every one
-# and says so. A stage that would evaluate is not run here at all until it
-# has a mode that does not; the `pending` job names each such stage in the
-# run, so it is skipped in sight rather than left out.
+# and says so. The evaluation stages run with `target: fake`: the API they
+# ask is a stand-in on the job's loopback with a key of its own, so no
+# secret is read and no evaluation is posted.
 #
 # The fixture jobs call the stage workflows and actions that exist today.
-# Once pipeline.yml exists, `stages`, `build`, `fixture` and `pending` become one
-# matrix job that calls it for each profile, with the fixture's directory
-# as its working directory; README, "Testing the pipeline", says what
-# pipeline.yml needs for that.
+# Once pipeline.yml exists, `stages`, `build`, `fixture` and the evaluate
+# jobs become one matrix job that calls it for each profile, with the
+# fixture's directory as its working directory; README, "Testing the
+# pipeline", says what pipeline.yml needs for that.
 name: self-test
 
 on:
@@ -249,51 +249,162 @@ jobs:
           PROFILE: ${{ matrix.profile }}
         run: bash scripts/check-release-resume.sh "fixtures/${PROFILE}" .github/actions/semantic-release
 
-  # The stages of each profile that no fixture job runs yet, each with the
-  # reason, as a notice on the run and a table in this job's summary. The
-  # stages up to build, deploy and verify are not listed: `stages` and
-  # `build` run all of them for every profile, and each says itself when the
-  # profile has nothing for it. `release` runs in `fixture`, twice on one commit and re-run
-  # after it stops partway, the reconciler's `ref` included.
-  pending:
-    name: not run yet (${{ matrix.profile }})
+  # The evaluation stages' request and decisions, case by case: what
+  # blocks a release and what passes it, the backoff, and the request and
+  # poll against the stand-in API in each of its scenarios.
+  evaluate-decision:
+    name: evaluate decision check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every request, decide and poll case decides as it should
+        run: bash scripts/test-evaluate-decision.sh
+
+  # The evaluation stages (stages-evaluate.yml) against the stand-in API.
+  # Evaluation asks about a commit, not a profile's build, so each case runs
+  # once rather than per fixture. evaluate-pre passes on a clean evaluation,
+  # and again when re-run on the same commit; it fails, so the release that
+  # needs it would not run, on an ERROR and on an evaluation that never
+  # finishes. evaluate-post asks for the published release and skips, asking
+  # nothing, when nothing was published. The failing cases are
+  # expect-failure: their failing step fails as a live one would and is let
+  # through, and `evaluate` below reads their `outcome` to prove it.
+  evaluate-pre-clean:
+    uses: ./.github/workflows/stages-evaluate.yml
+    permissions: {}
+    with:
+      phase: pre-release
+      sha: ${{ github.sha }}
+      target: fake
+      fake-scenario: clean
+      poll-initial-seconds: 1
+      poll-max-seconds: 2
+
+  evaluate-pre-again:
+    needs: evaluate-pre-clean
+    uses: ./.github/workflows/stages-evaluate.yml
+    permissions: {}
+    with:
+      phase: pre-release
+      sha: ${{ github.sha }}
+      target: fake
+      fake-scenario: clean
+      poll-initial-seconds: 1
+      poll-max-seconds: 2
+
+  evaluate-pre-blocked:
+    uses: ./.github/workflows/stages-evaluate.yml
+    permissions: {}
+    with:
+      phase: pre-release
+      sha: ${{ github.sha }}
+      target: fake
+      fake-scenario: blocking
+      expect-failure: true
+      poll-initial-seconds: 1
+      poll-max-seconds: 2
+
+  evaluate-pre-unfinished:
+    uses: ./.github/workflows/stages-evaluate.yml
+    permissions: {}
+    with:
+      phase: pre-release
+      sha: ${{ github.sha }}
+      target: fake
+      fake-scenario: running
+      expect-failure: true
+      evaluate-timeout-seconds: 5
+      poll-initial-seconds: 1
+      poll-max-seconds: 2
+
+  # What the release stage outputs, for a run that published a release and
+  # for one that did not, so evaluate-post is wired as pipeline.yml wires it:
+  # from release outputs in the same run.
+  evaluate-release:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { profile: python-service, stages: "evaluate-pre evaluate-post" }
-          - { profile: api-service, stages: "evaluate-pre evaluate-post" }
-          - { profile: python-library, stages: "evaluate-pre evaluate-post" }
-          - { profile: astro-site, stages: "evaluate-pre evaluate-post" }
-          - { profile: npm-library, stages: "evaluate-pre evaluate-post" }
-          - { profile: terraform-infra, stages: "evaluate-pre evaluate-post" }
-          - { profile: shared-workflows, stages: "evaluate-pre evaluate-post" }
+    outputs:
+      published: ${{ steps.release.outputs.published }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+      unpublished: ${{ steps.release.outputs.unpublished }}
     steps:
-      - name: Name each stage not run, and why
+      - name: A release, as the release stage reports one
+        id: release
+        run: |
+          {
+            echo "published=true"
+            echo "version=1.2.3"
+            echo "tag=v1.2.3"
+            echo "sha=${GITHUB_SHA}"
+            echo "unpublished=false"
+          } >> "$GITHUB_OUTPUT"
+
+  evaluate-post-published:
+    needs: evaluate-release
+    uses: ./.github/workflows/stages-evaluate.yml
+    permissions: {}
+    with:
+      phase: post-release
+      published: ${{ needs.evaluate-release.outputs.published }}
+      version: ${{ needs.evaluate-release.outputs.version }}
+      tag: ${{ needs.evaluate-release.outputs.tag }}
+      sha: ${{ needs.evaluate-release.outputs.sha }}
+      target: fake
+
+  # A run that released nothing: the release stage leaves version and sha
+  # empty.
+  evaluate-post-unpublished:
+    needs: evaluate-release
+    uses: ./.github/workflows/stages-evaluate.yml
+    permissions: {}
+    with:
+      phase: post-release
+      published: ${{ needs.evaluate-release.outputs.unpublished }}
+      version: ""
+      sha: ""
+      target: fake
+
+  evaluate:
+    name: evaluate stages check
+    needs: [evaluate-pre-clean, evaluate-pre-again, evaluate-pre-blocked, evaluate-pre-unfinished, evaluate-post-published, evaluate-post-unpublished]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Passed when clean, blocked on an ERROR or no answer, skipped when unpublished
         env:
-          PROFILE: ${{ matrix.profile }}
-          STAGES: ${{ matrix.stages }}
+          CLEAN: ${{ needs.evaluate-pre-clean.outputs.result }}/${{ needs.evaluate-pre-clean.outputs.requested }}/${{ needs.evaluate-pre-clean.outputs.outcome }}
+          AGAIN: ${{ needs.evaluate-pre-again.outputs.result }}/${{ needs.evaluate-pre-again.outputs.requested }}/${{ needs.evaluate-pre-again.outputs.outcome }}
+          BLOCKED: ${{ needs.evaluate-pre-blocked.outputs.result }}/${{ needs.evaluate-pre-blocked.outputs.requested }}/${{ needs.evaluate-pre-blocked.outputs.outcome }}
+          UNFINISHED: ${{ needs.evaluate-pre-unfinished.outputs.result }}/${{ needs.evaluate-pre-unfinished.outputs.requested }}/${{ needs.evaluate-pre-unfinished.outputs.outcome }}
+          PUBLISHED: ${{ needs.evaluate-post-published.outputs.result }}/${{ needs.evaluate-post-published.outputs.requested }}/${{ needs.evaluate-post-published.outputs.outcome }}
+          UNPUBLISHED: ${{ needs.evaluate-post-unpublished.outputs.result }}/${{ needs.evaluate-post-unpublished.outputs.requested }}/${{ needs.evaluate-post-unpublished.outputs.outcome }}
+          CLEAN_RUN: ${{ needs.evaluate-pre-clean.outputs.run-id }}
+          CLEAN_MESSAGE: ${{ needs.evaluate-pre-clean.outputs.message-id }}
         run: |
           set -euo pipefail
-          {
-            echo "### ${PROFILE}: stages not run against the fixture yet"
-            echo
-            echo "| Stage | Why |"
-            echo "|---|---|"
-          } >> "${GITHUB_STEP_SUMMARY}"
-          for stage in ${STAGES}; do
-            case "${stage}" in
-              evaluate-pre|evaluate-post)
-                why="pipeline.yml has no ${stage} stage yet. Against a fixture it must run dry and post no evaluation, so it runs here only once it can." ;;
-              *)
-                why="pipeline.yml has no ${stage} stage yet; it runs here once it does." ;;
-            esac
-            echo "::notice title=${PROFILE}: ${stage} skipped::${why}"
-            echo "| \`${stage}\` | ${why} |" >> "${GITHUB_STEP_SUMMARY}"
-          done
+          failures=0
+          expect() {
+            if [ "$2" = "$3" ]; then echo "ok: $1 ($2)"; else echo "::error::$1: $2, wanted $3 (result/requested/outcome)"; failures=$((failures + 1)); fi
+          }
+          expect "pre-release passes a clean evaluation" "${CLEAN}" "pass/true/success"
+          expect "pre-release asks again on a re-run, and passes" "${AGAIN}" "pass/true/success"
+          expect "pre-release fails on an ERROR, so the release does not run" "${BLOCKED}" "blocked/true/failure"
+          expect "pre-release fails closed when the evaluation never finishes" "${UNFINISHED}" "timeout/true/failure"
+          expect "post-release asks for the published release" "${PUBLISHED}" "requested/true/success"
+          expect "post-release skips, asking nothing, when nothing was published" "${UNPUBLISHED}" "skipped/false/success"
+          [ -n "${CLEAN_RUN}" ] && [ -n "${CLEAN_MESSAGE}" ] && echo "ok: the pass names its run and request" \
+            || { echo "::error::the pass did not name its run (${CLEAN_RUN:-none}) and request (${CLEAN_MESSAGE:-none})"; failures=$((failures + 1)); }
+          [ "${failures}" -eq 0 ]
 
   # One result for the whole stage, so main's ruleset can require one check
   # whose name does not change as jobs are added above. It runs whatever
@@ -301,7 +412,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [workflow-checks, security-typescript, stages, build, artifact-digest, deploy-decision, verify-decision, fixture-workflows, fixture, pending]
+    needs: [workflow-checks, security-typescript, stages, build, artifact-digest, deploy-decision, verify-decision, evaluate-decision, evaluate, fixture-workflows, fixture]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
