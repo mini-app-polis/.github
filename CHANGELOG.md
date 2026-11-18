@@ -1,3 +1,10 @@
+# [3.37.0](https://github.com/mini-app-polis/.github/compare/v3.36.0...v3.37.0) (2026-11-18)
+
+
+### Features
+
+* **pipeline:** add the evaluation stages, gating the release on a pre-release evaluation ([b63caea](https://github.com/mini-app-polis/.github/commit/b63caea40db0105bc43541963793b3f0124f7d33))
+
 # [3.36.0](https://github.com/mini-app-polis/.github/compare/v3.35.0...v3.36.0) (2026-11-18)
 
 
