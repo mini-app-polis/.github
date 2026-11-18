@@ -101,8 +101,9 @@ jobs:
         with:
           client-id: ${{ secrets.app-client-id }}
           private-key: ${{ secrets.app-private-key }}
+          # What the promote App holds: Contents and Pull requests. Asking
+          # for anything more fails the token.
           permission-contents: write
-          permission-issues: write
           permission-pull-requests: write
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
