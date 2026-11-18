@@ -693,10 +693,10 @@ commit and phase that started at or after `since` (the moment the stage
 asked): its state (`pending`, `running` or `complete`), its findings counted
 by severity, and the findings themselves. Findings are only ever added to a
 run, so a blocking one decides at once, finished or not. A pass needs
-`complete`, and today the evaluator closes only a clean evaluation (with its
-one `SUCCESS` row); an evaluation with `WARN` findings and no `ERROR` stays
-`running` and times out, failing closed, until the evaluator closes those
-too. An API without the outcome route (404) fails at once, as `unsupported`.
+`complete`: an evaluation holding its `SUCCESS` row (a clean one), or one
+whose findings stopped arriving the API's settle period ago. The evaluator
+computes every check, then posts a repository's findings together, so a
+quiet run has finished. An API without the outcome route (404) fails at once, as `unsupported`.
 The decisions are `evaluate-decision.sh` in the `evaluate-decision` action;
 `scripts/test-evaluate-decision.sh` proves them against `stand-in.py`, a
 stand-in for the two API routes.
@@ -724,9 +724,9 @@ like `GET /v1/evaluations`, it is public and read-only.
 | `published` | empty | `post-release`: `release`'s `published`; anything but `true` skips |
 | `repo`, `org` | the calling repository | What to evaluate |
 | `api-url` | `https://api.kaianolevine.com` | Base URL of api-kaianolevine-com |
-| `timeout-minutes` | `30` | How long the job may run |
-| `evaluate-timeout-seconds` | `900` | `pre-release`: how long to wait for a decision before failing closed |
-| `poll-initial-seconds`, `poll-max-seconds` | `10`, `60` | `pre-release`: the backoff between reads |
+| `timeout-minutes` | `10` | How long the job may run |
+| `evaluate-timeout-seconds` | `300` | `pre-release`: how long to wait for a decision before failing closed. A deterministic evaluation finishes within a minute of being picked up |
+| `poll-initial-seconds`, `poll-max-seconds` | `5`, `20` | `pre-release`: the backoff between reads |
 | `target` | `live` | `fake` is the self-test's stand-in. Consumers leave it, and `fake-scenario` and `expect-failure`, which only it takes |
 
 | Output | Meaning |

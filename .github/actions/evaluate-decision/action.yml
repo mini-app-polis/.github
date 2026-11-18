@@ -55,7 +55,7 @@ inputs:
     default: "false"
   timeout-seconds:
     description: "With wait: give up once waiting again would pass this."
-    default: "900"
+    default: "300"
   initial-seconds:
     description: "With wait: the first wait between reads; it doubles each read."
     default: "10"
