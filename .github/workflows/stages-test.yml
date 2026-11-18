@@ -1,0 +1,759 @@
+# The pipeline's stages before `build`, for any profile: lint and type
+# check, unit tests, integration tests, contract tests and security, each a
+# job of its own so a failure names the kind of check that failed. `test` is
+# the gate over all of them, and the one check a ruleset requires; its name
+# does not change as stages are added.
+#
+# Every stage appears in every run. A stage the profile has nothing for
+# still runs, writes why in its job summary and as a notice on the run, and
+# passes, so a missing stage shows rather than vanishing from the graph.
+#
+# pipeline.yml calls this as one job, and consumers reach it through
+# pipeline.yml (README, "Test stages"). It can also be called on its own:
+#
+#   jobs:
+#     stages:
+#       uses: mini-app-polis/.github/.github/workflows/stages-test.yml@v3
+#       with:
+#         profile: api-service
+#         postgres-image: pgvector/pgvector:pg16
+#         postgres-database: kaianolevine_test
+#       secrets: inherit
+#
+# The actions and the security workflow are named with `$/`, which resolves
+# to this repository at the commit of this file, so a caller pinned to a tag
+# gets every part of the stages from that same tag, and this repository's
+# self-test runs the parts it is changing.
+
+name: stages-test
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "The repository's profile (README, \"Profiles\"): python-service, api-service, python-library, astro-site, npm-library, terraform-infra or shared-workflows."
+        type: string
+        required: true
+      working-directory:
+        description: "The directory, within the checkout, holding the repository to test. For this repository's fixtures; consumers leave it."
+        type: string
+        default: "."
+      timeout-minutes:
+        description: "How long each stage's job may run. Raise it for a longer suite."
+        type: number
+        default: 30
+      python-version:
+        description: "Python profiles: match the runtime the repository deploys to."
+        type: string
+        default: "3.14"
+      typecheck:
+        description: "Python profiles: the type-check command lint runs (TEST-012)."
+        type: string
+        default: "uv run mypy src/"
+      unit-pytest-args:
+        description: "Python profiles: appended to the unit stage's pytest. The integration tests' directory is left out of it whatever this says."
+        type: string
+        default: "--cov=src --cov-report=term-missing"
+      integration-tests:
+        description: "Python profiles: the directory holding the integration tests. Absent, the integration stage is skipped and says so."
+        type: string
+        default: "tests/integration"
+      integration-pytest-args:
+        description: "Python profiles: appended to the integration stage's pytest."
+        type: string
+        default: ""
+      postgres-image:
+        description: "A Postgres image for the integration stage's service container, by exact tag or digest (pgvector/pgvector:pg16). Empty starts none."
+        type: string
+        default: ""
+      postgres-database:
+        description: "The service container's database. It must end in _test, as the fleet's suites require."
+        type: string
+        default: "pipeline_test"
+      terraform-dir:
+        description: "A Python repository's Terraform directory, checked in lint; for terraform-infra, the directory to check (default: the repository)."
+        type: string
+        default: ""
+      terraform-version:
+        description: "Match what applies it from the workstation, so fmt agrees."
+        type: string
+        default: "1.16.2"
+      node-version:
+        description: "Node profiles: the Node release line."
+        type: string
+        default: "22"
+      unit-script:
+        description: "Node profiles: the package.json script the unit stage runs. Absent from package.json, the stage is skipped and says so."
+        type: string
+        default: "test"
+      integration-script:
+        description: "Node profiles: the package.json script the integration stage runs. Absent from package.json, the stage is skipped and says so."
+        type: string
+        default: "test:integration"
+      contract-suite:
+        description: "The contract suite to run: common-python-utils (the fleet's shared suite), or empty for none."
+        type: string
+        default: ""
+      contract-suite-version:
+        description: "The common-python-utils release whose suite runs. Empty: the version the repository's uv.lock holds."
+        type: string
+        default: ""
+      contract-api-url:
+        description: "The development API the contract suite calls. A production host is refused."
+        type: string
+        default: "https://dev-api.kaianolevine.com"
+      sbom:
+        description: "Have the security stage generate and retain a CycloneDX SBOM."
+        type: boolean
+        default: true
+    secrets:
+      CONTRACT_SUITE_API_KEY:
+        description: "The development API's contract-suite key (dev_...). Needed only when contract-suite is set."
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  # Package managers retry their own registry fetches with backoff; these
+  # raise each one's attempt count so a registry blip is ridden out rather
+  # than failing the stage.
+  UV_HTTP_RETRIES: "5"
+  PIP_RETRIES: "5"
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
+
+jobs:
+  # What the profile means for the stages below: the tooling family each
+  # stage runs, and the language and package manager the security stage
+  # audits. An unknown profile fails here, before any stage runs.
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      family: ${{ steps.resolve.outputs.family }}
+      language: ${{ steps.resolve.outputs.language }}
+      package-manager: ${{ steps.resolve.outputs.package-manager }}
+    steps:
+      - name: Resolve the profile
+        id: resolve
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          # terraform-infra and shared-workflows have no package manager of
+          # their own. The Python audit with pip finds no dependencies, says
+          # so and passes; the secret scan and static analysis still run.
+          case "${PROFILE}" in
+            python-service|api-service|python-library)
+              family=python; language=python; pm=uv ;;
+            astro-site|npm-library)
+              family=node; language=typescript; pm=npm ;;
+            terraform-infra)
+              family=terraform; language=python; pm=pip ;;
+            shared-workflows)
+              family=workflows; language=python; pm=pip ;;
+            *)
+              echo "::error::Unknown profile '${PROFILE}'. The profiles are listed in the README, under \"Profiles\"."
+              exit 1 ;;
+          esac
+          {
+            echo "family=${family}"
+            echo "language=${language}"
+            echo "package-manager=${pm}"
+          } >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: profile
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: stage-lint-${{ github.workflow }}-${{ github.ref }}-${{ inputs.profile }}-${{ inputs.working-directory }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide what runs
+        id: plan
+        env:
+          FAMILY: ${{ needs.profile.outputs.family }}
+          PROFILE: ${{ inputs.profile }}
+          TF_DIR: ${{ inputs.terraform-dir }}
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "::notice title=lint skipped (${PROFILE})::$1"
+            printf '### lint: skipped (%s)\n\n%s\n' "${PROFILE}" "$1" >> "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          }
+          case "${FAMILY}" in
+            python)
+              echo "run=true" >> "$GITHUB_OUTPUT" ;;
+            node)
+              if [ -f pnpm-lock.yaml ]; then pm=pnpm
+              elif [ -f package-lock.json ]; then pm=npm
+              else
+                echo "::error::No pnpm-lock.yaml or package-lock.json: a Node profile installs from its lockfile."
+                exit 1
+              fi
+              { echo "run=true"; echo "pm=${pm}"; } >> "$GITHUB_OUTPUT" ;;
+            terraform)
+              { echo "run=true"; echo "tf-dir=${TF_DIR:-.}"; } >> "$GITHUB_OUTPUT" ;;
+            workflows)
+              skip "This profile's lint is workflow static analysis (workflow-checks.yml), which reads only workflow files and runs as part of the repository's own self-test, not here." ;;
+          esac
+
+      - name: Lint, format and type check (Python)
+        id: python
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'python'
+        uses: $/.github/actions/python-checks
+        with:
+          stage: lint
+          working-directory: ${{ inputs.working-directory }}
+          python-version: ${{ inputs.python-version }}
+          typecheck: ${{ inputs.typecheck }}
+          terraform-dir: ${{ inputs.terraform-dir }}
+          terraform-version: ${{ inputs.terraform-version }}
+
+      # pnpm's version comes from package.json's packageManager field.
+      - name: Set up pnpm
+        if: steps.plan.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Set up Node
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Type check and lint (Node)
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'node'
+        env:
+          PM: ${{ steps.plan.outputs.pm }}
+        run: |
+          set -euo pipefail
+          notes="${RUNNER_TEMP}/stage-notes.md"
+          has() { jq -e --arg s "$1" '.scripts[$s] // empty' package.json > /dev/null; }
+          if [ "${PM}" = pnpm ]; then pnpm install --frozen-lockfile; else npm ci --no-audit --no-fund; fi
+          if has typecheck; then
+            "${PM}" run typecheck
+            echo "- \`${PM} run typecheck\`" >> "${notes}"
+          else
+            echo "::warning title=lint::package.json has no typecheck script, so nothing typechecked this run."
+            echo "- No \`typecheck\` script in package.json: nothing typechecked." >> "${notes}"
+          fi
+          if has lint; then
+            "${PM}" run lint
+            echo "- \`${PM} run lint\`" >> "${notes}"
+          else
+            echo "::notice title=lint::package.json has no lint script."
+            echo "- No \`lint\` script in package.json." >> "${notes}"
+          fi
+
+      - name: Set up Terraform
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'terraform'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          # Plain terraform output; the wrapper only matters for steps that
+          # read stdout as outputs, and none here do.
+          terraform_wrapper: false
+
+      # -backend=false: validate needs the providers' schemas, not state or
+      # credentials, and nothing here plans or applies.
+      - name: Terraform fmt and validate
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'terraform'
+        env:
+          TF_DIR: ${{ steps.plan.outputs.tf-dir }}
+        run: |
+          set -euo pipefail
+          terraform -chdir="${TF_DIR}" fmt -check -recursive -diff
+          terraform -chdir="${TF_DIR}" init -backend=false -input=false
+          terraform -chdir="${TF_DIR}" validate
+          printf -- '- `terraform fmt -check`, `init -backend=false` and `validate` in `%s`\n' "${TF_DIR}" >> "${RUNNER_TEMP}/stage-notes.md"
+
+      - name: Report
+        if: always() && steps.plan.outputs.run == 'true'
+        env:
+          STATUS: ${{ job.status }}
+          PROFILE: ${{ inputs.profile }}
+          LOG: ${{ steps.python.outputs.log }}
+        run: |
+          {
+            printf '### lint: %s (%s)\n\n' "${STATUS}" "${PROFILE}"
+            if [ -f "${RUNNER_TEMP}/stage-notes.md" ]; then cat "${RUNNER_TEMP}/stage-notes.md"; fi
+            if [ -n "${LOG}" ] && [ -f "${LOG}" ]; then
+              printf '```\n'; grep -E '^(\$ |FAILED)' "${LOG}" || true; printf '```\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  unit:
+    needs: profile
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: stage-unit-${{ github.workflow }}-${{ github.ref }}-${{ inputs.profile }}-${{ inputs.working-directory }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide what runs
+        id: plan
+        env:
+          FAMILY: ${{ needs.profile.outputs.family }}
+          PROFILE: ${{ inputs.profile }}
+          UNIT_ARGS: ${{ inputs.unit-pytest-args }}
+          INTEGRATION_TESTS: ${{ inputs.integration-tests }}
+          SCRIPT: ${{ inputs.unit-script }}
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "::notice title=unit skipped (${PROFILE})::$1"
+            printf '### unit: skipped (%s)\n\n%s\n' "${PROFILE}" "$1" >> "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          }
+          case "${FAMILY}" in
+            python)
+              # The integration tests are their own stage, with the services
+              # they need, so the unit run leaves their directory out.
+              args="${UNIT_ARGS}"
+              if [ -n "${INTEGRATION_TESTS}" ] && [ -d "${INTEGRATION_TESTS}" ]; then
+                args="--ignore=${INTEGRATION_TESTS} ${args}"
+              fi
+              { echo "run=true"; echo "pytest-args=${args}"; } >> "$GITHUB_OUTPUT" ;;
+            node)
+              if [ -f pnpm-lock.yaml ]; then pm=pnpm
+              elif [ -f package-lock.json ]; then pm=npm
+              else
+                echo "::error::No pnpm-lock.yaml or package-lock.json: a Node profile installs from its lockfile."
+                exit 1
+              fi
+              if jq -e --arg s "${SCRIPT}" '.scripts[$s] // empty' package.json > /dev/null; then
+                { echo "run=true"; echo "pm=${pm}"; } >> "$GITHUB_OUTPUT"
+              else
+                skip "package.json has no \`${SCRIPT}\` script, so this repository has no unit tests for the stage to run."
+              fi ;;
+            terraform)
+              skip "Terraform has no unit tests in this profile; fmt and validate run in lint." ;;
+            workflows)
+              skip "This repository's workflows are tested by running them against fixture repositories (self-test.yml), not by a unit suite." ;;
+          esac
+
+      - name: Unit tests (Python)
+        id: python
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'python'
+        uses: $/.github/actions/python-checks
+        with:
+          stage: unit
+          working-directory: ${{ inputs.working-directory }}
+          python-version: ${{ inputs.python-version }}
+          pytest-args: ${{ steps.plan.outputs.pytest-args }}
+
+      - name: Set up pnpm
+        if: steps.plan.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Set up Node
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Unit tests (Node)
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'node'
+        env:
+          PM: ${{ steps.plan.outputs.pm }}
+          SCRIPT: ${{ inputs.unit-script }}
+        run: |
+          set -euo pipefail
+          if [ "${PM}" = pnpm ]; then pnpm install --frozen-lockfile; else npm ci --no-audit --no-fund; fi
+          "${PM}" run "${SCRIPT}"
+          echo "- \`${PM} run ${SCRIPT}\`" >> "${RUNNER_TEMP}/stage-notes.md"
+
+      - name: Report
+        if: always() && steps.plan.outputs.run == 'true'
+        env:
+          STATUS: ${{ job.status }}
+          PROFILE: ${{ inputs.profile }}
+          LOG: ${{ steps.python.outputs.log }}
+        run: |
+          {
+            printf '### unit: %s (%s)\n\n' "${STATUS}" "${PROFILE}"
+            if [ -f "${RUNNER_TEMP}/stage-notes.md" ]; then cat "${RUNNER_TEMP}/stage-notes.md"; fi
+            if [ -n "${LOG}" ] && [ -f "${LOG}" ]; then
+              printf '```\n'; grep -E '^(\$ |FAILED)' "${LOG}" || true; printf '```\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  integration:
+    needs: profile
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: stage-integration-${{ github.workflow }}-${{ github.ref }}-${{ inputs.profile }}-${{ inputs.working-directory }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    # Real Postgres, never SQLite (TEST-015), when the caller names an image.
+    # An empty image starts no container. The credentials are the
+    # container's own, on a database that lives only as long as this job.
+    #
+    # The image is the caller's, so zizmor cannot see whether it is pinned.
+    # The first step fails the stage unless it is an exact tag or a digest.
+    services:
+      postgres:
+        image: ${{ inputs.postgres-image }} # zizmor: ignore[unpinned-images]
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ inputs.postgres-database }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide what runs
+        id: plan
+        env:
+          FAMILY: ${{ needs.profile.outputs.family }}
+          PROFILE: ${{ inputs.profile }}
+          INTEGRATION_TESTS: ${{ inputs.integration-tests }}
+          INTEGRATION_ARGS: ${{ inputs.integration-pytest-args }}
+          SCRIPT: ${{ inputs.integration-script }}
+          POSTGRES_IMAGE: ${{ inputs.postgres-image }}
+          POSTGRES_DATABASE: ${{ inputs.postgres-database }}
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "::notice title=integration skipped (${PROFILE})::$1"
+            printf '### integration: skipped (%s)\n\n%s\n' "${PROFILE}" "$1" >> "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          }
+
+          # The fleet's integration suites find their database through
+          # TEST_DATABASE_URL, refuse one that is not local or not named
+          # *_test, and point the application at it through DATABASE_URL.
+          if [ -n "${POSTGRES_IMAGE}" ]; then
+            # Pinned, so the database the tests meet does not move under them.
+            case "${POSTGRES_IMAGE}" in
+              *@sha256:*) ;;
+              *:latest|*:latest@*) echo "::error::postgres-image '${POSTGRES_IMAGE}' is :latest; pin an exact tag or a digest."; exit 1 ;;
+              *:*) ;;
+              *) echo "::error::postgres-image '${POSTGRES_IMAGE}' has no tag; pin an exact tag or a digest."; exit 1 ;;
+            esac
+            case "${POSTGRES_DATABASE}" in
+              *_test) ;;
+              *) echo "::error::postgres-database '${POSTGRES_DATABASE}' must end in _test."; exit 1 ;;
+            esac
+            url="postgresql://postgres:postgres@localhost:5432/${POSTGRES_DATABASE}"
+            { echo "TEST_DATABASE_URL=${url}"; echo "DATABASE_URL=${url}"; } >> "$GITHUB_ENV"
+            echo "- Postgres service container \`${POSTGRES_IMAGE}\`, database \`${POSTGRES_DATABASE}\`, as \`TEST_DATABASE_URL\` and \`DATABASE_URL\`" >> "${RUNNER_TEMP}/stage-notes.md"
+          fi
+
+          case "${FAMILY}" in
+            python)
+              if [ -n "${INTEGRATION_TESTS}" ] && [ -d "${INTEGRATION_TESTS}" ]; then
+                { echo "run=true"; echo "pytest-args=${INTEGRATION_TESTS} ${INTEGRATION_ARGS}"; } >> "$GITHUB_OUTPUT"
+              else
+                skip "There is no \`${INTEGRATION_TESTS}\` directory, so this repository has no integration tests for the stage to run."
+              fi ;;
+            node)
+              if [ -f pnpm-lock.yaml ]; then pm=pnpm
+              elif [ -f package-lock.json ]; then pm=npm
+              else
+                echo "::error::No pnpm-lock.yaml or package-lock.json: a Node profile installs from its lockfile."
+                exit 1
+              fi
+              if jq -e --arg s "${SCRIPT}" '.scripts[$s] // empty' package.json > /dev/null; then
+                { echo "run=true"; echo "pm=${pm}"; } >> "$GITHUB_OUTPUT"
+              else
+                skip "package.json has no \`${SCRIPT}\` script, so this repository has no integration tests for the stage to run."
+              fi ;;
+            terraform)
+              skip "Terraform has no integration tests in this profile: nothing here may plan or apply against real infrastructure." ;;
+            workflows)
+              skip "This repository's workflows are tested by running them against fixture repositories (self-test.yml), not by an integration suite." ;;
+          esac
+
+      - name: Integration tests (Python)
+        id: python
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'python'
+        uses: $/.github/actions/python-checks
+        with:
+          stage: integration
+          working-directory: ${{ inputs.working-directory }}
+          python-version: ${{ inputs.python-version }}
+          pytest-args: ${{ steps.plan.outputs.pytest-args }}
+
+      - name: Set up pnpm
+        if: steps.plan.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Set up Node
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Integration tests (Node)
+        if: steps.plan.outputs.run == 'true' && needs.profile.outputs.family == 'node'
+        env:
+          PM: ${{ steps.plan.outputs.pm }}
+          SCRIPT: ${{ inputs.integration-script }}
+        run: |
+          set -euo pipefail
+          if [ "${PM}" = pnpm ]; then pnpm install --frozen-lockfile; else npm ci --no-audit --no-fund; fi
+          "${PM}" run "${SCRIPT}"
+          echo "- \`${PM} run ${SCRIPT}\`" >> "${RUNNER_TEMP}/stage-notes.md"
+
+      - name: Report
+        if: always() && steps.plan.outputs.run == 'true'
+        env:
+          STATUS: ${{ job.status }}
+          PROFILE: ${{ inputs.profile }}
+          LOG: ${{ steps.python.outputs.log }}
+        run: |
+          {
+            printf '### integration: %s (%s)\n\n' "${STATUS}" "${PROFILE}"
+            if [ -f "${RUNNER_TEMP}/stage-notes.md" ]; then cat "${RUNNER_TEMP}/stage-notes.md"; fi
+            if [ -n "${LOG}" ] && [ -f "${LOG}" ]; then
+              printf '```\n'; grep -E '^(\$ |FAILED)' "${LOG}" || true; printf '```\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The fleet's shared contract suite (contract/ in common-python-utils)
+  # against the development API: every endpoint in the catalog, called
+  # through the typed client the repository uses, so a response the API
+  # changes fails here before the repository meets it (TEST-016).
+  #
+  # The suite is taken from the common-python-utils sdist on PyPI, which
+  # ships contract/ and the suite's own uv.lock: by default the release the
+  # repository's uv.lock holds, checked against the hash that lock records.
+  # So the suite is the one written for the client this repository runs.
+  #
+  # It writes to the development API, so it runs one at a time in the group
+  # common-python-utils' own contract workflow uses, and is never cancelled
+  # partway. It refuses a production host before anything is fetched, and
+  # the suite's own guards refuse one again, along with any key that is not
+  # a development key (CD-033).
+  contract:
+    needs: profile
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: ${{ inputs.contract-suite != '' && 'contract-dev-kaiano-api' || format('stage-contract-{0}-{1}-{2}-{3}', github.workflow, github.ref, inputs.profile, inputs.working-directory) }}
+      cancel-in-progress: ${{ inputs.contract-suite == '' && github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide what runs
+        id: plan
+        env:
+          PROFILE: ${{ inputs.profile }}
+          SUITE: ${{ inputs.contract-suite }}
+          SUITE_VERSION: ${{ inputs.contract-suite-version }}
+          API_URL: ${{ inputs.contract-api-url }}
+          HAS_KEY: ${{ secrets.CONTRACT_SUITE_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          case "${SUITE}" in
+            "")
+              why="No contract suite is named for this repository (the contract-suite input), so there is none for the stage to run."
+              echo "::notice title=contract skipped (${PROFILE})::${why}"
+              printf '### contract: skipped (%s)\n\n%s\n' "${PROFILE}" "${why}" >> "$GITHUB_STEP_SUMMARY"
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+            common-python-utils) ;;
+            *)
+              echo "::error::Unknown contract suite '${SUITE}'. The one suite the stage runs is common-python-utils."
+              exit 1 ;;
+          esac
+
+          # A gate that cannot run must not pass.
+          if [ "${HAS_KEY}" != "true" ]; then
+            echo "::error::The contract suite needs the CONTRACT_SUITE_API_KEY secret (the development contract-suite key); none was passed."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import tomllib
+          import urllib.error
+          import urllib.request
+          from urllib.parse import urlsplit
+
+          api = os.environ["API_URL"]
+          parts = urlsplit(api)
+          host = (parts.hostname or "").lower()
+          if parts.scheme != "https" or not host:
+              sys.exit(f"::error::contract-api-url '{api}' is not an https URL.")
+          # The production domain is refused except for its development host,
+          # so a production host added later is refused without a change here.
+          if (host == "kaianolevine.com" or host.endswith(".kaianolevine.com")) and host != "dev-api.kaianolevine.com":
+              sys.exit(f"::error::Refusing {host}: the contract suite writes data and runs only against the development API.")
+
+          package = "miniapppolis-common-utils"
+          version = os.environ.get("SUITE_VERSION", "").strip()
+          url = digest = ""
+          if not version:
+              try:
+                  with open("uv.lock", "rb") as f:
+                      lock = tomllib.load(f)
+              except FileNotFoundError:
+                  sys.exit("::error::No uv.lock to read the common-python-utils release from; set contract-suite-version.")
+              found = [p for p in lock.get("package", []) if p.get("name") == package]
+              if not found or "sdist" not in found[0]:
+                  sys.exit(f"::error::uv.lock holds no {package} release from PyPI; set contract-suite-version.")
+              version = found[0]["version"]
+              url = found[0]["sdist"]["url"]
+              digest = found[0]["sdist"]["hash"].removeprefix("sha256:")
+          else:
+              index = f"https://pypi.org/pypi/{package}/{version}/json"
+              for attempt in range(5):
+                  try:
+                      with urllib.request.urlopen(index, timeout=30) as response:
+                          release = json.load(response)
+                      break
+                  except urllib.error.HTTPError as error:
+                      if error.code == 404:
+                          sys.exit(f"::error::{package} {version} is not on PyPI.")
+                      if attempt == 4:
+                          raise
+                  except urllib.error.URLError:
+                      if attempt == 4:
+                          raise
+                  time.sleep(5 * 2**attempt)
+              sdists = [u for u in release["urls"] if u["packagetype"] == "sdist"]
+              if not sdists:
+                  sys.exit(f"::error::{package} {version} has no sdist on PyPI.")
+              url = sdists[0]["url"]
+              digest = sdists[0]["digests"]["sha256"]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"run=true\nversion={version}\nurl={url}\nsha256={digest}\n")
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "stage-notes.md"), "a") as notes:
+              notes.write(f"- The common-python-utils {version} contract suite, against {host}\n")
+          PY
+
+      - name: Set up uv
+        if: steps.plan.outputs.run == 'true'
+        uses: $/.github/actions/setup-uv
+
+      - name: Fetch the suite
+        if: steps.plan.outputs.run == 'true'
+        env:
+          URL: ${{ steps.plan.outputs.url }}
+          SHA256: ${{ steps.plan.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          suite="${RUNNER_TEMP}/contract-suite"
+          mkdir -p "${suite}"
+          curl -sSfL --retry 5 --retry-connrefused -o "${RUNNER_TEMP}/contract-suite.tar.gz" "${URL}"
+          echo "${SHA256}  ${RUNNER_TEMP}/contract-suite.tar.gz" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/contract-suite.tar.gz" -C "${suite}" --strip-components 1
+          test -d "${suite}/contract" || { echo "::error::The sdist has no contract/ directory."; exit 1; }
+
+      - name: Run the contract suite
+        if: steps.plan.outputs.run == 'true'
+        working-directory: ${{ runner.temp }}/contract-suite
+        env:
+          CONTRACT_API_URL: ${{ inputs.contract-api-url }}
+          CONTRACT_SUITE_API_KEY: ${{ secrets.CONTRACT_SUITE_API_KEY }}
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          uv run pytest contract --no-cov -p no:cacheprovider -rA
+
+      - name: Report
+        if: always() && steps.plan.outputs.run == 'true'
+        env:
+          STATUS: ${{ job.status }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          {
+            printf '### contract: %s (%s)\n\n' "${STATUS}" "${PROFILE}"
+            if [ -f "${RUNNER_TEMP}/stage-notes.md" ]; then cat "${RUNNER_TEMP}/stage-notes.md"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The shared security controls, with the profile's language and package
+  # manager.
+  security:
+    needs: profile
+    uses: $/.github/workflows/security.yml
+    permissions:
+      contents: read
+    with:
+      language: ${{ needs.profile.outputs.language }}
+      package-manager: ${{ needs.profile.outputs.package-manager }}
+      sbom: ${{ inputs.sbom }}
+      working-directory: ${{ inputs.working-directory }}
+
+  # One result for every stage above, so a ruleset requires one check whose
+  # name does not change as stages are added. It runs whatever happened, and
+  # passes only if every stage passed; a stage the profile has nothing for
+  # passes having said so.
+  test:
+    if: always()
+    needs: [profile, lint, unit, integration, contract, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every stage passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          {
+            printf '### test (%s)\n\n| Stage | Result |\n|---|---|\n' "${PROFILE}"
+            jq -r 'to_entries[] | "| `\(.key)` | \(.value.result) |"' <<< "${NEEDS}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "${NEEDS}"
+          failed="$(jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")' <<< "${NEEDS}")"
+          if [ -n "${failed}" ]; then
+            echo "::error::Did not pass: ${failed}."
+            exit 1
+          fi

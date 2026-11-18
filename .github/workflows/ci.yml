@@ -2,10 +2,12 @@
 # so a change to security.yml is exercised before any consumer picks it up.
 #
 # Job names are canonical per ecosystem-standards CD-026: security, test,
-# release. The TypeScript self-call is named `test` because that is what it
-# is — the work job of a repo whose only artifact is workflow YAML is the
-# one that exercises that YAML. CD-026 says as much: the name records the
-# job's place in the pipeline, not its contents.
+# release. `test` is self-test.yml, because that is what it is: the work job
+# of a repo whose only artifact is workflow YAML is the one that exercises
+# that YAML. It runs the workflow static analysis, the TypeScript branch of
+# the security workflow, and the pipeline's stages against one fixture per
+# profile. CD-026 says as much: the name records the job's place in the
+# pipeline, not its contents.
 name: ci
 
 on:
@@ -30,18 +32,13 @@ jobs:
       # lock it should have failed.
       self-test: true
 
-  # The TypeScript branch needs exercising here too, or a change to it
-  # reaches consumers untested — which is how the osv-scanner swap in v2
-  # would otherwise have gone out. The only Node lockfile here is the
-  # release tooling's, in .github/actions/semantic-release, so this job is
-  # also the audit of what every repo's release installs.
+  # Workflow static analysis, and the pipeline against every profile's
+  # fixture (self-test.yml). The release needs this job, so a failing
+  # fixture or a new high-severity workflow finding blocks the release.
   test:
-    uses: ./.github/workflows/security.yml
+    uses: ./.github/workflows/self-test.yml
     permissions:
       contents: read
-    with:
-      language: typescript
-      sbom: false
 
   # CD-025: needs the security job, not just the work job. A release that
   # lists only `test` goes out whether or not the scan passed.
