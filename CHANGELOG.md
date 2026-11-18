@@ -1,3 +1,10 @@
+# [3.34.0](https://github.com/mini-app-polis/.github/compare/v3.33.0...v3.34.0) (2026-11-18)
+
+
+### Features
+
+* **release:** finish a partway release on re-run, and expose published, version and sha ([4187e9e](https://github.com/mini-app-polis/.github/commit/4187e9e5202cb83c66bb5c0bb49428da565fae34))
+
 # [3.33.0](https://github.com/mini-app-polis/.github/compare/v3.32.1...v3.33.0) (2026-11-18)
 
 
