@@ -1,3 +1,15 @@
+# [3.33.0](https://github.com/mini-app-polis/.github/compare/v3.32.1...v3.33.0) (2026-11-18)
+
+
+### Bug Fixes
+
+* **pipeline:** run the build stage's first step before the fixture is checked out ([1c091b3](https://github.com/mini-app-polis/.github/commit/1c091b320f8c8bb6f5840d7540b4e1a6464ea95c))
+
+
+### Features
+
+* **pipeline:** add the build stage, one sealed artifact and SBOM per profile ([6f1932d](https://github.com/mini-app-polis/.github/commit/6f1932d89f626dd3ebe200486fa83358f8b85ff5))
+
 ## [3.32.1](https://github.com/mini-app-polis/.github/compare/v3.32.0...v3.32.1) (2026-11-18)
 
 
