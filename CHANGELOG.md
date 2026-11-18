@@ -1,3 +1,10 @@
+## [3.37.1](https://github.com/mini-app-polis/.github/compare/v3.37.0...v3.37.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* **evaluate:** wait 5 minutes for a pre-release decision, not 15 ([5630aee](https://github.com/mini-app-polis/.github/commit/5630aeeeb70cc08c1d04e41a7be238f2412eaef9))
+
 # [3.37.0](https://github.com/mini-app-polis/.github/compare/v3.36.0...v3.37.0) (2026-11-18)
 
 
