@@ -53,3 +53,19 @@ the tag is already pushed, so a re-run finds nothing new to release.
 retries a `git push` that failed with a transient error, waiting longer each
 time. Every other git command, and every real refusal (non-fast-forward, a
 protected branch, a hook), goes through unchanged.
+
+## Re-runs: `release-state.sh`, `finish-release.sh`, `move-major-tag.sh`
+
+Before semantic-release, `release-state.sh` works out whether this commit
+already has a release (a `vX.Y.Z` tag on it, or the release commit pushed on
+top of it) and, if so, what that release is missing. It reads git and
+changes nothing. When there is a release, semantic-release does not run:
+`finish-release.sh` pushes a missing tag and moves the major tag with
+`move-major-tag.sh`, and the action makes a missing GitHub release with
+`gh release create`. It also refuses to cut a release anywhere but `main`.
+The repository README ("Shared release") has the cases, and
+`scripts/check-release-resume.sh` proves them against a scratch repository.
+
+`move-major-tag.sh` lives here, not in `scripts/`, so a re-run has it at
+the ref the caller pinned; this repository's `.releaserc.json` still calls
+it as its `successCmd`, through `scripts/move-major-tag.sh`.

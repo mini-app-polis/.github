@@ -12,7 +12,7 @@
 # The build stage uploads its artifact and SBOM to this run only, and saves
 # the api-service image to a tarball rather than pushing it. The release
 # stage runs only as a dry run, in a scratch repository whose one remote is
-# a bare repository beside it. No fixture names a contract suite, so the
+# a bare repository beside it; its re-run proof tags and pushes only there. No fixture names a contract suite, so the
 # contract stage, which calls the development API, skips against every one
 # and says so. A stage that would deploy or evaluate is not run here at all
 # until it has a mode that does neither; the `pending` job names each such
@@ -141,7 +141,8 @@ jobs:
       working-directory: fixtures/shared-workflows
 
   # The stages that run on a runner of their own against each fixture: the
-  # release stage, run twice on one commit, and for the Python fixtures the
+  # release stage, run twice on one commit and re-run after each way it can
+  # stop partway, and for the Python fixtures the
   # python-checks action as python-test.yml runs it, every check in one job,
   # since the fleet's callers of python-test.yml still use it that way.
   #
@@ -193,11 +194,20 @@ jobs:
           PROFILE: ${{ matrix.profile }}
         run: bash scripts/check-release-rerun.sh "fixtures/${PROFILE}" .github/actions/semantic-release
 
+      # Release commit without its tag, tag without its GitHub release, major
+      # tag not moved, and the reconciler's ref: each re-run finishes the
+      # release with one tag and one release commit.
+      - name: A re-run finishes a release that stopped partway
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: bash scripts/check-release-resume.sh "fixtures/${PROFILE}" .github/actions/semantic-release
+
   # The stages of each profile that no fixture job runs yet, each with the
   # reason, as a notice on the run and a table in this job's summary. The
   # stages up to build are not listed: `stages` and `build` run all of them
   # for every profile, and each says itself when the profile has nothing
-  # for it. `release` runs in `fixture`.
+  # for it. `release` runs in `fixture`, twice on one commit and re-run
+  # after it stops partway, the reconciler's `ref` included.
   pending:
     name: not run yet (${{ matrix.profile }})
     runs-on: ubuntu-latest

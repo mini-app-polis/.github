@@ -24,6 +24,19 @@
 #
 # A repository whose release job is only checkout and release can call
 # .github/workflows/release.yml instead, which wraps this action.
+#
+# Running it again on a released commit cuts nothing. release-state.sh
+# first looks for this commit's release: a vX.Y.Z tag on it, or the release
+# commit pushed on top of it. When there is one, semantic-release does not
+# run; the action finishes what that release is missing (its tag, its
+# GitHub release, the major tag) and reports it as published. So a re-run of
+# a release that failed partway finishes it, with no second tag and no
+# second release commit. A step of the caller's own after this one (a
+# package upload, a fleet notice) runs on `published` and makes itself safe
+# to repeat; the repository README, "Shared release", says how.
+#
+# It cuts a release on main only: on any other ref it refuses, unless it is
+# a dry run or `ref` names a release tag on main to finish.
 
 name: semantic-release
 description: Run semantic-release with the fleet's locked plugins, in the caller's checkout.
@@ -49,27 +62,82 @@ inputs:
     description: Author and committer email for the release commit. Used only with git-author-name.
     required: false
     default: ""
+  ref:
+    description: "A vX.Y.Z tag on main to finish rather than this checkout's HEAD: the release reconciler's `ref`. It is never cut again; what it is missing is finished. Empty: HEAD."
+    required: false
+    default: ""
 
 outputs:
+  published:
+    description: "\"true\" when this commit has a release on the remote after this run: cut by it, or cut before and finished by it. \"false\" otherwise, and always on a dry run. A caller's publish and notice steps run on it."
+    value: ${{ steps.released.outputs.published }}
+  version:
+    description: The release's version, X.Y.Z, or empty when the commit has none.
+    value: ${{ steps.released.outputs.version }}
   tag:
-    description: The v* tag on the commit left at HEAD, or empty when the run released nothing.
+    description: The release's vX.Y.Z tag, or empty when the commit has none. Set on a run that finished an earlier release too.
     value: ${{ steps.released.outputs.tag }}
+  sha:
+    description: The commit the release tag is on (the release commit, where the repository makes one), or empty.
+    value: ${{ steps.released.outputs.sha }}
+  resumed:
+    description: "\"true\" when the release was cut by an earlier run and this one only finished it."
+    value: ${{ steps.released.outputs.resumed }}
 
 runs:
   using: composite
   steps:
+    # What a run on this commit has to do: release, or finish a release
+    # already cut. The fetch brings main and the tags up to date with the
+    # remote (a re-run's checkout may be older than either); --force because
+    # a major tag moves, and a fetch without it refuses to update a tag it
+    # already has. A checkout that cannot fetch (no persisted credentials)
+    # goes on with what it checked out, which is how it ran before.
+    - name: Find this commit's release
+      id: state
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        TARGET_REF: ${{ inputs.ref }}
+      run: |
+        set -euo pipefail
+        if ! git fetch --quiet --force --tags origin "+refs/heads/main:refs/remotes/origin/main"; then
+          echo "::warning::Could not fetch main and the tags from origin; working from the checkout's."
+        fi
+        state="$(bash "${GITHUB_ACTION_PATH}/release-state.sh")"
+        if grep -qx 'state=finish' <<< "${state}"; then
+          tag="$(sed -n 's/^tag=//p' <<< "${state}")"
+          # A 404 is the one answer that means no release; anything else
+          # fails the step rather than making a second one.
+          if err="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --silent 2>&1)"; then
+            exists=true
+          elif grep -q 'HTTP 404' <<< "${err}"; then
+            exists=false
+          else
+            echo "::error::Could not ask GitHub for the release of ${tag}: ${err}"
+            exit 1
+          fi
+          state="$(GITHUB_RELEASE_EXISTS="${exists}" bash "${GITHUB_ACTION_PATH}/release-state.sh")"
+        fi
+        echo "${state}"
+        echo "${state}" >> "${GITHUB_OUTPUT}"
+
     - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      if: steps.state.outputs.state == 'release'
       with:
         node-version: ${{ inputs.node-version }}
 
     # --ignore-scripts: nothing in the release tooling needs an install
     # script, and none runs with the job's token in the environment.
     - name: Install the locked release tooling
+      if: steps.state.outputs.state == 'release'
       shell: bash
       working-directory: ${{ github.action_path }}
       run: npm ci --ignore-scripts --no-audit --no-fund
 
     - name: Release
+      if: steps.state.outputs.state == 'release'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -92,9 +160,89 @@ runs:
         fi
         "${GITHUB_ACTION_PATH}/node_modules/.bin/semantic-release" "${args[@]}"
 
-    # semantic-release tags the release commit it leaves at HEAD. No tag
-    # there means the push carried nothing releasable.
-    - name: Record the release tag
+    # A release cut before this run: push its missing tag and move its major
+    # tag (finish-release.sh), then make its missing GitHub release. A dry
+    # run says what it would do and does nothing.
+    - name: Finish the release
+      if: steps.state.outputs.state == 'finish'
+      shell: bash
+      env:
+        DRY_RUN: ${{ inputs.dry-run }}
+        TAG: ${{ steps.state.outputs.tag }}
+        VERSION: ${{ steps.state.outputs.version }}
+        SHA: ${{ steps.state.outputs.sha }}
+        CREATE_TAG: ${{ steps.state.outputs.create-tag }}
+        MOVE_MAJOR_TAG: ${{ steps.state.outputs.move-major-tag }}
+        CREATE_GITHUB_RELEASE: ${{ steps.state.outputs.create-github-release }}
+      run: |
+        set -euo pipefail
+        echo "${TAG} is this commit's release, on ${SHA}. Missing: tag ${CREATE_TAG}, GitHub release ${CREATE_GITHUB_RELEASE}, major tag ${MOVE_MAJOR_TAG}."
+        if [ "${DRY_RUN}" = "true" ]; then
+          echo "Dry run: nothing finished."
+          exit 0
+        fi
+        SEMANTIC_RELEASE_REAL_GIT="$(command -v git)"
+        export SEMANTIC_RELEASE_REAL_GIT
+        PATH="${GITHUB_ACTION_PATH}/bin:${PATH}" bash "${GITHUB_ACTION_PATH}/finish-release.sh"
+
+    # The release notes are the release commit's message body, which is
+    # where the fleet's @semantic-release/git message puts them. A tag on a
+    # commit that is not a release commit gets GitHub's generated notes.
+    - name: Make the missing GitHub release
+      if: steps.state.outputs.state == 'finish' && steps.state.outputs.create-github-release == 'true' && inputs.dry-run != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        TAG: ${{ steps.state.outputs.tag }}
+        SHA: ${{ steps.state.outputs.sha }}
+        LATEST: ${{ steps.state.outputs.latest }}
+        RELEASE_COMMIT: ${{ steps.state.outputs.release-commit }}
+      run: |
+        set -euo pipefail
+        notes=()
+        if [ "${RELEASE_COMMIT}" = "true" ]; then
+          git log -1 --format=%b "${SHA}" > "${RUNNER_TEMP}/release-notes.md"
+          notes=(--notes-file "${RUNNER_TEMP}/release-notes.md")
+        else
+          notes=(--generate-notes)
+        fi
+        gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag \
+          --title "${TAG}" --latest="${LATEST}" "${notes[@]}"
+        echo "made the GitHub release ${TAG}"
+
+    # semantic-release tags the release commit it leaves at HEAD; no release
+    # tag there means the push carried nothing releasable. A finished
+    # release is the one release-state.sh found. Only vX.Y.Z tags count: a
+    # major tag on the same commit is not the release.
+    - name: Record the release
       id: released
       shell: bash
-      run: echo "tag=$(git tag --points-at HEAD --list 'v*' | head -n1)" >> "${GITHUB_OUTPUT}"
+      env:
+        DRY_RUN: ${{ inputs.dry-run }}
+        STATE: ${{ steps.state.outputs.state }}
+        FOUND_TAG: ${{ steps.state.outputs.tag }}
+        FOUND_SHA: ${{ steps.state.outputs.sha }}
+      run: |
+        set -euo pipefail
+        resumed=false
+        if [ "${STATE}" = "finish" ]; then
+          tag="${FOUND_TAG}" sha="${FOUND_SHA}" resumed=true
+        else
+          tag="$(git tag --points-at HEAD --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          sha=""
+          if [ -n "${tag}" ]; then
+            sha="$(git rev-parse HEAD)"
+          fi
+        fi
+        published=false
+        if [ -n "${tag}" ] && [ "${DRY_RUN}" != "true" ]; then
+          published=true
+        fi
+        {
+          echo "published=${published}"
+          echo "tag=${tag}"
+          echo "version=${tag#v}"
+          echo "sha=${sha}"
+          echo "resumed=${resumed}"
+        } >> "${GITHUB_OUTPUT}"
+        echo "published=${published} tag=${tag} sha=${sha} resumed=${resumed}"
