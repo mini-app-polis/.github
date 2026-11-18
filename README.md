@@ -693,10 +693,10 @@ commit and phase that started at or after `since` (the moment the stage
 asked): its state (`pending`, `running` or `complete`), its findings counted
 by severity, and the findings themselves. Findings are only ever added to a
 run, so a blocking one decides at once, finished or not. A pass needs
-`complete`, and today the evaluator closes only a clean evaluation (with its
-one `SUCCESS` row); an evaluation with `WARN` findings and no `ERROR` stays
-`running` and times out, failing closed, until the evaluator closes those
-too. An API without the outcome route (404) fails at once, as `unsupported`.
+`complete`: an evaluation holding its `SUCCESS` row (a clean one), or one
+whose findings stopped arriving the API's settle period ago. The evaluator
+computes every check, then posts a repository's findings together, so a
+quiet run has finished. An API without the outcome route (404) fails at once, as `unsupported`.
 The decisions are `evaluate-decision.sh` in the `evaluate-decision` action;
 `scripts/test-evaluate-decision.sh` proves them against `stand-in.py`, a
 stand-in for the two API routes.
