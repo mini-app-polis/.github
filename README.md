@@ -227,8 +227,10 @@ repository per profile. A failing fixture blocks the release.
   repository's security checks passing: the `main` ruleset, declared in
   infra. No review is required, since the organisation has one member who
   cannot approve their own pull request. `CODEOWNERS` names the owner of
-  the workflow and action paths and `pipeline.yaml`. GitHub Actions bypasses
-  the rule to push the release commit and move the major tag.
+  the workflow and action paths and `pipeline.yaml`. The release pushes
+  its version commit and moves the major tag as the promote App, the
+  ruleset's one bypass: GitHub does not accept GitHub Actions itself as a
+  bypass actor.
 - **Releases.** This repository releases with semantic-release on every
   merge to `main` that has a releasable commit, as every other repository
   does (see Versioning below).
@@ -487,6 +489,16 @@ jobs:
       issues: write
       pull-requests: write
     uses: mini-app-polis/.github/.github/workflows/release.yml@v3
+```
+
+A repository whose `main` ruleset refuses direct pushes passes the promote
+App's credentials, and the release checks out and pushes as the App, which
+the ruleset lets through:
+
+```yaml
+    secrets:
+      app-client-id: ${{ secrets.PROMOTE_APP_CLIENT_ID }}
+      app-private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
 ```
 
 A release job with steps of its own around the release (a dependency

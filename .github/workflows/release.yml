@@ -47,6 +47,13 @@ on:
         description: Author and committer email for the release commit. Used only with git-author-name.
         type: string
         default: ""
+    secrets:
+      app-client-id:
+        description: "A GitHub App's client ID. With app-private-key, the release checks out and pushes as that App: for a repository whose main ruleset lets only the App past its pull-request rule."
+        required: false
+      app-private-key:
+        description: The private key of the App named by app-client-id.
+        required: false
     outputs:
       tag:
         description: The v* tag this run released, or empty when it released nothing.
@@ -80,19 +87,36 @@ jobs:
       pull-requests: write
     outputs:
       tag: ${{ steps.release.outputs.tag }}
+    env:
+      # Read in a step's `if`, which cannot read secrets directly.
+      APP_CLIENT_ID: ${{ secrets.app-client-id }}
     steps:
+      # A caller that passes an App releases as that App: the push of the
+      # version commit and the major tag goes past a main ruleset that
+      # bypasses only the App. Without one, the run's own token, as before.
+      - name: App token
+        id: app
+        if: env.APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # semantic-release reads the tag history to decide the next
           # version.
           fetch-depth: 0
-          token: ${{ github.token }}
+          token: ${{ steps.app.outputs.token || github.token }}
 
       - name: Release
         id: release
         uses: $/.github/actions/semantic-release
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ steps.app.outputs.token || github.token }}
           # A run started by hand is always a dry run.
           dry-run: ${{ github.event_name == 'workflow_dispatch' || inputs.dry-run }}
           node-version: ${{ inputs.node-version || '22' }}
