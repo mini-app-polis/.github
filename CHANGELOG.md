@@ -1,3 +1,10 @@
+## [3.32.1](https://github.com/mini-app-polis/.github/compare/v3.32.0...v3.32.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* **commons-update:** refresh the package's index when re-locking ([05b2e2a](https://github.com/mini-app-polis/.github/commit/05b2e2a37a34ec4a99a28acce0d390d82626cc08))
+
 # [3.32.0](https://github.com/mini-app-polis/.github/compare/v3.31.2...v3.32.0) (2026-11-18)
 
 
