@@ -298,10 +298,6 @@ jobs:
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
-    # Only the self-test's planned failure: the job fails as a live one
-    # would, and the self-test reads `outcome` to prove it did, but its own
-    # run stays green.
-    continue-on-error: ${{ inputs.target == 'fake' && inputs.expect-failure }}
     permissions:
       contents: read
       statuses: write # the record: a commit status on the release's commit
@@ -720,8 +716,14 @@ jobs:
             [ "${verified}" = true ] || echo "| Errors channel | $([ "${POSTED}" = true ] && echo posted || echo 'not posted') |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # In the self-test's planned failure (fake target, expect-failure)
+      # this step fails as it would live, but is let through, so the job
+      # shows green and `outcome` still reports the failure for the
+      # self-test to prove. Anywhere else it fails the job.
       - name: Fail when not verified
+        id: fail
         if: always() && needs.plan.outputs.kind != 'none' && steps.result.outputs.verified != 'true'
+        continue-on-error: ${{ inputs.target == 'fake' && inputs.expect-failure }}
         env:
           REASON: ${{ steps.outcome-of-check.outputs.reason }}
         run: |
@@ -733,5 +735,7 @@ jobs:
         id: outcome
         if: always()
         env:
-          STATUS: ${{ job.status }}
+          # A let-through failure leaves job.status success; the step's own
+          # outcome still says it failed.
+          STATUS: ${{ steps.fail.outcome == 'failure' && 'failure' || job.status }}
         run: echo "outcome=${STATUS}" >> "$GITHUB_OUTPUT"
