@@ -724,9 +724,9 @@ like `GET /v1/evaluations`, it is public and read-only.
 | `published` | empty | `post-release`: `release`'s `published`; anything but `true` skips |
 | `repo`, `org` | the calling repository | What to evaluate |
 | `api-url` | `https://api.kaianolevine.com` | Base URL of api-kaianolevine-com |
-| `timeout-minutes` | `30` | How long the job may run |
-| `evaluate-timeout-seconds` | `900` | `pre-release`: how long to wait for a decision before failing closed |
-| `poll-initial-seconds`, `poll-max-seconds` | `10`, `60` | `pre-release`: the backoff between reads |
+| `timeout-minutes` | `10` | How long the job may run |
+| `evaluate-timeout-seconds` | `300` | `pre-release`: how long to wait for a decision before failing closed. A deterministic evaluation finishes within a minute of being picked up |
+| `poll-initial-seconds`, `poll-max-seconds` | `5`, `20` | `pre-release`: the backoff between reads |
 | `target` | `live` | `fake` is the self-test's stand-in. Consumers leave it, and `fake-scenario` and `expect-failure`, which only it takes |
 
 | Output | Meaning |
