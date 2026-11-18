@@ -136,6 +136,8 @@ jobs:
       # uploaded as one artifact. Outside the checkout, so nothing in the
       # repository is mistaken for part of it.
       - name: Where the stage works
+        # Before checkout the job's working directory does not exist yet.
+        working-directory: .
         run: |
           {
             echo "ARTIFACT_DIR=${RUNNER_TEMP}/build-artifact"
