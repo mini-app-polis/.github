@@ -1,0 +1,492 @@
+# The pipeline's `build` stage, for any profile: build the commit's one
+# versioned artifact, seal it with a digest, generate its SBOM, and keep both
+# with the run. Every stage after it (security, release, deploy) takes the
+# artifact by name and digest through the fetch-artifact action instead of
+# building again, so what ships is what was built and tested (README, "Build
+# stage").
+#
+# A profile with nothing to build still runs the stage, which says why in its
+# job summary and as a notice on the run, and passes with no artifact.
+#
+# Running it twice on one commit builds once. An artifact for this commit
+# already in the run (a re-run, or a second call) is downloaded, checked
+# against the manifest it was sealed with, and reported with the same
+# digest; only what is missing (the artifact, or its SBOM) is made.
+#
+# pipeline.yml calls this as one job after the stages before it, and
+# consumers reach it through pipeline.yml. It can also be called on its own:
+#
+#   jobs:
+#     build:
+#       needs: stages
+#       uses: mini-app-polis/.github/.github/workflows/stages-build.yml@v3
+#       with:
+#         profile: python-service
+#         lambda-handler: deejay_cog.worker.lambda_handler
+#
+# The actions are named with `$/`, which resolves to this repository at the
+# commit of this file, so a caller pinned to a tag gets every part of the
+# stage from that same tag, and this repository's self-test runs the parts it
+# is changing.
+
+name: stages-build
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "The repository's profile (README, \"Profiles\"): python-service, api-service, python-library, astro-site, npm-library, terraform-infra or shared-workflows."
+        type: string
+        required: true
+      working-directory:
+        description: "The directory, within the checkout, holding the repository to build. For this repository's fixtures; consumers leave it."
+        type: string
+        default: "."
+      timeout-minutes:
+        description: "How long the build job may run."
+        type: number
+        default: 30
+      python-version:
+        description: "Python profiles: the runtime the repository deploys to."
+        type: string
+        default: "3.14"
+      node-version:
+        description: "Node profiles: the Node release line."
+        type: string
+        default: "22"
+      build-script:
+        description: "astro-site: the package.json script that builds the site. npm-library: run before packing when package.json has it."
+        type: string
+        default: "build"
+      site-dir:
+        description: "astro-site: the directory the build script writes the site to."
+        type: string
+        default: "dist"
+      dockerfile:
+        description: "api-service: the Dockerfile the image is built from, relative to the repository."
+        type: string
+        default: "Dockerfile"
+      lambda-handler:
+        description: "python-service: module.path.function, as infra/worker.tf's `handler`. Set, the artifact also holds the Lambda zip; empty, a service with no Lambda (a Railway worker) gets its wheel and sdist only."
+        type: string
+        default: ""
+      lambda-architecture:
+        description: "python-service: x86_64 | arm64, as `architectures` in infra/worker.tf."
+        type: string
+        default: "x86_64"
+      lambda-trigger:
+        description: "python-service: sqs | schedule, what invokes the function (the lambda-zip action says what each probes)."
+        type: string
+        default: "sqs"
+      lambda-strip:
+        description: "python-service: top-level paths to leave out of the Lambda zip, for dependencies the function never imports."
+        type: string
+        default: ""
+      syft-version:
+        description: "Pinned syft release for the SBOM, as security.yml pins it."
+        type: string
+        default: "1.29.1"
+    outputs:
+      artifact-name:
+        description: "The artifact's name in this run, or empty when the profile has nothing to build."
+        value: ${{ jobs.build.outputs.artifact-name }}
+      artifact-digest:
+        description: "sha256:<hex>, the SHA-256 of the artifact's SHA256SUMS manifest; empty when there is no artifact."
+        value: ${{ jobs.build.outputs.artifact-digest }}
+      sbom-name:
+        description: "The name of the artifact holding the build's CycloneDX SBOM; empty when there is no artifact."
+        value: ${{ jobs.build.outputs.sbom-name }}
+      version:
+        description: "The build's version: the version the commit declares, then +g and the commit's first 12 hex digits."
+        value: ${{ jobs.build.outputs.version }}
+      reused:
+        description: "true when the artifact was already in the run and was taken rather than rebuilt."
+        value: ${{ jobs.build.outputs.reused }}
+
+permissions:
+  contents: read
+
+env:
+  # Package managers retry their own registry fetches with backoff; these
+  # raise each one's attempt count so a registry blip is ridden out rather
+  # than failing the stage.
+  UV_HTTP_RETRIES: "5"
+  PIP_RETRIES: "5"
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    outputs:
+      artifact-name: ${{ steps.plan.outputs.name }}
+      artifact-digest: ${{ steps.seal.outputs.digest || steps.reused.outputs.digest }}
+      sbom-name: ${{ steps.plan.outputs.sbom-name }}
+      version: ${{ steps.plan.outputs.version }}
+      reused: ${{ steps.found.outputs.artifact }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      # Everything the stage builds goes in ARTIFACT_DIR, then is sealed and
+      # uploaded as one artifact. Outside the checkout, so nothing in the
+      # repository is mistaken for part of it.
+      - name: Where the stage works
+        run: |
+          {
+            echo "ARTIFACT_DIR=${RUNNER_TEMP}/build-artifact"
+            echo "SBOM_DIR=${RUNNER_TEMP}/build-sbom"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # What the profile builds, the version and the artifact's name. An
+      # unknown profile fails here; one with nothing to build says why and
+      # stops.
+      #
+      # The version is the one the commit declares (pyproject.toml or
+      # package.json) with +g and the commit's first 12 hex digits: a label
+      # for "built from this commit, which declares that version", which
+      # orders after that release and before the next. It is not the version
+      # semantic-release would cut: that is known only to a release run, on
+      # main, with the tag history and a token, and the build runs on every
+      # event. The files are built exactly as the commit has them.
+      - name: Decide what is built
+        id: plan
+        env:
+          PROFILE: ${{ inputs.profile }}
+          HANDLER: ${{ inputs.lambda-handler }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "::notice title=build skipped (${PROFILE})::$1"
+            printf '### build: skipped (%s)\n\n%s\n' "${PROFILE}" "$1" >> "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          case "${PROFILE}" in
+            python-library|python-service)
+              kind=python ;;
+            api-service)
+              kind=image ;;
+            astro-site)
+              kind=site ;;
+            npm-library)
+              kind=npm ;;
+            terraform-infra)
+              skip "This profile's artifact is the reviewed Terraform plan, and a plan needs the state backend and the providers' credentials, which the build stage does not hold. It is made by the deploy stage's plan, not here." ;;
+            shared-workflows)
+              skip "This profile has no artifact: its release moves the major tag, and callers run the workflows from that tag." ;;
+            *)
+              echo "::error::Unknown profile '${PROFILE}'. The profiles are listed in the README, under \"Profiles\"."
+              exit 1 ;;
+          esac
+
+          case "${kind}" in
+            python|image)
+              declared="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"].get("version", ""))')" ;;
+            *)
+              declared="$(jq -r '.version // empty' package.json)" ;;
+          esac
+          if [ -z "${declared}" ]; then
+            echo "::error::No static version in the repository's pyproject.toml or package.json to label the build with."
+            exit 1
+          fi
+          version="${declared}+g${GITHUB_SHA:0:12}"
+          name="build-${PROFILE}-${version}"
+          # The name is matched as a pattern when the stage looks for it in
+          # the run, so it must hold no pattern characters.
+          if ! [[ "${name}" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+            echo "::error::'${name}' is not a usable artifact name: the declared version '${declared}' has characters outside A-Z a-z 0-9 . _ + -."
+            exit 1
+          fi
+
+          pm=""
+          if [ "${kind}" = site ] || [ "${kind}" = npm ]; then
+            if [ -f pnpm-lock.yaml ]; then pm=pnpm
+            elif [ -f package-lock.json ]; then pm=npm
+            else
+              echo "::error::No pnpm-lock.yaml or package-lock.json: a Node profile installs from its lockfile."
+              exit 1
+            fi
+          fi
+          if [ "${kind}" = image ] && [ ! -f "${DOCKERFILE}" ]; then
+            echo "::error::No ${DOCKERFILE}: the api-service artifact is a container image built from it."
+            exit 1
+          fi
+          lambda=false
+          if [ "${PROFILE}" = python-service ]; then
+            if [ -n "${HANDLER}" ]; then
+              lambda=true
+            else
+              echo "::notice title=build (${PROFILE})::No lambda-handler, so no Lambda zip: the artifact is the wheel and sdist."
+            fi
+          fi
+
+          {
+            echo "run=true"
+            echo "kind=${kind}"
+            echo "pm=${pm}"
+            echo "lambda=${lambda}"
+            echo "version=${version}"
+            echo "name=${name}"
+            echo "sbom-name=${name}-sbom"
+          } >> "$GITHUB_OUTPUT"
+
+      # A pattern rather than a name, so an artifact that is not there yet
+      # downloads nothing instead of failing. The name holds no pattern
+      # characters (checked above), so it matches only itself.
+      - name: Look for this commit's artifact in the run
+        if: steps.plan.outputs.run == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ${{ steps.plan.outputs.name }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: Look for its SBOM in the run
+        if: steps.plan.outputs.run == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ${{ steps.plan.outputs.sbom-name }}
+          path: ${{ env.SBOM_DIR }}
+
+      - name: What the run already has
+        id: found
+        if: steps.plan.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          has() { [ -d "$1" ] && [ -n "$(find "$1" -type f -print -quit)" ] && echo true || echo false; }
+          artifact="$(has "${ARTIFACT_DIR}")"
+          sbom="$(has "${SBOM_DIR}")"
+          echo "artifact=${artifact}" >> "$GITHUB_OUTPUT"
+          echo "sbom=${sbom}" >> "$GITHUB_OUTPUT"
+          echo "artifact in the run: ${artifact}; SBOM in the run: ${sbom}"
+          mkdir -p "${ARTIFACT_DIR}" "${SBOM_DIR}"
+
+      # Taken, not rebuilt: checked against the manifest it was sealed with,
+      # so a changed, missing or added file fails here.
+      - name: Check the artifact already in the run
+        id: reused
+        if: steps.found.outputs.artifact == 'true'
+        uses: $/.github/actions/artifact-digest
+        with:
+          mode: check
+          directory: ${{ env.ARTIFACT_DIR }}
+
+      # Python: the wheel and sdist, with the pinned uv.
+      - name: Set up uv
+        if: steps.found.outputs.artifact == 'false' && steps.plan.outputs.kind == 'python'
+        uses: $/.github/actions/setup-uv
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      # uv writes a .gitignore into the output directory; hidden files are
+      # left out of an upload, so it would fail the seal.
+      - name: Build the wheel and sdist
+        if: steps.found.outputs.artifact == 'false' && steps.plan.outputs.kind == 'python'
+        run: |
+          set -euo pipefail
+          uv build --out-dir "${ARTIFACT_DIR}/dist"
+          rm -f "${ARTIFACT_DIR}/dist/.gitignore"
+
+      - name: Build the Lambda zip
+        if: steps.found.outputs.artifact == 'false' && steps.plan.outputs.lambda == 'true'
+        uses: $/.github/actions/lambda-zip
+        with:
+          handler: ${{ inputs.lambda-handler }}
+          architecture: ${{ inputs.lambda-architecture }}
+          trigger: ${{ inputs.lambda-trigger }}
+          python-version: ${{ inputs.python-version }}
+          strip: ${{ inputs.lambda-strip }}
+          working-directory: ${{ inputs.working-directory }}
+          output-dir: ${{ env.ARTIFACT_DIR }}/lambda
+
+      # The image is built and saved as a docker-archive tarball in the
+      # artifact. It is never pushed: a deploy stage pushes the image it
+      # takes from here, to its own registry, by this digest.
+      - name: Build the container image
+        if: steps.found.outputs.artifact == 'false' && steps.plan.outputs.kind == 'image'
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PROFILE: ${{ inputs.profile }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A tag cannot hold "+".
+          tag="pipeline-build/${PROFILE}:${VERSION//+/_}"
+          docker build --file "${DOCKERFILE}" --tag "${tag}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" .
+          mkdir -p "${ARTIFACT_DIR}/image"
+          docker save --output "${ARTIFACT_DIR}/image/image.tar" "${tag}"
+          docker image inspect --format '{{.Id}}' "${tag}" > "${ARTIFACT_DIR}/image/image-id"
+          echo "${tag}" > "${ARTIFACT_DIR}/image/tag"
+          echo "image ${tag}: $(cat "${ARTIFACT_DIR}/image/image-id")"
+
+      # pnpm's version comes from package.json's packageManager field.
+      - name: Set up pnpm
+        if: steps.found.outputs.artifact == 'false' && steps.plan.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Set up Node
+        if: steps.found.outputs.artifact == 'false' && steps.plan.outputs.pm != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # The site bundle is one tarball, with names, times and owners fixed
+      # so the same tree always gives the same bytes.
+      - name: Build the site bundle
+        if: steps.found.outputs.artifact == 'false' && steps.plan.outputs.kind == 'site'
+        env:
+          PM: ${{ steps.plan.outputs.pm }}
+          SCRIPT: ${{ inputs.build-script }}
+          SITE_DIR: ${{ inputs.site-dir }}
+        run: |
+          set -euo pipefail
+          if ! jq -e --arg s "${SCRIPT}" '.scripts[$s] // empty' package.json > /dev/null; then
+            echo "::error::package.json has no '${SCRIPT}' script: an astro-site's artifact is the site it builds."
+            exit 1
+          fi
+          if [ "${PM}" = pnpm ]; then pnpm install --frozen-lockfile; else npm ci --no-audit --no-fund; fi
+          "${PM}" run "${SCRIPT}"
+          if [ ! -d "${SITE_DIR}" ] || [ -z "$(find "${SITE_DIR}" -type f -print -quit)" ]; then
+            echo "::error::The '${SCRIPT}' script left nothing in ${SITE_DIR}."
+            exit 1
+          fi
+          mkdir -p "${ARTIFACT_DIR}/site"
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C "${SITE_DIR}" -cf - . | gzip -n > "${ARTIFACT_DIR}/site/site.tar.gz"
+
+      - name: Pack the npm package
+        if: steps.found.outputs.artifact == 'false' && steps.plan.outputs.kind == 'npm'
+        env:
+          PM: ${{ steps.plan.outputs.pm }}
+          SCRIPT: ${{ inputs.build-script }}
+        run: |
+          set -euo pipefail
+          if [ "${PM}" = pnpm ]; then pnpm install --frozen-lockfile; else npm ci --no-audit --no-fund; fi
+          if jq -e --arg s "${SCRIPT}" '.scripts[$s] // empty' package.json > /dev/null; then
+            "${PM}" run "${SCRIPT}"
+          fi
+          mkdir -p "${ARTIFACT_DIR}/package"
+          "${PM}" pack --pack-destination "${ARTIFACT_DIR}/package"
+
+      - name: Seal the artifact
+        id: seal
+        if: steps.found.outputs.artifact == 'false'
+        uses: $/.github/actions/artifact-digest
+        with:
+          mode: seal
+          directory: ${{ env.ARTIFACT_DIR }}
+
+      # The SBOM describes the artifact itself: the image's layers, or the
+      # archives unpacked (the Lambda zip holds every dependency's
+      # dist-info). It is made from the artifact on disk, built or taken, so
+      # an SBOM lost from an earlier attempt is made again from the same
+      # bytes.
+      - name: Restore syft
+        id: syft-cache
+        if: steps.found.outputs.sbom == 'false'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/fleet-tools/syft
+          key: syft-${{ inputs.syft-version }}-linux
+
+      - name: Install syft
+        if: steps.found.outputs.sbom == 'false' && steps.syft-cache.outputs.cache-hit != 'true'
+        env:
+          SYFT_VERSION: ${{ inputs.syft-version }}
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/anchore/syft/main/install.sh"
+          curl -sSfL --retry 5 --retry-connrefused "${url}" | sh -s -- -b "${HOME}/.cache/fleet-tools/syft" "v${SYFT_VERSION}"
+
+      - name: Generate the SBOM
+        if: steps.found.outputs.sbom == 'false'
+        env:
+          NAME: ${{ steps.plan.outputs.name }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          # The pinned release, so no check for a newer one.
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          set -euo pipefail
+          syft="${HOME}/.cache/fleet-tools/syft/syft"
+          "${syft}" version
+          out="${SBOM_DIR}/sbom.cyclonedx.json"
+          if [ -f "${ARTIFACT_DIR}/image/image.tar" ]; then
+            source="docker-archive:${ARTIFACT_DIR}/image/image.tar"
+          else
+            scan="${RUNNER_TEMP}/build-sbom-scan"
+            rm -rf "${scan}"
+            mkdir -p "${scan}"
+            while IFS= read -r -d '' file; do
+              into="${scan}/${file#"${ARTIFACT_DIR}"/}"
+              mkdir -p "${into}"
+              case "${file}" in
+                *.whl|*.zip) unzip -q "${file}" -d "${into}" ;;
+                *.tar.gz|*.tgz) tar -xzf "${file}" -C "${into}" ;;
+                *) rmdir "${into}" ;;
+              esac
+            done < <(find "${ARTIFACT_DIR}" -type f -print0)
+            source="dir:${scan}"
+          fi
+          "${syft}" "${source}" --source-name "${NAME}" --source-version "${VERSION}" \
+            -o "cyclonedx-json=${out}"
+          echo "SBOM of ${source}: $(jq '.components | length' "${out}") components"
+
+      - name: Upload the artifact
+        if: steps.found.outputs.artifact == 'false'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.plan.outputs.name }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error
+
+      # Kept for every build: ecosystem-standards SEC-005. The retention
+      # is the one security.yml gives its SBOM.
+      - name: Upload the SBOM
+        if: steps.found.outputs.sbom == 'false'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.plan.outputs.sbom-name }}
+          path: ${{ env.SBOM_DIR }}/sbom.cyclonedx.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Report
+        if: always() && steps.plan.outputs.run == 'true'
+        env:
+          STATUS: ${{ job.status }}
+          PROFILE: ${{ inputs.profile }}
+          NAME: ${{ steps.plan.outputs.name }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          DIGEST: ${{ steps.seal.outputs.digest || steps.reused.outputs.digest }}
+          REUSED: ${{ steps.found.outputs.artifact }}
+          SBOM_NAME: ${{ steps.plan.outputs.sbom-name }}
+        run: |
+          {
+            printf '### build: %s (%s)\n\n' "${STATUS}" "${PROFILE}"
+            if [ "${REUSED}" = true ]; then
+              echo "Taken from earlier in this run, not rebuilt."
+              echo
+            fi
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Artifact | \`${NAME}\` |"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Digest | \`${DIGEST:-none}\` |"
+            echo "| SBOM | \`${SBOM_NAME}\` |"
+            if [ -f "${ARTIFACT_DIR}/SHA256SUMS" ]; then
+              printf '\n```\n'; cat "${ARTIFACT_DIR}/SHA256SUMS"; printf '```\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

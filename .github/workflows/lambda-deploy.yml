@@ -1,33 +1,21 @@
-# The fleet's shared Lambda deploy: build a cog's zip from its lockfile, prove
-# it starts in Lambda's own runtime, upload it, and prove what AWS holds is
-# what this run built.
+# The fleet's shared Lambda deploy: take a cog's zip, upload it, and prove
+# what AWS holds is what was built.
 #
 # Terraform owns the function's configuration and is applied from a
 # workstation (each cog's infra/). This owns the code only. The deploy role
 # a cog passes can call UpdateFunctionCode and GetFunction(Configuration)
 # and nothing else.
 #
-# **Why this is shared.** It was a file copied from evaluator-cog into
-# deejay-cog, and the copy carried a flaw: wheels were chosen for the
-# GitHub runner rather than for Lambda, and the import guard ran on the
-# runner too, so it passed. deejay-cog's first deploy shipped cryptography
-# built against glibc 2.34 to a runtime with 2.26 and failed at import.
-# evaluator-cog had the same flaw for longer and had not tripped it: it ships
-# x86_64 builds of pydantic-core, cryptography and rpds-py to an arm64
-# function, and works only because nothing it runs imports them. One file
-# means that class of bug is fixed once.
-#
-# Three guards, in the order they fail cheapest:
-#   1. Wheels are chosen for the target (--python-platform), never the runner.
-#   2. No compiled library may need a newer glibc than the runtime has.
-#   3. Every module imports, and the handler answers a probe, inside
-#      public.ecr.aws/lambda/python:<version> for the target architecture.
-#      A pass here means the function will start; an import check on the
-#      runner does not. The probe is a malformed SQS record, so it applies
-#      only to a queue consumer (`trigger: sqs`, the default). A function
-#      invoked on a schedule (`trigger: schedule`) takes no event worth
-#      probing, and invoking it would run its real work, so it gets the
-#      import check alone.
+# The zip comes one of two ways:
+#   - From the build stage, by `artifact-name` and `artifact-digest`: the
+#     artifact stages-build.yml made for this commit, downloaded from the
+#     run and refused unless its digest matches. Nothing is rebuilt, so
+#     what deploys is what was tested. The build stage already ran the
+#     zip's three guards; target.json in the artifact records what it was
+#     built for, and a deploy for anything else is refused.
+#   - From `ref`, as before: the zip is built here by the lambda-zip action,
+#     the same action and the same three guards the build stage runs (its
+#     header says why each exists).
 #
 # Usage, from a cog's ci.yml. Call it as a job after `release`, not with
 # `on: release`: semantic-release publishes with GITHUB_TOKEN and GitHub
@@ -47,6 +35,14 @@
 #       role-arn: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
 #       region: ${{ vars.AWS_REGION }}
 #       function-name: ${{ vars.AWS_FUNCTION_NAME }}
+#
+# In the same run as the build stage, pass its outputs instead of `ref`:
+#
+#       artifact-name: ${{ needs.build.outputs.artifact-name }}
+#       artifact-digest: ${{ needs.build.outputs.artifact-digest }}
+#
+# The actions are named with `$/`, which resolves to this repository at the
+# commit of this file, so a caller pinned to a tag gets them from that tag.
 
 name: lambda-deploy
 
@@ -54,9 +50,17 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: "The ref to build — the release tag when called from ci.yml."
+        description: "The ref to build, the release tag when called from ci.yml. Not used, and may be empty, when artifact-name is given."
         type: string
-        required: true
+        default: ""
+      artifact-name:
+        description: "The build stage's artifact-name output. With artifact-digest, deploy that artifact's zip instead of building one."
+        type: string
+        default: ""
+      artifact-digest:
+        description: "The build stage's artifact-digest output (sha256:<hex>). The artifact is refused unless it matches."
+        type: string
+        default: ""
       handler:
         description: "module.path.function, exactly as infra/worker.tf's `handler`. The module must be importable from the zip root."
         type: string
@@ -125,158 +129,92 @@ jobs:
       # for why github.job_workflow_sha cannot stand in for it.
       WORKFLOW_VERSION: v3
     steps:
-      - name: Resolve the target
+      - name: Resolve the source
+        id: source
+        env:
+          REF: ${{ inputs.ref }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
         run: |
           set -euo pipefail
           echo "lambda-deploy.yml ${WORKFLOW_VERSION}: ${HANDLER} on python${PY}/${ARCH}"
-
-          case "$ARCH" in
-            x86_64) echo "WHEEL_ARCH=x86_64"  >> "$GITHUB_ENV"; echo "DOCKER_PLATFORM=linux/amd64" >> "$GITHUB_ENV" ;;
-            arm64)  echo "WHEEL_ARCH=aarch64" >> "$GITHUB_ENV"; echo "DOCKER_PLATFORM=linux/arm64" >> "$GITHUB_ENV" ;;
-            *) echo "::error::architecture must be x86_64 or arm64, got '$ARCH'"; exit 1 ;;
-          esac
-
-          case "$TRIGGER" in
-            sqs|schedule) ;;
-            *) echo "::error::trigger must be sqs or schedule, got '$TRIGGER'"; exit 1 ;;
-          esac
-
-          # The runtime's glibc, by Python version. python3.8–3.11 run on
-          # Amazon Linux 2 (glibc 2.26); 3.12 onward on Amazon Linux 2023
-          # (glibc 2.34). Wheels are chosen at the matching manylinux tag.
-          case "$PY" in
-            3.8|3.9|3.10|3.11) echo "GLIBC_MINOR=26" >> "$GITHUB_ENV"; echo "MANYLINUX=manylinux_2_17" >> "$GITHUB_ENV" ;;
-            3.12|3.13|3.14)    echo "GLIBC_MINOR=34" >> "$GITHUB_ENV"; echo "MANYLINUX=manylinux_2_28" >> "$GITHUB_ENV" ;;
-            *) echo "::error::no known Lambda runtime for python ${PY}"; exit 1 ;;
-          esac
-
-          module="${HANDLER%.*}"
-          echo "MODULE=${module}"             >> "$GITHUB_ENV"
-          echo "FUNC=${HANDLER##*.}"          >> "$GITHUB_ENV"
-          echo "MODULE_PATH=${module//.//}.py" >> "$GITHUB_ENV"
-          echo "PACKAGE=${module%%.*}"        >> "$GITHUB_ENV"
+          if [ -n "${ARTIFACT_NAME}" ] || [ -n "${ARTIFACT_DIGEST}" ]; then
+            if [ -z "${ARTIFACT_NAME}" ] || [ -z "${ARTIFACT_DIGEST}" ]; then
+              echo "::error::artifact-name and artifact-digest go together: pass both of the build stage's outputs, or neither."
+              exit 1
+            fi
+            echo "from=artifact" >> "$GITHUB_OUTPUT"
+            echo "Deploying ${ARTIFACT_NAME} (${ARTIFACT_DIGEST}) from the build stage."
+          elif [ -n "${REF}" ]; then
+            echo "from=ref" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Nothing to deploy: pass ref, or the build stage's artifact-name and artifact-digest."
+            exit 1
+          fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.source.outputs.from == 'ref'
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-
       - name: Build the zip
-        run: |
-          set -euo pipefail
-          uv python install "$PY"
-
-          # From the lockfile, not a fresh resolve: the zip carries exactly
-          # the versions the test job ran against (CD-020).
-          uv export --frozen --no-dev --no-emit-project --no-hashes \
-            --format requirements-txt -o requirements.lock.txt
-
-          # Guard 1. Left to itself uv picks the newest wheel the *runner*
-          # can load, for the runner's architecture.
-          uv pip install --python "$PY" \
-            --python-platform "${WHEEL_ARCH}-${MANYLINUX}" \
-            --target build/ -r requirements.lock.txt --quiet
-          uv pip install --python "$PY" --target build/ --no-deps . --quiet
-
-          rm -rf build/boto3 build/botocore build/s3transfer build/jmespath
-          for path in $STRIP; do rm -rf "build/$path"; done
-          # dist-info stays. It is metadata, not dead weight: packages read
-          # their own version from it at import — httpx2, under anthropic and
-          # openai, does `importlib.metadata.version("httpx2")` and fails to
-          # import without it — and the run-report library stamps each
-          # report with the cog's version the same way.
-          rm -rf build/__pycache__
-
-          test -f "build/${MODULE_PATH}" || {
-            echo "::error::${MODULE_PATH} is not at the zip root; the handler cannot resolve"
-            exit 1
-          }
-
-      - name: "Guard 2: glibc"
-        run: |
-          set -euo pipefail
-          worst=$(find build -name '*.so*' -type f -exec readelf -V {} + 2>/dev/null \
-            | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n -u | tail -1 || true)
-          echo "newest glibc symbol required: ${worst:-none}; runtime has GLIBC_2.${GLIBC_MINOR}"
-          if [ -n "$worst" ] && [ "${worst#GLIBC_2.}" -gt "$GLIBC_MINOR" ]; then
-            echo "::error::the zip needs $worst; the runtime has GLIBC_2.${GLIBC_MINOR}"
-            find build -name '*.so*' -type f | while read -r f; do
-              readelf -V "$f" 2>/dev/null | grep -q "$worst" && echo "  $f"
-            done
-            exit 1
-          fi
-
-      # An arm64 image on an x86_64 runner needs emulation. Slow, but only
-      # for an import walk and one handler call.
-      - name: Set up QEMU
-        if: inputs.architecture == 'arm64'
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        id: built
+        if: steps.source.outputs.from == 'ref'
+        uses: $/.github/actions/lambda-zip
         with:
-          platforms: arm64
+          handler: ${{ inputs.handler }}
+          architecture: ${{ inputs.architecture }}
+          trigger: ${{ inputs.trigger }}
+          python-version: ${{ inputs.python-version }}
+          strip: ${{ inputs.strip }}
+          output-dir: ${{ runner.temp }}/lambda
 
-      - name: "Guard 3: start in Lambda's own image"
+      - name: Take the build stage's artifact
+        id: artifact
+        if: steps.source.outputs.from == 'artifact'
+        uses: $/.github/actions/fetch-artifact
+        with:
+          name: ${{ inputs.artifact-name }}
+          digest: ${{ inputs.artifact-digest }}
+
+      # The build stage probed the zip for one handler, architecture, Python
+      # and trigger. Deploying it as anything else would skip the guards
+      # that matter, so a difference is refused rather than shipped.
+      - name: Check the artifact was built for this function
+        id: taken
+        if: steps.source.outputs.from == 'artifact'
+        env:
+          DIR: ${{ steps.artifact.outputs.path }}
         run: |
           set -euo pipefail
-          docker run --rm -i --platform "$DOCKER_PLATFORM" \
-            -v "$PWD/build:/var/task:ro" -e PYTHONPATH=/var/task \
-            -e PACKAGE -e MODULE -e FUNC -e TRIGGER \
-            --entrypoint /var/lang/bin/python3 \
-            "public.ecr.aws/lambda/python:${PY}" - <<'PROBE'
-          import importlib, os, pkgutil, platform, sys
-
-          print(f"runtime: python {platform.python_version()} on {platform.machine()}")
-          package = importlib.import_module(os.environ["PACKAGE"])
-          failed = []
-          for m in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
-              try:
-                  importlib.import_module(m.name)
-              except Exception as exc:
-                  failed.append(f"{m.name}: {type(exc).__name__}: {exc}")
-          if failed:
-              print("::error::the package does not import in the Lambda runtime")
-              for line in failed:
-                  print(f"  {line}")
-              sys.exit(1)
-
-          handler = getattr(importlib.import_module(os.environ["MODULE"]), os.environ["FUNC"])
-          if not callable(handler):
-              print(f"::error::{os.environ['MODULE']}.{os.environ['FUNC']} is not callable")
-              sys.exit(1)
-
-          # A scheduled function's event carries nothing to probe, and
-          # calling it would run a real tick with no configuration.
-          if os.environ["TRIGGER"] == "schedule":
-              print("every module imports, and the handler resolves, in the Lambda runtime")
-              sys.exit(0)
-
-          # The probe from each cog's infra runbook, without AWS: a
-          # malformed record must come back as a reported failure — the
-          # batchItemFailures shape the event source mapping acts on — and
-          # not as an exception, which would fail the whole batch.
-          record = {"messageId": "probe-1", "body": "not json", "attributes": {}}
-          result = handler({"Records": [record]}, None)
-          expected = {"batchItemFailures": [{"itemIdentifier": "probe-1"}]}
-          if result != expected:
-              print(f"::error::probe returned {result!r}, expected {expected!r}")
-              sys.exit(1)
-          print("every module imports, and the handler answers, in the Lambda runtime")
-          PROBE
-
-      - name: Package
-        run: |
-          set -euo pipefail
-          cd build
-          zip -qr "$GITHUB_WORKSPACE/worker.zip" .
-          cd "$GITHUB_WORKSPACE"
-          size=$(stat -c%s worker.zip)
-          echo "zip is $((size / 1024 / 1024)) MB of the 50 MB direct-upload limit"
-          if [ "$size" -gt 47000000 ]; then
-            echo "::error::the zip is within 3 MB of the 50 MB limit"
+          zip="${DIR}/lambda/worker.zip"
+          target="${DIR}/lambda/target.json"
+          if [ ! -f "${zip}" ] || [ ! -f "${target}" ]; then
+            echo "::error::The artifact has no lambda/worker.zip and lambda/target.json: it is not a python-service build with a lambda-handler."
             exit 1
           fi
-          echo "LOCAL_SHA=$(openssl dgst -sha256 -binary worker.zip | base64)" >> "$GITHUB_ENV"
+          built="$(jq -c '{handler, architecture, "python-version", trigger}' "${target}")"
+          wanted="$(jq -cn --arg handler "${HANDLER}" --arg architecture "${ARCH}" --arg python "${PY}" --arg trigger "${TRIGGER}" \
+            '{handler: $handler, architecture: $architecture, "python-version": $python, trigger: $trigger}')"
+          if [ "${built}" != "${wanted}" ]; then
+            echo "::error::The artifact was built for ${built}; this deploy is for ${wanted}."
+            exit 1
+          fi
+          echo "zip=${zip}" >> "$GITHUB_OUTPUT"
+          echo "code-sha256=$(openssl dgst -sha256 -binary "${zip}" | base64)" >> "$GITHUB_OUTPUT"
+
+      - name: The zip to deploy
+        env:
+          BUILT_ZIP: ${{ steps.built.outputs.zip }}
+          BUILT_SHA: ${{ steps.built.outputs.code-sha256 }}
+          TAKEN_ZIP: ${{ steps.taken.outputs.zip }}
+          TAKEN_SHA: ${{ steps.taken.outputs.code-sha256 }}
+        run: |
+          set -euo pipefail
+          {
+            echo "ZIP=${BUILT_ZIP:-${TAKEN_ZIP}}"
+            echo "LOCAL_SHA=${BUILT_SHA:-${TAKEN_SHA}}"
+          } >> "$GITHUB_ENV"
 
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -297,10 +235,10 @@ jobs:
             exit 1
           fi
           aws lambda update-function-code --function-name "$FUNCTION" \
-            --zip-file fileb://worker.zip --publish >/dev/null
+            --zip-file "fileb://${ZIP}" --publish >/dev/null
           aws lambda wait function-updated --function-name "$FUNCTION"
 
-      # The checksum AWS reports must be the one this run built, so a green
+      # The checksum AWS reports must be the zip this run built or took, so a green
       # run is evidence rather than an assumption.
       - name: Confirm what is deployed
         env:
@@ -312,6 +250,6 @@ jobs:
           echo "built:    $LOCAL_SHA"
           echo "deployed: $REMOTE_SHA"
           if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
-            echo "::error::the deployed checksum is not the one this run built"
+            echo "::error::the deployed checksum is not the zip this run built or took"
             exit 1
           fi

@@ -8,8 +8,9 @@ workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 | `security` | `security.yml` — the fleet's shared security controls |
 | `test` | `python-test.yml` — lock check, lint, format and tests for a uv repo |
 | `lint`, `unit`, `integration`, `contract`, `security`, gated by `test` | `stages-test.yml` — the canonical pipeline's stages before `build`, for any profile (see Test stages) |
+| `build` | `stages-build.yml` — the commit's one artifact and its SBOM, for any profile (see Build stage) |
 | `release` | `release.yml` — semantic-release from the fleet's locked tooling |
-| `deploy` | `lambda-deploy.yml` — build, prove and upload a cog's Lambda zip |
+| `deploy` | `lambda-deploy.yml` — take the build's Lambda zip (or build and prove one) and upload it |
 | `evaluate` | `evaluate.yml` — ask for the repository to be evaluated |
 
 Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
@@ -130,15 +131,15 @@ produces no second release, deploy or evaluation.
 | `lint`, `unit`, `integration`, `contract` | the commit; the profile's commands; for `integration`, the Postgres service container the caller names; for `contract`, the contract suite the caller names, at the release its lock holds, and the development API | what ran and its result in the job summary, or why the stage had nothing to run | `lint`, `unit` and `integration` change nothing outside the run; `contract` writes only fixed rows the development API upserts, so a second run converges on the first |
 | `test` | the results of `lint`, `unit`, `integration`, `contract` and `security` | a table of them in the job summary | it only reads them |
 | `security` | the commit; the profile's language and package manager | findings in the job summary | it changes nothing outside the run |
-| `build` | the commit; the profile's build | `artifact-name`, `artifact-digest`; the artifact (wheel, Lambda zip, container image or site bundle) and its SBOM, kept with the run | an artifact for this commit already in the run is reused, not rebuilt |
+| `build` | the commit; the profile's build | `artifact-name`, `artifact-digest`; the artifact (wheel, Lambda zip, container image or site bundle) and its SBOM, kept with the run | an artifact for this commit already in the run is reused, not rebuilt: it is checked against its seal and reported with the same digest |
 | `evaluate-pre` | `repo`, `sha`, `phase: pre-release` | the evaluation id | the evaluator answers a repeated (repo, sha, phase) with the evaluation it already has |
 | `release` | the commit, or `ref` from the reconciler | `published` (true or false), `version`, `tag`, `sha` | a tag already on this commit is this commit's release: the stage finishes what is missing (the GitHub release, the package publish, the fleet notice) and reports it, rather than cutting another |
 | `deploy` | `artifact-digest`, `environment`, `version` | `deployed-version` | it reads what the target runs first and skips when that is already this version |
 | `verify` | `environment`, `version`, the profile's check | `verified` | it only reads the running service |
 | `evaluate-post` | `repo`, `version`, `sha`, `phase: post-release` | the evaluation id | the evaluator answers a repeated (repo, version, phase) with the evaluation it already has |
 
-Every later stage consumes the artifact `build` produced, by digest. No
-stage rebuilds it.
+Every later stage consumes the artifact `build` produced, by digest,
+through the `fetch-artifact` action (see Build stage). No stage rebuilds it.
 
 Every job declares `timeout-minutes`. Network calls (registry pulls,
 package publish, deploys, API calls) retry with backoff. `release` and
@@ -158,12 +159,12 @@ and the repository's inputs override them.
 
 | Profile | Tooling | Integration and contract | Artifact | Deploy | Verify |
 |---|---|---|---|---|---|
-| `python-service` | uv, ruff, mypy, pytest | Postgres service container where the repository's tests need it; contract suites it consumes | Lambda zip, or container image for a Railway worker | AWS Lambda functions, or Railway services | the function's or service's reported version |
+| `python-service` | uv, ruff, mypy, pytest | Postgres service container where the repository's tests need it; contract suites it consumes | wheel and sdist, with the Lambda zip when it names a handler | AWS Lambda functions, or Railway services | the function's or service's reported version |
 | `api-service` | uv, ruff, mypy, pytest | Postgres service container; the contract suites it provides and consumes | container image | Railway | `/health` reports the released version |
 | `python-library` | uv, ruff, mypy, pytest | contract suites against the development API where it ships them | wheel and sdist | published to PyPI by `release`, which also tells the fleet a release is out | the published version resolves on PyPI |
 | `astro-site` | Node with npm or pnpm, typecheck, build | the API contract suites the site consumes; end-to-end tests where it has them | site bundle | Cloudflare Pages, uploaded from the pipeline | the site serves the released version |
 | `npm-library` | Node with npm or pnpm, typecheck, lint, tests | contract suites where it ships them | npm package | published to the registry by `release` | the published version resolves |
-| `terraform-infra` | Terraform fmt and validate, the repository's consistency checks | the task contract suite | the reviewed plan | `terraform apply` of that plan | a fresh plan shows no changes |
+| `terraform-infra` | Terraform fmt and validate, the repository's consistency checks | the task contract suite | the reviewed plan, made where credentials are (`build` skips and says so) | `terraform apply` of that plan | a fresh plan shows no changes |
 | `shared-workflows` | workflow static analysis, the pipeline's fixture repositories | — | — | the release moves the major tag | the fixtures pass at the new tag |
 
 `shared-workflows` is this repository. It has no `dev`: pull requests
@@ -277,7 +278,7 @@ one or the other.
 
 `pipeline.yml` does not exist yet. When it does, it calls this workflow as
 one job, with `$/` so a caller pinned to a tag runs the stages from that
-same tag, and `build` needs it:
+same tag, and `build` (see Build stage) needs it:
 
 ```yaml
 jobs:
@@ -291,11 +292,112 @@ jobs:
       CONTRACT_SUITE_API_KEY: ${{ secrets.CONTRACT_SUITE_API_KEY }}
   build:
     needs: stages
+    uses: $/.github/workflows/stages-build.yml
+    with:
+      profile: ${{ inputs.profile }}
 ```
 
 In a repository's run the gate then reports as `pipeline / stages / test`,
 the name its ruleset requires. Until then a repository may call
 `stages-test.yml` directly, as in the comment at the top of that file.
+
+### Build stage
+
+`stages-build.yml` is the `build` stage: one job, `build`, that makes the
+commit's one artifact, seals it with a digest, generates its SBOM and keeps
+both with the run. Every stage after it takes the artifact by name and
+digest instead of building again, so what is released and deployed is the
+thing that was built and tested.
+
+| Profile | Artifact (directory in it) |
+|---|---|
+| `python-library` | `uv build`: the wheel and sdist (`dist/`) |
+| `python-service` | the wheel and sdist (`dist/`), and with `lambda-handler` set, the Lambda zip and `target.json`, what it was built for (`lambda/`) |
+| `api-service` | the container image from the `Dockerfile`, saved as a docker-archive tarball with its image ID (`image/`). It is never pushed; a deploy pushes what it takes |
+| `astro-site` | the site the `build` script writes to `dist`, as one tarball (`site/`) |
+| `npm-library` | `npm pack` (or `pnpm pack`), after the `build` script where there is one (`package/`) |
+| `terraform-infra` | none: skipped and says why. The artifact is the reviewed plan, and a plan needs the state backend and the providers' credentials, which the build stage does not hold |
+| `shared-workflows` | none: skipped and says why. The release moves the major tag |
+
+The Lambda zip is made by the `lambda-zip` action, which `lambda-deploy.yml`
+also runs when it is not given an artifact, so the zip and its three guards
+(see Shared Lambda deploy) are one piece of code wherever it is built.
+
+**Version.** The build's version is the one the commit declares, in
+`pyproject.toml` or `package.json`, with `+g` and the commit's first 12 hex
+digits: `1.4.0+g0123456789ab`. It says what the build is, the commit that
+declares 1.4.0, and it orders after that release and before the next. It
+labels the artifact; the files are built exactly as the commit has them.
+semantic-release's next version is not used: it is known only to a release
+run, on `main`, with the tag history and a token, and `build` runs on every
+event, pull requests included.
+
+**Digest.** The artifact's directory is sealed with `SHA256SUMS`, the
+SHA-256 of every file in it by path, and `artifact-digest` is
+`sha256:` and the SHA-256 of that manifest. One digest covers an artifact of
+several files as well as one of a single file, and a changed, missing or
+added file changes it. The `artifact-digest` action seals and checks; the
+work is its `artifact-digest.sh`, which `scripts/test-artifact-digest.sh`
+proves against each way an artifact can be wrong.
+
+**Reuse.** Before building, the stage looks in the run for an artifact of
+this name, which holds the commit's sha. One that is there (a re-run, or a
+second call) is downloaded, checked against its seal and reported with the
+same digest, and nothing is rebuilt. An SBOM missing from an earlier attempt
+is made again from the artifact's bytes.
+
+**SBOM.** syft, at the release `security.yml` pins, describes the artifact
+itself: the image's layers, or the archives unpacked (the Lambda zip holds
+every dependency's metadata). It is uploaded as `<artifact-name>-sbom` from
+the same job as the build, and kept for every build as ecosystem-standards
+SEC-005 asks, with the retention `security.yml` gives its own SBOM.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `profile` | required | The repository's profile |
+| `working-directory` | `.` | As for `stages-test.yml` |
+| `timeout-minutes` | `30` | How long the build job may run |
+| `python-version` | `3.14` | Python profiles: the runtime the repository deploys to |
+| `node-version` | `22` | Node profiles: the Node release line |
+| `build-script` | `build` | `astro-site`: the script that builds the site. `npm-library`: run before packing when `package.json` has it |
+| `site-dir` | `dist` | `astro-site`: where the build script writes the site |
+| `dockerfile` | `Dockerfile` | `api-service`: the image's Dockerfile |
+| `lambda-handler` | empty | `python-service`: `module.function`, as `handler` in `infra/worker.tf`. Empty, no Lambda zip |
+| `lambda-architecture` | `x86_64` | `python-service`: as `architectures` in `infra/worker.tf` |
+| `lambda-trigger` | `sqs` | `python-service`: `sqs` or `schedule`, what invokes the function |
+| `lambda-strip` | empty | `python-service`: top-level paths left out of the zip |
+| `syft-version` | `1.29.1` | The SBOM's syft, as `security.yml` pins it |
+
+| Output | Meaning |
+|---|---|
+| `artifact-name` | The artifact's name in the run; empty when the profile builds nothing |
+| `artifact-digest` | `sha256:<hex>` of its `SHA256SUMS` |
+| `sbom-name` | The SBOM artifact's name |
+| `version` | The build's version, above |
+| `reused` | `true` when the artifact was taken from earlier in the run |
+
+#### Taking the artifact
+
+A stage after `build` takes the artifact with the `fetch-artifact` action,
+which downloads it from the run by name and fails unless its digest is the
+one `build` reported:
+
+```yaml
+      - uses: $/.github/actions/fetch-artifact
+        id: artifact
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          digest: ${{ needs.build.outputs.artifact-digest }}
+      # the verified artifact is in ${{ steps.artifact.outputs.path }}
+```
+
+`release.yml` and `lambda-deploy.yml` take `artifact-name` and
+`artifact-digest` inputs and do this themselves. Without them they behave
+as they always have. `release.yml` points `PIPELINE_ARTIFACT_DIR` at the
+artifact for semantic-release, so a repository's publish step can ship it.
+`lambda-deploy.yml` deploys the artifact's `lambda/worker.zip` instead of
+building one, and refuses it unless `target.json` names the handler,
+architecture, Python and trigger the deploy is for.
 
 ### Enforced and subscribed
 
@@ -388,7 +490,11 @@ reports holds a pull request open for good.
   integration test that needs the Postgres service container and fails
   without it, `npm-library` has `lint` and `test` scripts and `astro-site`
   has neither, `python-service` and `python-library` have no integration
-  tests. The `fixture` job runs the release stage twice on one commit,
+  tests. The `build` job runs `stages-build.yml` twice against each fixture
+  and takes the artifact by digest with `fetch-artifact`
+  (`self-test-build.yml`), and `artifact-digest check` runs
+  `scripts/test-artifact-digest.sh`, which plants a digest mismatch and
+  every other way an artifact can be wrong. The `fixture` job runs the release stage twice on one commit,
   and, for the Python fixtures, the local `python-checks` action with
   every check in one job as `python-test.yml` runs it (not
   `python-test.yml` itself, which runs the published action and so would
@@ -404,7 +510,9 @@ reports holds a pull request open for good.
   and Node fixtures are `private`, so a registry refuses them even if
   something tried. No fixture names a contract suite, so `contract`, which
   calls the development API, skips against every one, and a fixture needs
-  no secret and reaches no network beyond package registries. Deploy and
+  no secret and reaches no network beyond package and container registries.
+  The build stage uploads only to the run, and the `api-service` image is
+  saved to a tarball, never pushed. Deploy and
   evaluation stages do not run against a fixture until they can do so with
   no effect outside the run.
 - **One gate.** The `gate` job in `self-test.yml` passes only if every
@@ -434,7 +542,8 @@ As each later stage lands it adds its own proof here, run twice against
 the fixtures in the same job:
 
 - `build` reuses the artifact already in the run for this commit, and the
-  second run reports the same digest.
+  second run reports the same digest. The `build` job in `self-test.yml`
+  proves it for every fixture.
 - `deploy` reads what the target runs first; against a fixture its target
   is a stand-in that only records, and the second run must skip with the
   version already there.
@@ -447,7 +556,7 @@ the fixtures in the same job:
 
 #### Pointing it at pipeline.yml
 
-Once `pipeline.yml` exists, the `stages`, `fixture` and `pending` jobs in
+Once `pipeline.yml` exists, the `stages`, `build`, `fixture` and `pending` jobs in
 `self-test.yml` become one matrix job over the profiles that calls it:
 
 ```yaml
@@ -755,6 +864,7 @@ released nothing.
 | `node-version` | `22` | Node.js version semantic-release runs under |
 | `git-author-name` | empty | Author and committer name of the release commit; empty keeps semantic-release-bot |
 | `git-author-email` | empty | Author and committer email, used with `git-author-name` |
+| `artifact-name`, `artifact-digest` | empty | Workflow only: the build stage's outputs. The release takes that artifact, refuses it on a digest mismatch, and sets `PIPELINE_ARTIFACT_DIR` to it for semantic-release (see Build stage) |
 | `github-token` | the job's token | Action only: the token semantic-release pushes and creates the release with |
 
 Run by hand from the Actions tab, `release.yml` is a dry run of this
@@ -762,9 +872,12 @@ repository's own next release.
 
 ## Shared Lambda deploy
 
-`.github/workflows/lambda-deploy.yml` builds a cog's function zip from its
-lockfile, proves it starts in Lambda's own runtime, uploads it, and fails
-unless the checksum AWS reports is the one it built. Each cog's `infra/`
+`.github/workflows/lambda-deploy.yml` uploads a cog's function zip and
+fails unless the checksum AWS reports is the zip's. Given the build stage's
+`artifact-name` and `artifact-digest`, it deploys that artifact's zip;
+given `ref`, it builds the zip from the lockfile and proves it starts in
+Lambda's own runtime with the `lambda-zip` action, the one the build stage
+runs. Each cog's `infra/`
 owns the function's configuration; this owns only its code.
 
 ```yaml
@@ -792,9 +905,10 @@ sweep) `needs: deploy`.
 
 | Input | Default | Meaning |
 |---|---|---|
-| `ref` | *(required)* | The release tag to build |
+| `ref` | empty | The release tag to build. Not used with `artifact-name` |
+| `artifact-name`, `artifact-digest` | empty | The build stage's outputs: deploy that artifact's zip instead of building. Both or neither |
 | `handler` | *(required)* | `module.function`, as `handler` in the cog's `infra/worker.tf` |
-| `architecture` | *(required)* | `x86_64` or `arm64`, as `architectures` in `infra/worker.tf`. The deploy refuses a function whose architecture differs |
+| `architecture` | *(required)* | `x86_64` or `arm64`, as `architectures` in `infra/worker.tf`. The deploy refuses a function whose architecture differs, and an artifact built for another |
 | `python-version` | `3.11` | As `runtime` in `infra/worker.tf` |
 | `strip` | *(none)* | Top-level paths to drop from the zip because the cog never imports them. boto3 is always dropped |
 | `role-arn`, `region`, `function-name` | *(required)* | From the cog's `terraform output` |

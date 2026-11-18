@@ -1,4 +1,4 @@
-# What running a fixture's checks locally leaves behind.
+# What running a fixture's checks and builds locally leaves behind.
 .venv/
 .coverage
 .mypy_cache/
@@ -7,3 +7,4 @@
 __pycache__/
 node_modules/
 .terraform/
+dist/

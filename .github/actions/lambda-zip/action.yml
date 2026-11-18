@@ -1,0 +1,154 @@
+# Builds a cog's Lambda zip from its lockfile and proves it starts in
+# Lambda's own runtime. The build stage (stages-build.yml) runs it for the
+# python-service profile, and lambda-deploy.yml runs it when it is not given
+# the build stage's artifact, so the zip is made one way wherever it is made.
+#
+# **Why the guards.** The deploy was a file copied from evaluator-cog into
+# deejay-cog, and the copy carried a flaw: wheels were chosen for the
+# GitHub runner rather than for Lambda, and the import guard ran on the
+# runner too, so it passed. deejay-cog's first deploy shipped cryptography
+# built against glibc 2.34 to a runtime with 2.26 and failed at import.
+# evaluator-cog had the same flaw for longer and had not tripped it: it
+# ships x86_64 builds of pydantic-core, cryptography and rpds-py to an arm64
+# function, and works only because nothing it runs imports them.
+#
+# Three guards, in the order they fail cheapest:
+#   1. Wheels are chosen for the target (--python-platform), never the runner.
+#   2. No compiled library may need a newer glibc than the runtime has.
+#   3. Every module imports, and the handler answers a probe, inside
+#      public.ecr.aws/lambda/python:<version> for the target architecture.
+#      The probe is a malformed SQS record, so it applies only to a queue
+#      consumer (`trigger: sqs`). A function invoked on a schedule
+#      (`trigger: schedule`) takes no event worth probing, and invoking it
+#      would run its real work, so it gets the import check alone.
+#
+# The zip is written as worker.zip in output-dir, with target.json beside
+# it recording the handler, architecture, Python and trigger it was built
+# and probed for.
+#
+# Usage, as a step after a checkout of the cog:
+#
+#   - uses: $/.github/actions/lambda-zip
+#     id: zip
+#     with:
+#       handler: deejay_cog.worker.lambda_handler
+#       architecture: x86_64
+
+name: lambda-zip
+description: Build a Lambda zip from the lockfile for the target runtime, and prove it starts there.
+
+inputs:
+  handler:
+    description: "module.path.function, exactly as infra/worker.tf's `handler`. The module must be importable from the zip root."
+    required: true
+  architecture:
+    description: "x86_64 | arm64, as `architectures` in the cog's infra/worker.tf."
+    required: true
+  trigger:
+    description: "sqs | schedule: what invokes the function. sqs gets guard 3's malformed-record probe; schedule gets the import check only."
+    default: "sqs"
+  python-version:
+    description: "The Lambda runtime's Python, as in `runtime = \"python<version>\"`."
+    default: "3.14"
+  strip:
+    description: "Space-separated top-level paths to remove from the zip, for dependencies the cog never imports. Guard 3 fails the build if one is in fact imported. boto3 and its stack are always removed; the runtime provides them."
+    default: ""
+  working-directory:
+    description: "The directory, within the checkout, holding the cog."
+    default: "."
+  output-dir:
+    description: "Where to write worker.zip and target.json. Empty: a directory under the runner's temporary directory."
+    default: ""
+
+outputs:
+  zip:
+    description: "The zip's path."
+    value: ${{ steps.package.outputs.zip }}
+  sha256:
+    description: "The zip's SHA-256, in hex."
+    value: ${{ steps.package.outputs.sha256 }}
+  code-sha256:
+    description: "The zip's SHA-256 in base64, the form Lambda reports as CodeSha256."
+    value: ${{ steps.package.outputs.code-sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the target
+      id: target
+      shell: bash
+      env:
+        HANDLER: ${{ inputs.handler }}
+        ARCH: ${{ inputs.architecture }}
+        PY: ${{ inputs.python-version }}
+        TRIGGER: ${{ inputs.trigger }}
+      run: '"${GITHUB_ACTION_PATH}/lambda-zip.sh" resolve'
+
+    # The pinned uv, read from pipeline.yaml by the setup-uv action's script.
+    # Not that action itself: a composite action cannot name a sibling
+    # action in its own repository, only one in the caller's workspace.
+    - name: Read the pinned uv
+      id: uv
+      shell: bash
+      run: echo "version=$("${GITHUB_ACTION_PATH}/../setup-uv/uv-version.sh")" >> "${GITHUB_OUTPUT}"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        version: ${{ steps.uv.outputs.version }}
+
+    - name: Build (guard 1)
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PY: ${{ inputs.python-version }}
+        STRIP: ${{ inputs.strip }}
+        BUILD: ${{ runner.temp }}/lambda-zip/build
+        WHEEL_ARCH: ${{ steps.target.outputs.wheel-arch }}
+        MANYLINUX: ${{ steps.target.outputs.manylinux }}
+        MODULE_PATH: ${{ steps.target.outputs.module-path }}
+      run: |
+        set -euo pipefail
+        uv python install "${PY}"
+        "${GITHUB_ACTION_PATH}/lambda-zip.sh" build
+
+    - name: "Guard 2: glibc"
+      shell: bash
+      env:
+        BUILD: ${{ runner.temp }}/lambda-zip/build
+        GLIBC_MINOR: ${{ steps.target.outputs.glibc-minor }}
+      run: '"${GITHUB_ACTION_PATH}/lambda-zip.sh" glibc'
+
+    # An arm64 image on an x86_64 runner needs emulation. Slow, but only
+    # for an import walk and one handler call.
+    - name: Set up QEMU
+      if: inputs.architecture == 'arm64'
+      uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      with:
+        platforms: arm64
+
+    - name: "Guard 3: start in Lambda's own image"
+      shell: bash
+      env:
+        BUILD: ${{ runner.temp }}/lambda-zip/build
+        PY: ${{ inputs.python-version }}
+        DOCKER_PLATFORM: ${{ steps.target.outputs.docker-platform }}
+        PACKAGE: ${{ steps.target.outputs.package }}
+        MODULE: ${{ steps.target.outputs.module }}
+        FUNC: ${{ steps.target.outputs.func }}
+        TRIGGER: ${{ inputs.trigger }}
+      run: '"${GITHUB_ACTION_PATH}/lambda-zip.sh" probe'
+
+    - name: Package
+      id: package
+      shell: bash
+      env:
+        BUILD: ${{ runner.temp }}/lambda-zip/build
+        OUT_DIR: ${{ inputs.output-dir }}
+        HANDLER: ${{ inputs.handler }}
+        ARCH: ${{ inputs.architecture }}
+        PY: ${{ inputs.python-version }}
+        TRIGGER: ${{ inputs.trigger }}
+      run: |
+        set -euo pipefail
+        OUT="${OUT_DIR:-${RUNNER_TEMP}/lambda-zip/out}" "${GITHUB_ACTION_PATH}/lambda-zip.sh" package

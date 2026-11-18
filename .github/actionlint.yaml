@@ -16,7 +16,7 @@ paths:
       # workflow that is running, so a caller pinned to a tag gets the
       # action from that same tag. actionlint does not know the form and
       # reads it as an action reference with no ref.
-      - 'specifying action "\$/\.github/actions/semantic-release" in invalid format because ref is missing'
+      - 'specifying action "\$/\.github/actions/(semantic-release|fetch-artifact)" in invalid format because ref is missing'
   .github/workflows/stages-test.yml:
     ignore:
       # The same `$/` form as release.yml, for the stages' actions and for
@@ -26,3 +26,12 @@ paths:
       # remote nor a local workflow.
       - 'specifying action "\$/\.github/actions/(python-checks|setup-uv)" in invalid format because ref is missing'
       - 'reusable workflow call "\$/\.github/workflows/security\.yml" at "uses" is not following the format'
+  .github/workflows/stages-build.yml:
+    ignore:
+      # The same `$/` form as stages-test.yml, for the build stage's actions.
+      - 'specifying action "\$/\.github/actions/(artifact-digest|lambda-zip|setup-uv)" in invalid format because ref is missing'
+  .github/workflows/lambda-deploy.yml:
+    ignore:
+      # The same `$/` form, so a caller pinned to a tag builds or takes the
+      # zip with the actions from that tag.
+      - 'specifying action "\$/\.github/actions/(lambda-zip|fetch-artifact)" in invalid format because ref is missing'
