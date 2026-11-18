@@ -41,6 +41,13 @@
 #       artifact-name: ${{ needs.build.outputs.artifact-name }}
 #       artifact-digest: ${{ needs.build.outputs.artifact-digest }}
 #
+# The pipeline's deploy stage (stages-deploy.yml) calls it with the artifact,
+# `version`, `environment` and `skip-if-deployed: true`: it then reads the
+# function's CodeSha256 first and skips when that is already the zip, so a
+# second run on the same commit deploys nothing, and runs in the GitHub
+# Environment it is given (production behind its protection rules). Without
+# them it behaves as before.
+#
 # The actions are named with `$/`, which resolves to this repository at the
 # commit of this file, so a caller pinned to a tag gets them from that tag.
 
@@ -91,6 +98,25 @@ on:
       function-name:
         type: string
         required: true
+      version:
+        description: "The version being deployed, for the deploy decision and the job summary. Empty: the ref, or the artifact's name."
+        type: string
+        default: ""
+      environment:
+        description: "The GitHub Environment the deploy job runs in (production, behind its protection rules). Empty: none, as before."
+        type: string
+        default: ""
+      skip-if-deployed:
+        description: "Read the function's CodeSha256 first and skip the upload when it is already this zip. The pipeline's deploy stage sets it."
+        type: boolean
+        default: false
+    outputs:
+      deployed-version:
+        description: "The version the function runs after this job, deployed now or already there."
+        value: ${{ jobs.deploy.outputs.deployed-version }}
+      deployed:
+        description: "\"true\" when this job uploaded the zip, \"false\" when the function already ran it."
+        value: ${{ jobs.deploy.outputs.deployed }}
 
 permissions:
   contents: read
@@ -113,9 +139,13 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: ${{ inputs.environment }}
     permissions:
       id-token: write # for OIDC; this is what replaces a long-lived key
       contents: read
+    outputs:
+      deployed-version: ${{ steps.result.outputs.deployed-version }}
+      deployed: ${{ steps.result.outputs.deployed }}
     concurrency:
       group: lambda-deploy-${{ inputs.function-name }}
       cancel-in-progress: false
@@ -221,7 +251,32 @@ jobs:
           role-to-assume: ${{ inputs.role-arn }}
           aws-region: ${{ inputs.region }}
 
+      # The pipeline's deploy stage: the function already running this zip
+      # is already running this version, and is left alone.
+      - name: What the function runs
+        id: running
+        if: inputs.skip-if-deployed
+        env:
+          FUNCTION: ${{ inputs.function-name }}
+        run: |
+          set -euo pipefail
+          running=$(aws lambda get-function --function-name "$FUNCTION" \
+            --query 'Configuration.CodeSha256' --output text)
+          echo "id=${running}" >> "$GITHUB_OUTPUT"
+          echo "${FUNCTION} runs ${running}"
+
+      - name: Does the function already run this zip
+        id: decide
+        if: inputs.skip-if-deployed
+        uses: $/.github/actions/deploy-decision
+        with:
+          mode: decide
+          version: ${{ inputs.version || inputs.ref || inputs.artifact-name }}
+          wanted-id: ${{ env.LOCAL_SHA }}
+          running-id: ${{ steps.running.outputs.id }}
+
       - name: Deploy
+        if: steps.decide.outputs.deploy != 'false'
         env:
           FUNCTION: ${{ inputs.function-name }}
         run: |
@@ -241,6 +296,7 @@ jobs:
       # The checksum AWS reports must be the zip this run built or took, so a green
       # run is evidence rather than an assumption.
       - name: Confirm what is deployed
+        if: steps.decide.outputs.deploy != 'false'
         env:
           FUNCTION: ${{ inputs.function-name }}
         run: |
@@ -253,3 +309,28 @@ jobs:
             echo "::error::the deployed checksum is not the zip this run built or took"
             exit 1
           fi
+
+      - name: Result
+        id: result
+        env:
+          VERSION: ${{ inputs.version || inputs.ref || inputs.artifact-name }}
+          DEPLOY: ${{ steps.decide.outputs.deploy }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          FUNCTION: ${{ inputs.function-name }}
+        run: |
+          set -euo pipefail
+          deployed=true
+          if [ "${DEPLOY}" = false ]; then
+            deployed=false
+            echo "::notice title=deploy skipped (${FUNCTION})::${REASON}"
+          fi
+          echo "deployed-version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "deployed=${deployed}" >> "$GITHUB_OUTPUT"
+          {
+            printf '### deploy: %s\n\n' "${FUNCTION}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| CodeSha256 | \`${LOCAL_SHA}\` |"
+            echo "| Uploaded | ${deployed}${REASON:+ (${REASON})} |"
+          } >> "$GITHUB_STEP_SUMMARY"

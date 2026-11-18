@@ -1,0 +1,42 @@
+# Installs the wrangler the deploy stage uploads Cloudflare Pages sites with,
+# from the lockfile beside this file (README, "Deploy stage"). Every deploy
+# runs the same reviewed release, transitive dependencies included, and
+# Dependabot moves it forward, as with the release tooling.
+#
+# Install scripts are not run: `wrangler pages deploy` of a built site needs
+# none, and the platform binaries it may use arrive as optional
+# dependencies.
+#
+# Usage, as a step (Node already set up):
+#
+#   - uses: $/.github/actions/wrangler
+#     id: wrangler
+#   # then "${{ steps.wrangler.outputs.bin }}" pages deploy ...
+
+name: wrangler
+description: Install the pipeline's locked wrangler and output its path.
+
+outputs:
+  bin:
+    description: "The wrangler executable."
+    value: ${{ steps.install.outputs.bin }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        npm_config_fetch_retries: "5"
+        npm_config_fetch_retry_mintimeout: "10000"
+        npm_config_fetch_retry_maxtimeout: "60000"
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP}/pipeline-wrangler"
+        rm -rf "${dir}"
+        mkdir -p "${dir}"
+        cp "${GITHUB_ACTION_PATH}/package.json" "${GITHUB_ACTION_PATH}/package-lock.json" "${dir}/"
+        npm ci --prefix "${dir}" --ignore-scripts --no-audit --no-fund
+        bin="${dir}/node_modules/.bin/wrangler"
+        "${bin}" --version
+        echo "bin=${bin}" >> "${GITHUB_OUTPUT}"

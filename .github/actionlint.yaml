@@ -33,5 +33,11 @@ paths:
   .github/workflows/lambda-deploy.yml:
     ignore:
       # The same `$/` form, so a caller pinned to a tag builds or takes the
-      # zip with the actions from that tag.
-      - 'specifying action "\$/\.github/actions/(lambda-zip|fetch-artifact)" in invalid format because ref is missing'
+      # zip, and decides whether to deploy it, with the actions from that tag.
+      - 'specifying action "\$/\.github/actions/(lambda-zip|fetch-artifact|deploy-decision)" in invalid format because ref is missing'
+  .github/workflows/stages-deploy.yml:
+    ignore:
+      # The same `$/` form as stages-test.yml, for the deploy stage's actions
+      # and for the Lambda deploy it delegates to.
+      - 'specifying action "\$/\.github/actions/(deploy-decision|fetch-artifact|wrangler)" in invalid format because ref is missing'
+      - 'reusable workflow call "\$/\.github/workflows/lambda-deploy\.yml" at "uses" is not following the format'

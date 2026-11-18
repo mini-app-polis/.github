@@ -1,0 +1,97 @@
+# The deploy stage's two decisions (README, "Deploy stage"): whether this
+# run may deploy to the environment at all (mode: guard), and whether the
+# target already runs the version this run deploys (mode: decide). The work
+# is deploy-decision.sh beside this file, which
+# scripts/test-deploy-decision.sh proves case by case; stages-deploy.yml and
+# lambda-deploy.yml run it through this action so each rule is one piece of
+# code wherever a deploy is decided.
+#
+# Usage, before anything is fetched:
+#
+#   - uses: $/.github/actions/deploy-decision
+#     with:
+#       mode: guard
+#       environment: ${{ inputs.environment }}
+#       target: ${{ inputs.target }}
+#       version: ${{ inputs.version }}
+#
+# and after reading what the target runs:
+#
+#   - uses: $/.github/actions/deploy-decision
+#     id: decide
+#     with:
+#       mode: decide
+#       version: ${{ inputs.version }}
+#       wanted-id: ${{ steps.local.outputs.id }}
+#       running-version: ${{ steps.target.outputs.version }}
+#       running-id: ${{ steps.target.outputs.id }}
+#   # then steps.decide.outputs.deploy is "true" or "false"
+
+name: deploy-decision
+description: Decide whether a run may deploy to an environment, and whether the target already runs its version.
+
+inputs:
+  mode:
+    description: "guard: fail unless this run may deploy to the environment. decide: whether to deploy, given what the target runs."
+    default: "decide"
+  environment:
+    description: "guard: development or production."
+    default: ""
+  target:
+    description: "guard: live, or fake for the self-test's stand-in."
+    default: "live"
+  version:
+    description: "The version this run deploys."
+    required: true
+  wanted-id:
+    description: "decide: what identifies the artifact on the target (image config digest, Lambda CodeSha256, artifact digest)."
+    default: ""
+  running-version:
+    description: "The version the target reports it runs; empty when it records none or runs nothing."
+    default: ""
+  running-id:
+    description: "The identity the target reports; empty when it runs nothing or cannot say."
+    default: ""
+
+outputs:
+  deploy:
+    description: "decide: \"true\" to deploy, \"false\" when the target already runs this version."
+    value: ${{ steps.decide.outputs.deploy }}
+  reason:
+    description: "Why, in one line."
+    value: ${{ steps.decide.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - id: decide
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        TARGET: ${{ inputs.target }}
+        VERSION: ${{ inputs.version }}
+        WANTED_ID: ${{ inputs.wanted-id }}
+        RUNNING_VERSION: ${{ inputs.running-version }}
+        RUNNING_ID: ${{ inputs.running-id }}
+      run: |
+        set -euo pipefail
+        tool="${GITHUB_ACTION_PATH}/deploy-decision.sh"
+        if [ "${MODE}" = guard ]; then
+          if ! out="$("${tool}" guard "${ENVIRONMENT}" "${TARGET}" "${GITHUB_REF}" "${VERSION}" 2>&1)"; then
+            echo "::error title=deploy refused::${out}"
+            exit 1
+          fi
+          echo "${out}"
+          exit 0
+        fi
+        if [ "${MODE}" != decide ]; then
+          echo "::error::mode is '${MODE}': it is guard or decide."
+          exit 1
+        fi
+        out="$("${tool}" decide "${VERSION}" "${WANTED_ID}" "${RUNNING_VERSION}" "${RUNNING_ID}")"
+        verdict="$(sed -n 1p <<< "${out}")"
+        reason="$(sed -n 2p <<< "${out}")"
+        if [ "${verdict}" = deploy ]; then echo "deploy=true" >> "${GITHUB_OUTPUT}"; else echo "deploy=false" >> "${GITHUB_OUTPUT}"; fi
+        echo "reason=${reason}" >> "${GITHUB_OUTPUT}"
+        echo "${verdict}: ${reason}"

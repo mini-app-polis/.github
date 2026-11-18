@@ -59,3 +59,22 @@ updates:
       - dependency-name: "npm"
     commit-message:
       prefix: "ci(deps)"
+
+  # The wrangler the deploy stage uploads Pages sites with, locked in
+  # .github/actions/wrangler.
+  - package-ecosystem: "npm"
+    directory: "/.github/actions/wrangler"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      deploy-tooling:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # A week before a new release is offered: what a deploy installs should
+    # have been out long enough for a bad release to be pulled.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci(deps)"

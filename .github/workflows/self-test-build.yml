@@ -12,8 +12,21 @@
 #            release and deploy use it. A profile with nothing to build must
 #            have said so and reported no artifact.
 #
+#   deploy   stages-deploy.yml with `target: fake`, to development with the
+#            build's version and to production with the release version the
+#            fixture declares, each twice. The first takes the artifact by
+#            digest and deploys to the stand-in; the second must read that
+#            the stand-in already runs the version and skip (README,
+#            "Running a stage twice"). A profile with nothing to deploy
+#            must say so and report no deployed version.
+#
 # Nothing leaves the run: the artifact and its SBOM are uploaded to the run,
-# and the api-service image is saved to a tarball, never pushed.
+# and the api-service image is saved to a tarball, never pushed. The deploy's
+# stand-in is a record kept as an artifact of the run; it reads no target,
+# holds no secret and pushes nothing. The deploy jobs are granted id-token
+# and packages write only because GitHub checks a reusable workflow's
+# permissions before any job's `if`: stages-deploy.yml asks for them for
+# its live Lambda and Railway paths, which a fake target never takes.
 name: self-test-build
 
 on:
@@ -135,3 +148,137 @@ jobs:
             npm-library) need 'package/*.tgz' ;;
             *) echo "::error::No expectation for ${PROFILE}."; exit 1 ;;
           esac
+
+  # The version each environment deploys: development the build's, and
+  # production the release the fixture declares, as release would report it.
+  versions:
+    needs: first
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      development: ${{ steps.v.outputs.development }}
+      production: ${{ steps.v.outputs.production }}
+    steps:
+      - id: v
+        env:
+          BUILD_VERSION: ${{ needs.first.outputs.version }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          # A profile that builds nothing has no version; any will do, since
+          # its deploy skips before reading one.
+          development="${BUILD_VERSION:-0.0.0+g000000000000}"
+          echo "development=${development}" >> "$GITHUB_OUTPUT"
+          echo "production=${development%%+*}" >> "$GITHUB_OUTPUT"
+          echo "${PROFILE}: development ${development}, production ${development%%+*}"
+
+  deploy-development:
+    needs: [first, versions]
+    uses: ./.github/workflows/stages-deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      profile: ${{ inputs.profile }}
+      environment: development
+      version: ${{ needs.versions.outputs.development }}
+      artifact-name: ${{ needs.first.outputs.artifact-name }}
+      artifact-digest: ${{ needs.first.outputs.artifact-digest }}
+      target: fake
+      lambda-handler: ${{ inputs.lambda-handler }}
+      lambda-trigger: ${{ inputs.lambda-trigger }}
+
+  deploy-development-again:
+    needs: [first, versions, deploy-development]
+    uses: ./.github/workflows/stages-deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      profile: ${{ inputs.profile }}
+      environment: development
+      version: ${{ needs.versions.outputs.development }}
+      artifact-name: ${{ needs.first.outputs.artifact-name }}
+      artifact-digest: ${{ needs.first.outputs.artifact-digest }}
+      target: fake
+      lambda-handler: ${{ inputs.lambda-handler }}
+      lambda-trigger: ${{ inputs.lambda-trigger }}
+
+  deploy-production:
+    needs: [first, versions]
+    uses: ./.github/workflows/stages-deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      profile: ${{ inputs.profile }}
+      environment: production
+      version: ${{ needs.versions.outputs.production }}
+      artifact-name: ${{ needs.first.outputs.artifact-name }}
+      artifact-digest: ${{ needs.first.outputs.artifact-digest }}
+      target: fake
+      lambda-handler: ${{ inputs.lambda-handler }}
+      lambda-trigger: ${{ inputs.lambda-trigger }}
+
+  deploy-production-again:
+    needs: [first, versions, deploy-production]
+    uses: ./.github/workflows/stages-deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      profile: ${{ inputs.profile }}
+      environment: production
+      version: ${{ needs.versions.outputs.production }}
+      artifact-name: ${{ needs.first.outputs.artifact-name }}
+      artifact-digest: ${{ needs.first.outputs.artifact-digest }}
+      target: fake
+      lambda-handler: ${{ inputs.lambda-handler }}
+      lambda-trigger: ${{ inputs.lambda-trigger }}
+
+  # The first deploy to each environment deployed, the second skipped, and
+  # both report the version the stand-in runs. A profile with nothing to
+  # deploy reported nothing deployed.
+  deploy:
+    needs: [versions, deploy-development, deploy-development-again, deploy-production, deploy-production-again]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      PROFILE: ${{ inputs.profile }}
+      DEV: ${{ needs.versions.outputs.development }}
+      PROD: ${{ needs.versions.outputs.production }}
+      DEV_FIRST: ${{ needs.deploy-development.outputs.deployed }}/${{ needs.deploy-development.outputs.deployed-version }}
+      DEV_AGAIN: ${{ needs.deploy-development-again.outputs.deployed }}/${{ needs.deploy-development-again.outputs.deployed-version }}
+      PROD_FIRST: ${{ needs.deploy-production.outputs.deployed }}/${{ needs.deploy-production.outputs.deployed-version }}
+      PROD_AGAIN: ${{ needs.deploy-production-again.outputs.deployed }}/${{ needs.deploy-production-again.outputs.deployed-version }}
+    steps:
+      - name: Deployed once, skipped the second time
+        run: |
+          set -euo pipefail
+          failures=0
+          expect() {
+            if [ "$2" = "$3" ]; then echo "ok: $1 ($2)"; else echo "::error::$1: $2, wanted $3 (deployed/deployed-version)"; failures=$((failures + 1)); fi
+          }
+          case "${PROFILE}" in
+            python-service|api-service|astro-site)
+              # On a re-run of this workflow the stand-in already holds the
+              # first attempt's record, so the first deploy rightly skips too.
+              first=true
+              [ "${GITHUB_RUN_ATTEMPT}" -gt 1 ] && first="${DEV_FIRST%%/*}"
+              expect "development, first" "${DEV_FIRST}" "${first}/${DEV}"
+              expect "development, again" "${DEV_AGAIN}" "false/${DEV}"
+              [ "${GITHUB_RUN_ATTEMPT}" -gt 1 ] && first="${PROD_FIRST%%/*}"
+              expect "production, first" "${PROD_FIRST}" "${first}/${PROD}"
+              expect "production, again" "${PROD_AGAIN}" "false/${PROD}" ;;
+            *)
+              for run in "${DEV_FIRST}" "${DEV_AGAIN}" "${PROD_FIRST}" "${PROD_AGAIN}"; do
+                expect "nothing to deploy" "${run}" "false/"
+              done ;;
+          esac
+          [ "${failures}" -eq 0 ]

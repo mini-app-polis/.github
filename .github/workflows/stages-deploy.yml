@@ -1,0 +1,757 @@
+# The pipeline's `deploy` stage, for any profile: take the build's artifact by
+# digest and put it on the profile's target, unless the target already runs
+# that version (README, "Deploy stage").
+#
+#   python-service   the Lambda zip, through lambda-deploy.yml
+#   api-service      the container image, pushed to GHCR and deployed by the
+#                    Railway service that pulls it
+#   astro-site       the site bundle, uploaded to Cloudflare Pages with the
+#                    pipeline's locked wrangler
+#   python-library,  nothing: release publishes them, and says so
+#   npm-library
+#   terraform-infra  nothing yet: its deploy is the apply of the reviewed
+#                    plan, which needs the state backend and credentials;
+#                    infra's own terraform.yml applies until then
+#   shared-workflows nothing: the release moves the major tag
+#
+# A profile with nothing to deploy still runs the stage, which says why in
+# its job summary and as a notice on the run, and passes.
+#
+# `environment` is development (from dev, any version) or production (from
+# main, a release X.Y.Z only), and production runs in the `production`
+# GitHub Environment, so its protection rules and secrets apply. The stage
+# refuses any other pairing before it fetches anything.
+#
+# Running it twice deploys once. Before deploying it reads what the target
+# runs (the image the service last deployed, the Lambda's code checksum,
+# the Pages deployment's metadata) and skips when that is already this
+# version; the decision is deploy-decision.sh, tested on its own. A failed
+# deploy is re-run on its own ("Re-run failed jobs"): it takes the same
+# artifact from the run by digest, so nothing is rebuilt.
+#
+# `target: fake` is for this repository's self-test and nothing else. It
+# fetches the artifact and makes every decision a live deploy makes, but its
+# target is a record kept in the run as an artifact: nothing outside the run
+# is read or changed, and no secret is needed.
+#
+# pipeline.yml calls this as one job after `build` (and on main after
+# `release`), and consumers reach it through pipeline.yml. It can also be
+# called on its own:
+#
+#   jobs:
+#     deploy:
+#       needs: [build, release]
+#       if: needs.release.outputs.published == 'true'
+#       permissions:
+#         contents: read
+#         id-token: write
+#         packages: write
+#       uses: mini-app-polis/.github/.github/workflows/stages-deploy.yml@v3
+#       with:
+#         profile: api-service
+#         environment: production
+#         version: ${{ needs.release.outputs.version }}
+#         artifact-name: ${{ needs.build.outputs.artifact-name }}
+#         artifact-digest: ${{ needs.build.outputs.artifact-digest }}
+#         railway-service: api-kaianolevine-com
+#       secrets:
+#         railway-token: ${{ secrets.RAILWAY_TOKEN }}
+#
+# The caller grants id-token: write and packages: write whatever its
+# profile: GitHub checks a reusable workflow's permissions before any job's
+# `if`, and the Lambda deploy needs the one, the image push the other.
+#
+# The actions are named with `$/`, which resolves to this repository at the
+# commit of this file, so a caller pinned to a tag gets every part of the
+# stage from that same tag.
+
+name: stages-deploy
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "The repository's profile (README, \"Profiles\")."
+        type: string
+        required: true
+      environment:
+        description: "development (from dev) or production (from main, a release only)."
+        type: string
+        required: true
+      version:
+        description: "The version to deploy: the release's X.Y.Z in production, the build's version in development."
+        type: string
+        required: true
+      artifact-name:
+        description: "The build stage's artifact-name output."
+        type: string
+        default: ""
+      artifact-digest:
+        description: "The build stage's artifact-digest output (sha256:<hex>). The artifact is refused unless it matches."
+        type: string
+        default: ""
+      target:
+        description: "live, or fake: the self-test's stand-in, which records in the run and deploys nowhere. Consumers leave it."
+        type: string
+        default: "live"
+      timeout-minutes:
+        description: "How long the deploy job may run."
+        type: number
+        default: 30
+      lambda-handler:
+        description: "python-service: module.function, as infra/worker.tf's `handler`. Empty: the service has no Lambda, and nothing is deployed."
+        type: string
+        default: ""
+      lambda-architecture:
+        description: "python-service: x86_64 | arm64, as infra/worker.tf's `architectures`."
+        type: string
+        default: "x86_64"
+      lambda-trigger:
+        description: "python-service: sqs | schedule, as the build was made for."
+        type: string
+        default: "sqs"
+      python-version:
+        description: "python-service: the Lambda runtime's Python, as the build was made for."
+        type: string
+        default: "3.14"
+      lambda-strip:
+        description: "python-service: as the build stage's lambda-strip."
+        type: string
+        default: ""
+      aws-role-arn:
+        description: "python-service: the function's CI deploy role (terraform output deploy_role_arn)."
+        type: string
+        default: ""
+      aws-region:
+        description: "python-service: the function's region."
+        type: string
+        default: ""
+      lambda-function-name:
+        description: "python-service: the function to deploy, for this environment."
+        type: string
+        default: ""
+      railway-service:
+        description: "api-service: the Railway service's name in the project the token is scoped to."
+        type: string
+        default: ""
+      image-repository:
+        description: "api-service: where the image is pushed and the service pulls from. Empty: ghcr.io/<owner>/<repository>, lower-cased."
+        type: string
+        default: ""
+      railway-deploy-minutes:
+        description: "api-service: how long to wait for Railway to report the deployment healthy."
+        type: number
+        default: 15
+      pages-project:
+        description: "astro-site: the Cloudflare Pages project."
+        type: string
+        default: ""
+      cloudflare-account-id:
+        description: "astro-site: the Cloudflare account holding the project."
+        type: string
+        default: ""
+      pages-production-branch:
+        description: "astro-site: the project's production branch; production deploys are uploaded as this branch."
+        type: string
+        default: "main"
+      pages-development-branch:
+        description: "astro-site: the branch development deploys are uploaded as, so they serve at <branch>.<project>.pages.dev."
+        type: string
+        default: "dev"
+      node-version:
+        description: "astro-site: the Node release line wrangler runs on."
+        type: string
+        default: "22"
+    secrets:
+      railway-token:
+        description: "api-service: a Railway project token scoped to this environment. Never an account or workspace token."
+        required: false
+      cloudflare-api-token:
+        description: "astro-site: a Cloudflare API token with Cloudflare Pages: Edit on the account."
+        required: false
+    outputs:
+      deployed-version:
+        description: "The version the target runs after this stage, deployed now or already there; empty when the profile deploys nothing."
+        value: ${{ jobs.deploy.outputs.deployed-version || jobs.lambda.outputs.deployed-version }}
+      deployed:
+        description: "\"true\" when this run changed the target, \"false\" when it skipped or the profile deploys nothing."
+        value: ${{ jobs.deploy.outputs.deployed || jobs.lambda.outputs.deployed }}
+
+permissions:
+  contents: read
+
+env:
+  npm_config_fetch_retries: "5"
+  npm_config_fetch_retry_mintimeout: "10000"
+  npm_config_fetch_retry_maxtimeout: "60000"
+
+jobs:
+  # What the profile deploys to, and whether this run may deploy to the
+  # environment at all. Nothing is fetched and no secret is read here.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      kind: ${{ steps.kind.outputs.kind }}
+      reason: ${{ steps.kind.outputs.reason }}
+      route: ${{ steps.kind.outputs.route }}
+      github-environment: ${{ steps.kind.outputs.github-environment }}
+    steps:
+      - name: Decide the target
+        id: kind
+        env:
+          PROFILE: ${{ inputs.profile }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TARGET: ${{ inputs.target }}
+          HANDLER: ${{ inputs.lambda-handler }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+          ROLE: ${{ inputs.aws-role-arn }}
+          REGION: ${{ inputs.aws-region }}
+          FUNCTION: ${{ inputs.lambda-function-name }}
+          RAILWAY_SERVICE: ${{ inputs.railway-service }}
+          PAGES_PROJECT: ${{ inputs.pages-project }}
+          CF_ACCOUNT: ${{ inputs.cloudflare-account-id }}
+        run: |
+          set -euo pipefail
+          reason=""
+          case "${PROFILE}" in
+            python-service)
+              if [ -n "${HANDLER}" ]; then kind=lambda
+              else
+                kind=none
+                reason="No lambda-handler: this python-service has no Lambda, and its artifact holds no image for a Railway service, so the stage has nothing it can deploy."
+              fi ;;
+            api-service) kind=railway ;;
+            astro-site) kind=pages ;;
+            python-library|npm-library)
+              kind=none
+              reason="A library is published to its registry by the release stage, which also tells the fleet a release is out. There is nothing to deploy." ;;
+            terraform-infra)
+              kind=none
+              reason="This profile's deploy is the apply of the reviewed plan, which needs the state backend and the providers' credentials. Until the plan is a pipeline artifact, the repository's own Terraform workflow applies it." ;;
+            shared-workflows)
+              kind=none
+              reason="This profile has no deploy: its release moves the major tag, and callers run the workflows from that tag." ;;
+            *)
+              echo "::error::Unknown profile '${PROFILE}'. The profiles are listed in the README, under \"Profiles\"."
+              exit 1 ;;
+          esac
+
+          if [ "${kind}" != none ]; then
+            if [ -z "${ARTIFACT_NAME}" ] || [ -z "${ARTIFACT_DIGEST}" ]; then
+              echo "::error::${PROFILE} deploys the build's artifact: pass the build stage's artifact-name and artifact-digest."
+              exit 1
+            fi
+            if [ "${TARGET}" = live ]; then
+              missing=""
+              case "${kind}" in
+                lambda) [ -n "${ROLE}" ] && [ -n "${REGION}" ] && [ -n "${FUNCTION}" ] || missing="aws-role-arn, aws-region and lambda-function-name" ;;
+                railway) [ -n "${RAILWAY_SERVICE}" ] || missing="railway-service" ;;
+                pages) [ -n "${PAGES_PROJECT}" ] && [ -n "${CF_ACCOUNT}" ] || missing="pages-project and cloudflare-account-id" ;;
+              esac
+              if [ -n "${missing}" ]; then
+                echo "::error::${PROFILE} deploys to ${kind}: pass ${missing}."
+                exit 1
+              fi
+            fi
+          fi
+
+          # The Lambda deploy is its own reusable workflow; everything else,
+          # the stand-in and the skips included, is the deploy job.
+          route=deploy
+          if [ "${kind}" = lambda ] && [ "${TARGET}" = live ]; then route=lambda; fi
+          # Only a live production deploy waits on the production
+          # environment; a skip, or the stand-in, has nothing to protect.
+          github_environment=""
+          if [ "${kind}" != none ] && [ "${TARGET}" = live ] && [ "${ENVIRONMENT}" = production ]; then
+            github_environment=production
+          fi
+          {
+            echo "kind=${kind}"
+            echo "reason=${reason}"
+            echo "route=${route}"
+            echo "github-environment=${github_environment}"
+          } >> "$GITHUB_OUTPUT"
+          echo "${PROFILE} to ${ENVIRONMENT}: ${kind} (${TARGET}), via the ${route} job"
+
+      - name: May this run deploy to the environment
+        if: steps.kind.outputs.kind != 'none'
+        uses: $/.github/actions/deploy-decision
+        with:
+          mode: guard
+          environment: ${{ inputs.environment }}
+          target: ${{ inputs.target }}
+          version: ${{ inputs.version }}
+
+  # Railway, Cloudflare Pages, the self-test's stand-in, and the profiles
+  # with nothing to deploy, which say why.
+  deploy:
+    needs: plan
+    if: needs.plan.outputs.route == 'deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ needs.plan.outputs.github-environment }}
+    # One deploy per repository and environment at a time, never cancelled
+    # partway. The stand-in's record is per profile, so the self-test's
+    # fixtures do not queue behind one another.
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}${{ inputs.target == 'fake' && format('-fake-{0}', inputs.profile) || '' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write # api-service: push the image to GHCR for Railway to pull
+    outputs:
+      deployed-version: ${{ steps.result.outputs.deployed-version }}
+      deployed: ${{ steps.result.outputs.deployed }}
+    env:
+      KIND: ${{ needs.plan.outputs.kind }}
+      TARGET: ${{ inputs.target }}
+      PROFILE: ${{ inputs.profile }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+      ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+    steps:
+      - name: Nothing to deploy
+        if: needs.plan.outputs.kind == 'none'
+        env:
+          REASON: ${{ needs.plan.outputs.reason }}
+        run: |
+          echo "::notice title=deploy skipped (${PROFILE})::${REASON}"
+          printf '### deploy: skipped (%s)\n\n%s\n' "${PROFILE}" "${REASON}" >> "$GITHUB_STEP_SUMMARY"
+
+      # By digest, from this run: a re-run of this job takes the same bytes
+      # and rebuilds nothing.
+      - name: Take the build stage's artifact
+        id: artifact
+        if: needs.plan.outputs.kind != 'none'
+        uses: $/.github/actions/fetch-artifact
+        with:
+          name: ${{ inputs.artifact-name }}
+          digest: ${{ inputs.artifact-digest }}
+
+      # What identifies this artifact on its target, computed as the live
+      # target reports it, for the stand-in as well as the real thing.
+      - name: What is being deployed
+        id: local
+        if: needs.plan.outputs.kind != 'none'
+        env:
+          DIR: ${{ steps.artifact.outputs.path }}
+        run: |
+          set -euo pipefail
+          case "${KIND}" in
+            lambda)
+              zip="${DIR}/lambda/worker.zip"
+              if [ ! -f "${zip}" ]; then
+                echo "::error::The artifact has no lambda/worker.zip: it is not a python-service build with a lambda-handler."
+                exit 1
+              fi
+              # Lambda reports CodeSha256, the base64 SHA-256 of the zip.
+              id="$(openssl dgst -sha256 -binary "${zip}" | base64)" ;;
+            railway)
+              tar="${DIR}/image/image.tar"
+              if [ ! -f "${tar}" ]; then
+                echo "::error::The artifact has no image/image.tar: it is not an api-service build."
+                exit 1
+              fi
+              # The image's config digest, which a registry keeps unchanged
+              # when the image is pushed, so the local and remote compare.
+              config="$(tar -xOf "${tar}" manifest.json | jq -r '.[0].Config')"
+              hex="$(grep -oE '[0-9a-f]{64}' <<< "${config}" | head -n1 || true)"
+              if [ -z "${hex}" ]; then
+                echo "::error::No config digest in the image's manifest.json ('${config}')."
+                exit 1
+              fi
+              id="sha256:${hex}"
+              echo "tar=${tar}" >> "$GITHUB_OUTPUT" ;;
+            pages)
+              bundle="${DIR}/site/site.tar.gz"
+              if [ ! -f "${bundle}" ]; then
+                echo "::error::The artifact has no site/site.tar.gz: it is not an astro-site build."
+                exit 1
+              fi
+              site="${RUNNER_TEMP}/deploy-site"
+              rm -rf "${site}"
+              mkdir -p "${site}"
+              tar -xzf "${bundle}" -C "${site}"
+              # Pages records the commit message given at upload; the
+              # artifact's digest goes there with the version.
+              id="${ARTIFACT_DIGEST}"
+              echo "site=${site}" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::No deploy for kind '${KIND}'."
+              exit 1 ;;
+          esac
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+          echo "${KIND}: ${VERSION} is ${id}"
+
+      # ---- The stand-in (target: fake) -----------------------------------
+      #
+      # Its record is an artifact of the run, named for the profile and the
+      # environment. Reading it is reading what the stand-in runs; writing it
+      # is the deploy. Nothing outside the run is touched.
+      - name: "Stand-in: where its record is"
+        id: fake
+        if: needs.plan.outputs.kind != 'none' && inputs.target == 'fake'
+        run: |
+          {
+            echo "name=fake-target-${PROFILE}-${ENVIRONMENT}"
+            echo "dir=${RUNNER_TEMP}/fake-target"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Stand-in: read what it runs"
+        if: steps.fake.outputs.name != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ${{ steps.fake.outputs.name }}
+          path: ${{ steps.fake.outputs.dir }}
+
+      - name: "Stand-in: what it reports"
+        id: fake-running
+        if: steps.fake.outputs.name != ''
+        env:
+          DIR: ${{ steps.fake.outputs.dir }}
+        run: |
+          set -euo pipefail
+          record="$(find "${DIR}" -name record.json -print -quit 2>/dev/null || true)"
+          if [ -n "${record}" ]; then
+            echo "version=$(jq -r '.version' "${record}")" >> "$GITHUB_OUTPUT"
+            echo "id=$(jq -r '.id' "${record}")" >> "$GITHUB_OUTPUT"
+            echo "The stand-in runs: $(cat "${record}")"
+          else
+            echo "The stand-in runs nothing yet."
+          fi
+
+      # ---- Railway (api-service) -----------------------------------------
+      #
+      # The service's source is the image tag named for the environment
+      # (ghcr.io/<owner>/<repo>:production), declared in the repository's
+      # .railway/railway.ts. The deploy pushes the image under its version,
+      # moves the environment tag to it, asks Railway for a deployment, and
+      # waits for Railway to report it healthy. Only then does it move
+      # <environment>-deployed, the record the next run reads.
+      - name: "Railway: the image's names"
+        id: image
+        if: needs.plan.outputs.kind == 'railway' && inputs.target == 'live'
+        env:
+          REPOSITORY: ${{ inputs.image-repository }}
+        run: |
+          set -euo pipefail
+          repo="${REPOSITORY:-ghcr.io/${GITHUB_REPOSITORY}}"
+          repo="${repo,,}"
+          case "${repo}" in
+            ghcr.io/*) ;;
+            *) echo "::error::image-repository must be on ghcr.io, where this job's token can push: '${repo}'."; exit 1 ;;
+          esac
+          {
+            echo "repo=${repo}"
+            # A tag cannot hold "+".
+            echo "version-tag=${VERSION//+/_}"
+            echo "environment-tag=${ENVIRONMENT}"
+            echo "record-tag=${ENVIRONMENT}-deployed"
+            echo "auth=${RUNNER_TEMP}/ghcr-auth.json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Railway: sign in to GHCR"
+        if: steps.image.outputs.repo != ''
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          REGISTRY_AUTH_FILE: ${{ steps.image.outputs.auth }}
+        run: |
+          set -euo pipefail
+          skopeo --version
+          skopeo login ghcr.io --username "${ACTOR}" --password-stdin <<< "${TOKEN}"
+
+      - name: "Railway: read what the service last deployed"
+        id: railway-running
+        if: steps.image.outputs.repo != ''
+        env:
+          REPO: ${{ steps.image.outputs.repo }}
+          RECORD_TAG: ${{ steps.image.outputs.record-tag }}
+          REGISTRY_AUTH_FILE: ${{ steps.image.outputs.auth }}
+        run: |
+          set -euo pipefail
+          if raw="$(skopeo inspect --raw --retry-times 3 "docker://${REPO}:${RECORD_TAG}" 2> "${RUNNER_TEMP}/inspect.err")"; then
+            # An index (a multi-platform push) names the image per platform.
+            if jq -e '.manifests' <<< "${raw}" > /dev/null; then
+              digest="$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")][0].digest // empty' <<< "${raw}")"
+              raw="$(skopeo inspect --raw --retry-times 3 "docker://${REPO}@${digest}")"
+            fi
+            id="$(jq -r '.config.digest // empty' <<< "${raw}")"
+            echo "id=${id}" >> "$GITHUB_OUTPUT"
+            echo "${REPO}:${RECORD_TAG} is ${id}"
+          elif grep -qiE 'manifest unknown|not found|name unknown' "${RUNNER_TEMP}/inspect.err"; then
+            echo "${REPO}:${RECORD_TAG} does not exist: the pipeline has not deployed this service yet."
+          else
+            echo "::error::Could not read ${REPO}:${RECORD_TAG}: $(cat "${RUNNER_TEMP}/inspect.err")"
+            exit 1
+          fi
+
+      # ---- Cloudflare Pages (astro-site) ---------------------------------
+      #
+      # Each upload carries the commit and a message naming the version and
+      # the artifact's digest. What the site runs is the production
+      # deployment the project serves, or the newest successful deployment
+      # of the development branch, which its alias serves.
+      - name: "Pages: read what the site serves"
+        id: pages-running
+        if: needs.plan.outputs.kind == 'pages' && inputs.target == 'live'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.cloudflare-api-token }}
+          ACCOUNT: ${{ inputs.cloudflare-account-id }}
+          PROJECT: ${{ inputs.pages-project }}
+          DEV_BRANCH: ${{ inputs.pages-development-branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+            echo "::error::No cloudflare-api-token: pass the Cloudflare token as the stage's secret."
+            exit 1
+          fi
+          api="https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/pages/projects/${PROJECT}"
+          get() {
+            curl -sS --fail-with-body --retry 5 --retry-all-errors --max-time 60 \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" "$1"
+          }
+          if [ "${ENVIRONMENT}" = production ]; then
+            deployment="$(get "${api}" | jq -c '.result.canonical_deployment // empty')"
+          else
+            deployment="$(get "${api}/deployments?env=preview&per_page=25" | jq -c --arg b "${DEV_BRANCH}" \
+              '[.result[] | select(.deployment_trigger.metadata.branch == $b and .latest_stage.name == "deploy" and .latest_stage.status == "success")][0] // empty')"
+          fi
+          message="$(jq -r '.deployment_trigger.metadata.commit_message // empty' <<< "${deployment:-null}")"
+          # pipeline-deploy version=<version> artifact=<digest>; anything
+          # else (a Git-integration build) is not one of the pipeline's.
+          if [[ "${message}" =~ ^pipeline-deploy\ version=([^ ]+)\ artifact=(sha256:[0-9a-f]{64})$ ]]; then
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            echo "id=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+            echo "${PROJECT} (${ENVIRONMENT}) serves ${BASH_REMATCH[1]}."
+          else
+            echo "${PROJECT} (${ENVIRONMENT}) serves no deployment of the pipeline's yet."
+          fi
+
+      - name: Does the target already run this version
+        id: decide
+        if: needs.plan.outputs.kind != 'none'
+        uses: $/.github/actions/deploy-decision
+        with:
+          mode: decide
+          version: ${{ inputs.version }}
+          wanted-id: ${{ steps.local.outputs.id }}
+          running-version: ${{ steps.fake-running.outputs.version || steps.pages-running.outputs.version }}
+          running-id: ${{ steps.fake-running.outputs.id || steps.railway-running.outputs.id || steps.pages-running.outputs.id }}
+
+      # ---- Deploy ----------------------------------------------------------
+
+      - name: "Stand-in: deploy (write its record)"
+        if: steps.fake.outputs.name != '' && steps.decide.outputs.deploy == 'true'
+        env:
+          DIR: ${{ steps.fake.outputs.dir }}
+          ID: ${{ steps.local.outputs.id }}
+        run: |
+          set -euo pipefail
+          rm -rf "${DIR}"
+          mkdir -p "${DIR}"
+          jq -n --arg version "${VERSION}" --arg id "${ID}" --arg kind "${KIND}" \
+            '{version: $version, id: $id, kind: $kind}' > "${DIR}/record.json"
+          cat "${DIR}/record.json"
+
+      # overwrite: false, so a second deploy that should have skipped fails
+      # here instead of passing.
+      - name: "Stand-in: keep its record in the run"
+        if: steps.fake.outputs.name != '' && steps.decide.outputs.deploy == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.fake.outputs.name }}
+          path: ${{ steps.fake.outputs.dir }}/record.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 1
+
+      - name: "Railway: push the image"
+        if: steps.image.outputs.repo != '' && steps.decide.outputs.deploy == 'true'
+        env:
+          TAR: ${{ steps.local.outputs.tar }}
+          ID: ${{ steps.local.outputs.id }}
+          REPO: ${{ steps.image.outputs.repo }}
+          VERSION_TAG: ${{ steps.image.outputs.version-tag }}
+          ENVIRONMENT_TAG: ${{ steps.image.outputs.environment-tag }}
+          REGISTRY_AUTH_FILE: ${{ steps.image.outputs.auth }}
+        run: |
+          set -euo pipefail
+          skopeo copy --retry-times 3 "docker-archive:${TAR}" "docker://${REPO}:${VERSION_TAG}"
+          pushed="$(skopeo inspect --raw --retry-times 3 "docker://${REPO}:${VERSION_TAG}" | jq -r '.config.digest')"
+          if [ "${pushed}" != "${ID}" ]; then
+            echo "::error::${REPO}:${VERSION_TAG} is ${pushed}, not the artifact's image ${ID}."
+            exit 1
+          fi
+          # The tag the service pulls.
+          skopeo copy --retry-times 3 "docker://${REPO}:${VERSION_TAG}" "docker://${REPO}:${ENVIRONMENT_TAG}"
+          echo "${REPO}:${ENVIRONMENT_TAG} -> ${VERSION_TAG} (${ID})"
+
+      # Railway's public API, with the environment's project token: the
+      # token names the project and environment, the service is found by
+      # name, and a new deployment of it pulls the environment tag.
+      - name: "Railway: deploy and wait until healthy"
+        if: steps.image.outputs.repo != '' && steps.decide.outputs.deploy == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.railway-token }}
+          SERVICE: ${{ inputs.railway-service }}
+          WAIT_MINUTES: ${{ inputs.railway-deploy-minutes }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RAILWAY_TOKEN}" ]; then
+            echo "::error::No railway-token: pass the environment's Railway project token as the stage's secret."
+            exit 1
+          fi
+          gql() {
+            local query="$1" vars="${2:-}"
+            [ -n "${vars}" ] || vars='{}'
+            local out
+            out="$(jq -cn --arg q "${query}" --argjson v "${vars}" '{query: $q, variables: $v}' \
+              | curl -sS --fail-with-body --retry 5 --retry-all-errors --max-time 60 \
+                  -H "Project-Access-Token: ${RAILWAY_TOKEN}" -H "Content-Type: application/json" \
+                  --data-binary @- https://backboard.railway.com/graphql/v2)"
+            if jq -e '.errors' <<< "${out}" > /dev/null; then
+              echo "::error::Railway answered: $(jq -c '.errors' <<< "${out}")" >&2
+              return 1
+            fi
+            echo "${out}"
+          }
+          ids="$(gql 'query { projectToken { projectId environmentId } }')"
+          project="$(jq -r '.data.projectToken.projectId' <<< "${ids}")"
+          environment="$(jq -r '.data.projectToken.environmentId' <<< "${ids}")"
+          services="$(gql 'query($id: String!) { project(id: $id) { services { edges { node { id name } } } } }' \
+            "$(jq -cn --arg id "${project}" '{id: $id}')")"
+          service="$(jq -r --arg n "${SERVICE}" '.data.project.services.edges[].node | select(.name == $n) | .id' <<< "${services}")"
+          if [ -z "${service}" ]; then
+            echo "::error::No service named '${SERVICE}' in the project this token is scoped to."
+            exit 1
+          fi
+          deployment="$(gql 'mutation($s: String!, $e: String!) { serviceInstanceDeployV2(serviceId: $s, environmentId: $e) }' \
+            "$(jq -cn --arg s "${service}" --arg e "${environment}" '{s: $s, e: $e}')" | jq -r '.data.serviceInstanceDeployV2')"
+          echo "Railway deployment ${deployment} of ${SERVICE}"
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          while :; do
+            status="$(gql 'query($id: String!) { deployment(id: $id) { status } }' \
+              "$(jq -cn --arg id "${deployment}" '{id: $id}')" | jq -r '.data.deployment.status')"
+            echo "$(date -u +%H:%M:%S) ${status}"
+            case "${status}" in
+              SUCCESS) break ;;
+              FAILED|CRASHED|REMOVED|SKIPPED|NEEDS_APPROVAL)
+                echo "::error::Railway deployment ${deployment} ended ${status}; the record of what the service runs is unchanged, so a re-run deploys again."
+                exit 1 ;;
+            esac
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::Railway deployment ${deployment} was not healthy after ${WAIT_MINUTES} minutes (last ${status})."
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: "Railway: record what the service runs"
+        if: steps.image.outputs.repo != '' && steps.decide.outputs.deploy == 'true'
+        env:
+          REPO: ${{ steps.image.outputs.repo }}
+          VERSION_TAG: ${{ steps.image.outputs.version-tag }}
+          RECORD_TAG: ${{ steps.image.outputs.record-tag }}
+          REGISTRY_AUTH_FILE: ${{ steps.image.outputs.auth }}
+        run: |
+          set -euo pipefail
+          skopeo copy --retry-times 3 "docker://${REPO}:${VERSION_TAG}" "docker://${REPO}:${RECORD_TAG}"
+
+      - name: Set up Node
+        if: needs.plan.outputs.kind == 'pages' && inputs.target == 'live' && steps.decide.outputs.deploy == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: "Pages: install the locked wrangler"
+        id: wrangler
+        if: needs.plan.outputs.kind == 'pages' && inputs.target == 'live' && steps.decide.outputs.deploy == 'true'
+        uses: $/.github/actions/wrangler
+
+      - name: "Pages: upload the site"
+        if: needs.plan.outputs.kind == 'pages' && inputs.target == 'live' && steps.decide.outputs.deploy == 'true'
+        env:
+          WRANGLER: ${{ steps.wrangler.outputs.bin }}
+          SITE: ${{ steps.local.outputs.site }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.cloudflare-api-token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
+          PROJECT: ${{ inputs.pages-project }}
+          PRODUCTION_BRANCH: ${{ inputs.pages-production-branch }}
+          DEV_BRANCH: ${{ inputs.pages-development-branch }}
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          set -euo pipefail
+          if [ "${ENVIRONMENT}" = production ]; then branch="${PRODUCTION_BRANCH}"; else branch="${DEV_BRANCH}"; fi
+          message="pipeline-deploy version=${VERSION} artifact=${ARTIFACT_DIGEST}"
+          for attempt in 1 2 3; do
+            if "${WRANGLER}" pages deploy "${SITE}" --project-name "${PROJECT}" --branch "${branch}" \
+                --commit-hash "${GITHUB_SHA}" --commit-message "${message}" --commit-dirty=false; then
+              exit 0
+            fi
+            echo "::warning::wrangler pages deploy failed (attempt ${attempt} of 3)."
+            sleep $(( attempt * 20 ))
+          done
+          exit 1
+
+      - name: Result
+        id: result
+        if: always()
+        env:
+          STATUS: ${{ job.status }}
+          DEPLOY: ${{ steps.decide.outputs.deploy }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          ID: ${{ steps.local.outputs.id }}
+          NOTHING: ${{ needs.plan.outputs.kind == 'none' }}
+        run: |
+          set -euo pipefail
+          deployed=false
+          version=""
+          if [ "${STATUS}" = success ] && [ "${NOTHING}" != true ]; then
+            version="${VERSION}"
+            [ "${DEPLOY}" = true ] && deployed=true
+          fi
+          echo "deployed-version=${version}" >> "$GITHUB_OUTPUT"
+          echo "deployed=${deployed}" >> "$GITHUB_OUTPUT"
+          [ "${NOTHING}" = true ] && exit 0
+          if [ "${DEPLOY}" = false ]; then
+            echo "::notice title=deploy skipped (${PROFILE}, ${ENVIRONMENT})::${REASON}"
+          fi
+          {
+            printf '### deploy: %s (%s to %s, %s)\n\n' "${STATUS}" "${PROFILE}" "${ENVIRONMENT}" "${TARGET}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Artifact | \`${ARTIFACT_DIGEST}\` |"
+            echo "| On the target | \`${ID:-unknown}\` |"
+            echo "| Decision | ${DEPLOY:-not reached}: ${REASON:-} |"
+            echo "| Deployed version | \`${version:-none}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # AWS Lambda (python-service), through the fleet's Lambda deploy, which
+  # takes the artifact by digest, reads the function's code checksum, skips
+  # when it is already this zip, and otherwise uploads and confirms it.
+  lambda:
+    needs: plan
+    if: needs.plan.outputs.route == 'lambda'
+    permissions:
+      id-token: write
+      contents: read
+    uses: $/.github/workflows/lambda-deploy.yml
+    with:
+      artifact-name: ${{ inputs.artifact-name }}
+      artifact-digest: ${{ inputs.artifact-digest }}
+      handler: ${{ inputs.lambda-handler }}
+      architecture: ${{ inputs.lambda-architecture }}
+      trigger: ${{ inputs.lambda-trigger }}
+      python-version: ${{ inputs.python-version }}
+      strip: ${{ inputs.lambda-strip }}
+      role-arn: ${{ inputs.aws-role-arn }}
+      region: ${{ inputs.aws-region }}
+      function-name: ${{ inputs.lambda-function-name }}
+      version: ${{ inputs.version }}
+      environment: ${{ needs.plan.outputs.github-environment }}
+      skip-if-deployed: true

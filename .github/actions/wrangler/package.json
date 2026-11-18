@@ -1,0 +1,8 @@
+{
+  "name": "pipeline-wrangler",
+  "private": true,
+  "description": "The wrangler the deploy stage uploads Cloudflare Pages sites with, locked so every deploy runs the same reviewed release. Moved by Dependabot.",
+  "dependencies": {
+    "wrangler": "4.164.0"
+  }
+}
