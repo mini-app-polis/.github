@@ -24,6 +24,10 @@ pull request into `dev` for a person to review.
 Infrastructure as Code on a pull request and plan again and apply on merge,
 as infra does for Terraform.
 
+One is not called by any repository: `required.yml` is the organization
+ruleset's required workflow, the security controls a repository on the
+pipeline cannot skip (see Enforced and subscribed).
+
 Two run from here over the whole fleet and open pull requests into other
 repositories' `dev`: `dependency-fix.yml` re-locks packages the dependency
 audit flags, and `commons-update.yml` re-locks a consumer onto a new
@@ -785,12 +789,23 @@ it, and nothing else in its caller changes. `evaluate.yml` stays for
 
 Two layers keep the pipeline whole.
 
-- **Enforced.** Organization rulesets, managed as code in infra, require
-  the security controls and the deterministic conformance check on `main`
-  and `dev` of every repository, through required workflows run from this
-  repository. A repository cannot remove or weaken them; a new repository
-  has them from its first pull request. The enforced checks map to the
-  catalog's security posture rules by reference.
+- **Enforced.** infra's organization ruleset `pipeline-main` requires a
+  pull request into the default branch of every repository in
+  `pipeline.yaml`'s `on_pipeline`, and requires `required.yml` from this
+  repository, at the current major's tag, to pass on it. `required.yml`
+  runs `security.yml`'s secret scan, dependency audit and static analysis
+  in the target repository; the repository does not own that copy and
+  cannot remove or edit it. The SBOM is a build artifact, made by the
+  pipeline's own `security` stage, not a gate. The promote App is the
+  ruleset's one bypass, for the release's commit.
+
+  GitHub runs ruleset workflows only on pull request and merge-queue
+  events, never on pushes, so `dev`, which takes direct pushes and
+  auto-merges, is not held by the ruleset: every change reaches the
+  default branch through the promotion pull request, where it is checked
+  once. The deterministic conformance check is not a merge check: it is
+  `evaluate-pre`, which gates the release on a push to `main` (see
+  Evaluation stages).
 - **Subscribed.** Everything else in the stage graph reaches a repository
   through its caller at the current major. Conformance rules require the
   caller to be thin, at the current major, with no inline jobs beyond the
@@ -867,7 +882,14 @@ same change that moves its deploys onto the pipeline: the canary in
 2. **The caller.** Its `ci.yml` calls the pipeline with its profile and its
    target inputs (`railway-service`; `pages-project` and
    `cloudflare-account-id`; or the Lambda's), and drops its own deploy jobs.
-   `pipeline.yaml` lists it in `on_pipeline` in the same change.
+   `pipeline.yaml` lists it in `on_pipeline` in the same change. Its
+   release then pushes as the promote App (`secrets: inherit` passes the
+   org's `PROMOTE_APP_CLIENT_ID` and `PROMOTE_APP_PRIVATE_KEY`), and its
+   `.releaserc.json` turns off `@semantic-release/github`'s
+   `successComment`, `failComment` and `releasedLabels`, which need Issues
+   access the App does not have. Once this lands on `main`, an infra apply
+   puts the repository under the organization ruleset (see Enforced and
+   subscribed).
 3. **Branch auto-deploy off, in IaC.**
    - *Railway*: in `.railway/railway.ts`, the service's source moves from
      `github("<org>/<repo>", { branch: "main", checkSuites: false })` to
