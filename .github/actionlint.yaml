@@ -46,3 +46,8 @@ paths:
       # The same `$/` form as stages-test.yml, for the verify stage's
       # actions.
       - 'specifying action "\$/\.github/actions/(fetch-artifact|verify-decision)" in invalid format because ref is missing'
+  .github/workflows/stages-evaluate.yml:
+    ignore:
+      # The same `$/` form as stages-test.yml, for the evaluation stages'
+      # action.
+      - 'specifying action "\$/\.github/actions/evaluate-decision" in invalid format because ref is missing'

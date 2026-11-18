@@ -11,7 +11,9 @@ workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 | `build` | `stages-build.yml` — the commit's one artifact and its SBOM, for any profile (see Build stage) |
 | `release` | `release.yml` — semantic-release from the fleet's locked tooling |
 | `deploy` | `stages-deploy.yml` — put the build's artifact on the profile's target, unless it already runs that version (see Deploy stage); `lambda-deploy.yml` is its Lambda path, and still callable on its own |
-| `evaluate` | `evaluate.yml` — ask for the repository to be evaluated |
+| `verify` | `stages-verify.yml` — ask the target, read-only, whether it runs the release (see Verify stage) |
+| `evaluate-pre`, `evaluate-post` | `stages-evaluate.yml` — a deterministic conformance evaluation of the commit before release, which gates it, and of the published release after `verify`, which reports (see Evaluation stages) |
+| `evaluate` | `evaluate.yml` — ask for the repository to be evaluated, without waiting: today's callers, and fleet passes |
 
 Two more sit outside the pipeline: `promote.yml` keeps a `dev` → `main`
 pull request open whenever `dev` has something to release, and
@@ -124,7 +126,8 @@ never a branch name and never a guess at when a deploy finished.
 
 Every stage declares its inputs, outputs and artifacts, and the check that
 makes running it twice on the same commit safe. Running any stage twice
-produces no second release, deploy or evaluation.
+produces no second release or deploy. An evaluation stage asks again, and
+decides on the evaluation it asked for (see Evaluation stages).
 
 | Stage | Inputs | Outputs and artifacts | Safe to re-run because |
 |---|---|---|---|
@@ -132,11 +135,11 @@ produces no second release, deploy or evaluation.
 | `test` | the results of `lint`, `unit`, `integration`, `contract` and `security` | a table of them in the job summary | it only reads them |
 | `security` | the commit; the profile's language and package manager | findings in the job summary | it changes nothing outside the run |
 | `build` | the commit; the profile's build | `artifact-name`, `artifact-digest`; the artifact (wheel, Lambda zip, container image or site bundle) and its SBOM, kept with the run | an artifact for this commit already in the run is reused, not rebuilt: it is checked against its seal and reported with the same digest |
-| `evaluate-pre` | `repo`, `sha`, `phase: pre-release` | the evaluation id | the evaluator answers a repeated (repo, sha, phase) with the evaluation it already has |
+| `evaluate-pre` | `repo`, `sha`, `phase: pre-release` | `result` (`pass`, `blocked`, `timeout`, `unsupported` or `not-requested`); the evaluation's ids, `message-id` (the request) and `run-id` (the run its findings are filed under); the findings in the job summary | it only asks for an evaluation and reads it: a re-run asks again and decides on the newest evaluation of (repo, sha, phase) that started after its own request. The API does not yet answer a repeated request with the evaluation it already has, so a re-run costs a second evaluation, filed under its own run |
 | `release` | the commit, or `ref` from the reconciler | `published` (true or false), `version`, `tag`, `sha` | a tag already on this commit, or a release commit pushed on top of it, is this commit's release: the stage does not run semantic-release, finishes what is missing (the tag, the GitHub release, the major tag) and reports `published`, so the package publish and the fleet notice that run on it finish too, rather than cutting another. It cuts a release on `main` only |
 | `deploy` | `artifact-name`, `artifact-digest`, `environment` (`development` or `production`), `version` | `deployed-version`, `deployed` | it reads what the target runs first and skips when that is already this version; a failed deploy re-runs on its own and takes the same artifact by digest |
 | `verify` | `environment`, `version` (deploy's `deployed-version`), `build-version`, `sha` (release's `sha` in production), the profile's check | `verified` (`true`, `false`, or `skipped` when the profile has nothing to verify); a commit status, `pipeline/verify (<environment>)`, on `sha` | it only reads the target, and its record is a commit status, of which the newest of a context is the one that counts |
-| `evaluate-post` | `repo`, `version`, `sha`, `phase: post-release` | the evaluation id | the evaluator answers a repeated (repo, version, phase) with the evaluation it already has |
+| `evaluate-post` | `repo`, `version`, `sha` and `published` from `release`'s outputs, `phase: post-release` | `result` (`requested`, `not-requested`, or `skipped` when nothing was published); `message-id` | it only asks: a re-run asks again, and the second evaluation of (repo, sha, phase) is filed under its own run, which Pipeline Health shows in place of the first |
 
 Every later stage consumes the artifact `build` produced, by digest,
 through the `fetch-artifact` action (see Build stage). No stage rebuilds it.
@@ -648,7 +651,135 @@ OIDC role), whatever its profile. In `pipeline.yml`:
 ```
 
 `evaluate-post` needs `verify` and runs only when it reports `verified`
-`true` (or `skipped`).
+`true` (or `skipped`); see Evaluation stages.
+
+### Evaluation stages
+
+`stages-evaluate.yml` is both evaluation stages, chosen by `phase`. Each asks
+api-kaianolevine-com (`POST /v1/evaluations/runs`) for a deterministic
+conformance evaluation of one commit, pinned by its full `sha`, and records
+the phase on every finding.
+
+- **`evaluate-pre`** (`phase: pre-release`) runs on a push to `main` after
+  `build`, on the commit about to be released, and gates `release`. It waits
+  for the outcome and passes only when the evaluation is complete and holds
+  no blocking finding. It fails as soon as a blocking finding arrives, and
+  it fails when no decision comes within `evaluate-timeout-seconds` (fail
+  closed): a release goes out only on an evaluation that said yes.
+- **`evaluate-post`** (`phase: post-release`) runs after `verify`, on the
+  release `release` published in the same run: its `version`, `tag` and
+  `sha` come in as inputs from `release`'s outputs, never from another run.
+  It asks and reports; it does not wait for the findings and fails only when
+  the API does not accept the request, since a dropped request leaves the
+  release unevaluated while looking fine. When `published` is anything but
+  `true` there is no release, and it skips and says so without asking.
+
+**What blocks a release.** A `CRITICAL` or `ERROR` finding. ecosystem-standards'
+`index.yaml` defines `ERROR` as a violation that "requires remediation before
+next deploy", which is exactly the decision this stage makes; `CRITICAL` is
+emitted when the evaluation itself could not run, which is no evaluation at
+all. The evaluator also reports a repository it could not read (its
+download failed, or processing raised) as an `ERROR` status row, so that
+blocks too. `WARN` ("remediation recommended") and `INFO` are reported in
+the job summary and do not block. Severities are what the evaluator posts,
+after the repository's exemptions, deferrals and downgrades in its
+`evaluator.yaml`, so a rule is waived for a repository there, not here.
+
+**How it waits.** The request is answered before anything is evaluated, so
+`evaluate-pre` reads `GET /v1/evaluations/runs/outcome?repo=&sha=&phase=&since=`
+with backoff (from `poll-initial-seconds`, doubling, capped at
+`poll-max-seconds`). The API answers with the newest evaluation of that
+commit and phase that started at or after `since` (the moment the stage
+asked): its state (`pending`, `running` or `complete`), its findings counted
+by severity, and the findings themselves. Findings are only ever added to a
+run, so a blocking one decides at once, finished or not. A pass needs
+`complete`, and today the evaluator closes only a clean evaluation (with its
+one `SUCCESS` row); an evaluation with `WARN` findings and no `ERROR` stays
+`running` and times out, failing closed, until the evaluator closes those
+too. An API without the outcome route (404) fails at once, as `unsupported`.
+The decisions are `evaluate-decision.sh` in the `evaluate-decision` action;
+`scripts/test-evaluate-decision.sh` proves them against `stand-in.py`, a
+stand-in for the two API routes.
+
+**Running it twice.** A re-run asks again. The API has no request-level
+idempotency today: a repeated (repo, sha, phase) is enqueued as a second
+evaluation under its own run id, and its findings are deduplicated only
+within that run. The stage tolerates that: it reads only evaluations that
+started after its own request, and of those the newest, so a re-run decides
+on the evaluation it asked for, never on a stale one (a transient
+"could not download" row included). Pipeline Health shows each repository's
+newest run, so the second evaluation replaces the first there.
+
+**The key.** `secrets.api-key` is the `ci-validator` machine key, the
+organisation secret `CI_VALIDATOR_API_KEY`, as for `evaluate.yml`. It holds
+one scope, `evaluations.runs.create`: it can cause an evaluation, not write a
+finding. A cog's key is never passed here. Reading the outcome needs no key:
+like `GET /v1/evaluations`, it is public and read-only.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `phase` | required | `pre-release` or `post-release` |
+| `sha` | required | The full commit sha: `github.sha` before release, `release`'s `sha` after |
+| `version`, `tag` | empty | `post-release`: `release`'s `version` (required when published) and `tag` (empty: `v<version>`) |
+| `published` | empty | `post-release`: `release`'s `published`; anything but `true` skips |
+| `repo`, `org` | the calling repository | What to evaluate |
+| `api-url` | `https://api.kaianolevine.com` | Base URL of api-kaianolevine-com |
+| `timeout-minutes` | `30` | How long the job may run |
+| `evaluate-timeout-seconds` | `900` | `pre-release`: how long to wait for a decision before failing closed |
+| `poll-initial-seconds`, `poll-max-seconds` | `10`, `60` | `pre-release`: the backoff between reads |
+| `target` | `live` | `fake` is the self-test's stand-in. Consumers leave it, and `fake-scenario` and `expect-failure`, which only it takes |
+
+| Output | Meaning |
+|---|---|
+| `result` | `pre-release`: `pass`, `blocked`, `timeout`, `unsupported` or `not-requested`. `post-release`: `requested`, `not-requested` or `skipped` |
+| `requested` | `true` when the API accepted a request from this run |
+| `message-id` | The queue message the request became: the evaluation's id until it has a run |
+| `run-id` | `pre-release`: the run the outcome was read from, which its findings are filed under |
+
+Neither job uses the run's token, so each is called with `permissions: {}`.
+In `pipeline.yml`:
+
+```yaml
+  evaluate-pre:
+    needs: [build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions: {}
+    uses: $/.github/workflows/stages-evaluate.yml
+    with:
+      phase: pre-release
+      sha: ${{ github.sha }}
+    secrets:
+      api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
+
+  release:
+    needs: [evaluate-pre]
+    # ...
+
+  evaluate-post:
+    needs: [release, verify]
+    # Skipped with its reason when nothing was published; otherwise only
+    # after verify passed.
+    if: always() && needs.release.result == 'success' && (needs.release.outputs.published != 'true' || needs.verify.result == 'success')
+    permissions: {}
+    uses: $/.github/workflows/stages-evaluate.yml
+    with:
+      phase: post-release
+      published: ${{ needs.release.outputs.published }}
+      version: ${{ needs.release.outputs.version }}
+      tag: ${{ needs.release.outputs.tag }}
+      sha: ${{ needs.release.outputs.sha }}
+    secrets:
+      api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
+```
+
+**From `evaluate.yml`.** The fleet's `ci.yml` `evaluate` jobs keep calling
+`evaluate.yml@v3`, which is unchanged: it asks for an evaluation of `main`
+and does not wait, and its callers need do nothing. A repository moves to
+the evaluation stages when it moves onto `pipeline.yml`, in the same change
+that drops its own `evaluate` job: `evaluate-pre` and `evaluate-post` replace
+it, and nothing else in its caller changes. `evaluate.yml` stays for
+`scope: fleet` (ecosystem-standards and evaluator-cog) and for
+`evaluate-now.yml`.
 
 ### Enforced and subscribed
 
@@ -805,9 +936,17 @@ reports holds a pull request open for good.
   every check in one job as `python-test.yml` runs it (not
   `python-test.yml` itself, which runs the published action and so would
   test what is already released). The `shared-workflows` fixture also
-  runs the static analysis above on its own workflows. Every later stage
-  of a profile that no job runs yet is named in the run, with its reason,
-  by the `not run yet` job, so a gap shows rather than passing in silence.
+  runs the static analysis above on its own workflows. The evaluate jobs
+  run `stages-evaluate.yml` against a stand-in API once, not per fixture,
+  since an evaluation asks about a commit rather than a profile's build:
+  `evaluate-pre` must pass a clean evaluation, pass again when re-run on the
+  same commit, and fail (its release would not run) on an `ERROR` and on an
+  evaluation that never finishes; `evaluate-post` must ask for a release
+  wired from release outputs, and skip without asking when nothing was
+  published. `evaluate decision check` runs
+  `scripts/test-evaluate-decision.sh`. Every stage in the stage graph now
+  runs against the fixtures, so there is no `not run yet` job; a stage
+  added before it can run here brings one back.
 - **No side effects.** A fixture never publishes a package, tags a fleet
   repository, deploys or posts an evaluation. The release stage runs only
   as a dry run, in a scratch repository whose one remote is a bare
@@ -825,8 +964,9 @@ reports holds a pull request open for good.
   secret. The verify stage runs with `target: fake` too: it polls a
   stand-in service on the job's own loopback, posts its alarm there, and
   keeps its record as an artifact of the run instead of a commit status.
-  Evaluation stages do not run against a fixture until they can do
-  so with no effect outside the run.
+  The evaluation stages run with `target: fake`: the API they ask is a
+  stand-in on the job's loopback with a key of its own, so they read no
+  secret and post no evaluation.
 - **One gate.** The `gate` job in `self-test.yml` passes only if every
   other job there passed. It is the check `main` requires, and its name
   does not change as fixtures or stages are added.
@@ -876,13 +1016,16 @@ the fixtures in the same job:
   job in `self-test.yml` runs it twice in production for every fixture,
   after a run to development, and then once against a version that is not
   the release, which must fail.
-- `evaluate-pre` and `evaluate-post` run dry against a fixture, and the
-  second request for the same (repo, sha, phase), or (repo, version,
-  phase), must be answered with the evaluation already recorded.
+- `evaluate-pre` and `evaluate-post` only ask and read. A re-run asks
+  again and decides on the evaluation it asked for (see Evaluation stages);
+  the `evaluate-pre-again` job in `self-test.yml` runs it a second time on
+  the same commit, which must pass again. Once the API answers a repeated
+  (repo, sha, phase) with the evaluation it already has, the same job
+  proves that, with no change to the stage.
 
 #### Pointing it at pipeline.yml
 
-Once `pipeline.yml` exists, the `stages`, `build`, `fixture` and `pending` jobs in
+Once `pipeline.yml` exists, the `stages`, `build`, `fixture` and evaluate jobs in
 `self-test.yml` become one matrix job over the profiles that calls it:
 
 ```yaml
@@ -902,10 +1045,10 @@ For that, `pipeline.yml` needs a `working-directory` input that every stage
 honours, as `stages-test.yml` does now (with the `postgres-image` the
 `stages` job passes `api-service` today becoming that profile's default), and every stage that
 reaches outside the run (release, deploy, verify, evaluate) needs a mode the
-fixtures run it in that has no effect outside the run (deploy and verify
-have one, `target: fake`). A stage the profile
+fixtures run it in that has no effect outside the run (deploy, verify and
+evaluate have one, `target: fake`). A stage the profile
 has no use for is skipped with its reason, as the stages before `build`
-already are, which replaces the `pending` job. `gate` keeps its name and needs the new job.
+already are. `gate` keeps its name and needs the new job.
 A new profile adds a directory under `fixtures/` and an entry in the
 matrix.
 
@@ -1028,7 +1171,9 @@ re-graded twelve repositories that had not changed.
 
 ### Using it
 
-Add one job that runs after your release job:
+On the canonical pipeline, the evaluation stages replace this job (see
+Evaluation stages). Until a repository moves, add one job that runs after
+your release job:
 
 ```yaml
 jobs:

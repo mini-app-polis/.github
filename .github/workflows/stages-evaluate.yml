@@ -1,0 +1,349 @@
+# The pipeline's evaluation stages (README, "Evaluation stages"): ask
+# api-kaianolevine-com for a deterministic conformance evaluation of one
+# commit, in one release phase.
+#
+#   pre-release   evaluate-pre, after `build` and before `release`, on the
+#                 commit about to be released. It waits for the outcome and
+#                 fails when the evaluation holds a CRITICAL or ERROR finding,
+#                 so `release`, which needs it, does not run. It also fails
+#                 when no outcome comes in time: a release goes out only on
+#                 an evaluation that said yes, never on one that said nothing.
+#   post-release  evaluate-post, after `verify`, on the release `release`
+#                 published: its `version` and `sha` come in as inputs, from
+#                 the release stage's outputs in the same run, never from
+#                 another run. It asks and reports, and does not wait for
+#                 the findings or fail on them; it fails only when the API
+#                 did not accept the request. With `published` anything but
+#                 "true" there is no release to evaluate, and it skips and
+#                 says so.
+#
+# The key is the ci-validator machine key, the organisation secret
+# CI_VALIDATOR_API_KEY, passed as `api-key`. It holds one scope,
+# evaluations.runs.create: it can cause an evaluation, not write a finding.
+# A cog's key is never used here. Reading the outcome needs no key: like
+# GET /v1/evaluations, it is public and read-only.
+#
+# A re-run asks again. The API has no request-level idempotency yet: it
+# enqueues a second evaluation of the same commit, filed under its own run.
+# The stage reads only evaluations that started after its own request, and
+# of those the newest, so a re-run decides on the evaluation it asked for.
+#
+# `target: fake` is for this repository's self-test and nothing else. The
+# API is a stand-in started in the job on its loopback (stand-in.py in the
+# evaluate-decision action), with its own key: no secret is read and
+# nothing outside the run is called. `fake-scenario` says what the stand-in
+# answers, and `expect-failure` (fake only) lets the self-test prove that a
+# blocked evaluation fails the stage without failing its own run: the
+# failing step is let through, and `outcome` still reports it.
+#
+# pipeline.yml calls it twice:
+#
+#   jobs:
+#     evaluate-pre:
+#       needs: [build]
+#       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+#       permissions: {}
+#       uses: mini-app-polis/.github/.github/workflows/stages-evaluate.yml@v3
+#       with:
+#         phase: pre-release
+#         sha: ${{ github.sha }}
+#       secrets:
+#         api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
+#
+#     evaluate-post:
+#       needs: [release, verify]
+#       if: always() && needs.release.result == 'success' && (needs.release.outputs.published != 'true' || needs.verify.result == 'success')
+#       permissions: {}
+#       uses: mini-app-polis/.github/.github/workflows/stages-evaluate.yml@v3
+#       with:
+#         phase: post-release
+#         published: ${{ needs.release.outputs.published }}
+#         version: ${{ needs.release.outputs.version }}
+#         tag: ${{ needs.release.outputs.tag }}
+#         sha: ${{ needs.release.outputs.sha }}
+#       secrets:
+#         api-key: ${{ secrets.CI_VALIDATOR_API_KEY }}
+#
+# The action is named with `$/`, which resolves to this repository at the
+# commit of this file, so a caller pinned to a tag gets every part of the
+# stage from that same tag.
+
+name: stages-evaluate
+
+on:
+  workflow_call:
+    inputs:
+      phase:
+        description: "pre-release (evaluate-pre: wait, and gate the release) or post-release (evaluate-post: ask and report)."
+        type: string
+        required: true
+      sha:
+        description: "The full commit sha to evaluate. pre-release: the commit about to be released. post-release: the release stage's sha."
+        type: string
+        required: true
+      version:
+        description: "post-release: the release stage's version (X.Y.Z). Required when published is \"true\"."
+        type: string
+        default: ""
+      tag:
+        description: "post-release: the release stage's tag, recorded as the ref. Empty: v<version>."
+        type: string
+        default: ""
+      published:
+        description: "post-release: the release stage's published. Anything but \"true\" means there is no release, and the stage skips."
+        type: string
+        default: ""
+      repo:
+        description: "Repository name, without the org. Empty: the calling repository."
+        type: string
+        default: ""
+      org:
+        description: "Owning GitHub org. Empty: the calling repository's owner."
+        type: string
+        default: ""
+      api-url:
+        description: "Base URL of api-kaianolevine-com."
+        type: string
+        default: https://api.kaianolevine.com
+      target:
+        description: "live, or fake: the self-test's stand-in. Consumers leave it."
+        type: string
+        default: live
+      fake-scenario:
+        description: "fake only: what the stand-in answers (clean, blocking, running, missing or refuse; stand-in.py says what each is). Consumers leave it."
+        type: string
+        default: clean
+      expect-failure:
+        description: "fake only: the stand-in is meant to fail the stage; the job still fails, but does not fail the run. Consumers leave it."
+        type: boolean
+        default: false
+      timeout-minutes:
+        description: "How long the evaluate job may run."
+        type: number
+        default: 30
+      evaluate-timeout-seconds:
+        description: "pre-release: how long to wait for the outcome before failing closed."
+        type: number
+        default: 900
+      poll-initial-seconds:
+        description: "pre-release: the first wait between reads; it doubles each read."
+        type: number
+        default: 10
+      poll-max-seconds:
+        description: "pre-release: the longest wait between reads."
+        type: number
+        default: 60
+    secrets:
+      api-key:
+        description: "The ci-validator machine key, the organisation secret CI_VALIDATOR_API_KEY. Required for target: live."
+        required: false
+    outputs:
+      result:
+        description: "pre-release: pass, blocked, timeout, unsupported or not-requested. post-release: requested, not-requested, or skipped when nothing was published."
+        value: ${{ jobs.evaluate.outputs.result }}
+      requested:
+        description: "\"true\" when the API accepted a request from this run, \"false\" otherwise."
+        value: ${{ jobs.evaluate.outputs.requested }}
+      message-id:
+        description: "The queue message the request became: the evaluation's id until it has a run."
+        value: ${{ jobs.evaluate.outputs.message-id }}
+      run-id:
+        description: "pre-release: the run the outcome was read from, which the findings are filed under."
+        value: ${{ jobs.evaluate.outputs.run-id }}
+      outcome:
+        description: "The evaluate job's status (success or failure), for the self-test, which runs a case meant to fail."
+        value: ${{ jobs.evaluate.outputs.outcome }}
+
+# Nothing here uses the run's token: no checkout, no GitHub API. The request
+# carries the api-key secret.
+permissions: {}
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions: {}
+    outputs:
+      result: ${{ steps.result.outputs.result }}
+      requested: ${{ steps.result.outputs.requested }}
+      message-id: ${{ steps.ask.outputs.message-id }}
+      run-id: ${{ steps.ask.outputs.run-id }}
+      outcome: ${{ steps.outcome.outputs.outcome }}
+    env:
+      PHASE: ${{ inputs.phase }}
+      SHA: ${{ inputs.sha }}
+      VERSION: ${{ inputs.version }}
+      TARGET: ${{ inputs.target }}
+    steps:
+      - name: Decide what to ask
+        id: plan
+        env:
+          TAG: ${{ inputs.tag }}
+          PUBLISHED: ${{ inputs.published }}
+          REPO: ${{ inputs.repo || github.event.repository.name }}
+          ORG: ${{ inputs.org || github.repository_owner }}
+          EXPECT_FAILURE: ${{ inputs.expect-failure }}
+          HAS_KEY: ${{ secrets.api-key != '' }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          case "${TARGET}" in live|fake) ;; *) fail "target is '${TARGET}': it is live or fake." ;; esac
+          if [ "${TARGET}" != fake ] && [ "${EXPECT_FAILURE}" = true ]; then
+            fail "expect-failure is for the self-test's stand-in (target: fake) only."
+          fi
+          skip=false
+          reason=""
+          case "${PHASE}" in
+            pre-release)
+              ref="${GITHUB_REF_NAME}" ;;
+            post-release)
+              if [ "${PUBLISHED}" != true ]; then
+                skip=true
+                reason="No release was published by this run (published: '${PUBLISHED:-empty}'), so there is no release to evaluate."
+              fi
+              ref="${TAG:-${VERSION:+v${VERSION}}}" ;;
+            *) fail "phase is '${PHASE}': it is pre-release or post-release." ;;
+          esac
+          if [ "${skip}" = false ]; then
+            [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || fail "sha is '${SHA}': pass the full commit sha (pre-release: github.sha; post-release: the release stage's sha)."
+            if [ "${PHASE}" = post-release ] && [ -z "${VERSION}" ]; then
+              fail "No version: pass the release stage's version."
+            fi
+            # Only ever the ci-validator key: the stage has no other secret.
+            if [ "${TARGET}" = live ] && [ "${HAS_KEY}" != true ]; then
+              fail "No api-key: forward the organisation secret CI_VALIDATOR_API_KEY as 'secrets: api-key'."
+            fi
+          fi
+          {
+            echo "skip=${skip}"
+            echo "reason=${reason}"
+            echo "repo=${REPO}"
+            echo "org=${ORG}"
+            echo "ref=${ref}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Nothing to evaluate
+        if: steps.plan.outputs.skip == 'true'
+        env:
+          REASON: ${{ steps.plan.outputs.reason }}
+        run: |
+          echo "::notice title=evaluate skipped (${PHASE})::${REASON}"
+          printf '### evaluate: skipped (%s)\n\n%s\n' "${PHASE}" "${REASON}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- The stand-in (target: fake) ---------------------------------------
+      #
+      # The API's two routes on the job's loopback, answering as the scenario
+      # says, with a key of its own. The action starts it, from the
+      # stand-in.py beside its script, which the action's tests use too; this
+      # picks where.
+      - name: "Stand-in: pick its address"
+        id: fake
+        if: steps.plan.outputs.skip == 'false' && inputs.target == 'fake'
+        run: |
+          set -euo pipefail
+          port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+          {
+            echo "port=${port}"
+            echo "url=http://127.0.0.1:${port}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ask for the evaluation
+        id: ask
+        if: steps.plan.outputs.skip == 'false'
+        uses: $/.github/actions/evaluate-decision
+        env:
+          EVALUATE_API_URL: ${{ inputs.target == 'fake' && steps.fake.outputs.url || inputs.api-url }}
+          EVALUATE_API_KEY: ${{ inputs.target == 'fake' && 'fake-key' || secrets.api-key }}
+          EVALUATE_STAND_IN: ${{ inputs.target == 'fake' && inputs.fake-scenario || '' }}
+          EVALUATE_STAND_IN_PORT: ${{ steps.fake.outputs.port }}
+        with:
+          phase: ${{ inputs.phase }}
+          repo: ${{ steps.plan.outputs.repo }}
+          org: ${{ steps.plan.outputs.org }}
+          sha: ${{ inputs.sha }}
+          ref: ${{ steps.plan.outputs.ref }}
+          wait: ${{ inputs.phase == 'pre-release' }}
+          timeout-seconds: ${{ inputs.evaluate-timeout-seconds }}
+          initial-seconds: ${{ inputs.poll-initial-seconds }}
+          max-seconds: ${{ inputs.poll-max-seconds }}
+
+      - name: Result
+        id: result
+        if: always()
+        env:
+          SKIP: ${{ steps.plan.outputs.skip }}
+          RESULT: ${{ steps.ask.outputs.result }}
+          REASON: ${{ steps.ask.outputs.reason }}
+          MESSAGE_ID: ${{ steps.ask.outputs.message-id }}
+          RUN_ID: ${{ steps.ask.outputs.run-id }}
+          ANSWER: ${{ steps.ask.outputs.answer }}
+          REPO: ${{ steps.plan.outputs.repo }}
+          ORG: ${{ steps.plan.outputs.org }}
+        run: |
+          set -euo pipefail
+          if [ "${SKIP}" = true ]; then
+            echo "result=skipped" >> "$GITHUB_OUTPUT"
+            echo "requested=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          result="${RESULT:-not-requested}"
+          requested=false
+          [ -n "${RESULT}" ] && [ "${RESULT}" != not-requested ] && requested=true
+          {
+            echo "result=${result}"
+            echo "requested=${requested}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            printf '### evaluate: %s (%s, %s)\n\n' "${result}" "${PHASE}" "${TARGET}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${ORG}/${REPO}@${SHA}\` |"
+            [ -n "${VERSION}" ] && echo "| Release | \`${VERSION}\` |"
+            echo "| Request | ${MESSAGE_ID:+message \`${MESSAGE_ID}\`}$([ "${requested}" = true ] || echo 'not accepted') |"
+            [ -n "${RUN_ID}" ] && echo "| Run | \`${RUN_ID}\` |"
+            echo "| Why | ${REASON:-the stage stopped before it asked; see the steps above} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # What the evaluation held, most severe first, when it was read.
+          if [ -n "${ANSWER}" ] && [ -s "${ANSWER}" ] && jq -e '.data.findings | length > 0' "${ANSWER}" > /dev/null 2>&1; then
+            {
+              echo
+              echo "| Severity | Rule | Finding |"
+              echo "|---|---|---|"
+              jq -r '.data.findings[] | "| \(.severity) | \(.violation_id // "status") | \(.finding | gsub("[\\r\\n|]+"; " ")) |"' "${ANSWER}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # pre-release gates: only a pass lets the release run. post-release
+      # reports: only a request the API did not accept fails it, because a
+      # dropped request leaves the release unevaluated while looking fine.
+      #
+      # In the self-test's planned failure (fake target, expect-failure)
+      # this step fails as it would live, but is let through, so the job
+      # shows green and `outcome` still reports the failure for the
+      # self-test to prove. Anywhere else it fails the job.
+      - name: Fail unless the phase's answer allows it
+        id: fail
+        if: always() && steps.plan.outputs.skip == 'false'
+        continue-on-error: ${{ inputs.target == 'fake' && inputs.expect-failure }}
+        env:
+          RESULT: ${{ steps.result.outputs.result }}
+          REASON: ${{ steps.ask.outputs.reason }}
+        run: |
+          set -euo pipefail
+          case "${PHASE}:${RESULT}" in
+            pre-release:pass|post-release:requested)
+              echo "${PHASE}: ${RESULT}" ;;
+            *)
+              echo "::error title=evaluate ${PHASE}: ${RESULT}::${REASON:-the stage stopped before it asked}"
+              exit 1 ;;
+          esac
+
+      # Last, so it sees every step above, the failure included.
+      - name: Outcome
+        id: outcome
+        if: always()
+        env:
+          # A let-through failure leaves job.status success; the step's own
+          # outcome still says it failed.
+          STATUS: ${{ steps.fail.outcome == 'failure' && 'failure' || job.status }}
+        run: echo "outcome=${STATUS}" >> "$GITHUB_OUTPUT"
