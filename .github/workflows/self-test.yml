@@ -1,0 +1,218 @@
+# This repository's own test stage: ci.yml's `test` job calls it on every
+# pull request and every push to main, and the release needs that job, so
+# anything failing here blocks the release.
+#
+# It runs workflow static analysis on this repository, and runs the
+# pipeline's stages against one fixture repository per profile (README,
+# "Changing the pipeline"). The fixtures are directories under fixtures/,
+# each holding only what its profile's stages need to run green.
+#
+# Fixtures never publish, tag a fleet repository, deploy or post an
+# evaluation, and reach no network beyond package registries. The release
+# stage runs only as a dry run, in a scratch repository whose one remote is
+# a bare repository beside it. No fixture names a contract suite, so the
+# contract stage, which calls the development API, skips against every one
+# and says so. A stage that would deploy or evaluate is not run here at all
+# until it has a mode that does neither; the `pending` job names each such
+# stage in the run, so it is skipped in sight rather than left out.
+#
+# The fixture jobs call the stage workflows and actions that exist today.
+# Once pipeline.yml exists, `stages`, `fixture` and `pending` become one
+# matrix job that calls it for each profile, with the fixture's directory
+# as its working directory; README, "Testing the pipeline", says what
+# pipeline.yml needs for that.
+name: self-test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # actionlint, zizmor and the timeout check over this repository's own
+  # workflows.
+  workflow-checks:
+    uses: ./.github/workflows/workflow-checks.yml
+    permissions:
+      contents: read
+
+  # The TypeScript branch of security.yml needs exercising here too, or a
+  # change to it reaches consumers untested — which is how the osv-scanner
+  # swap in v2 would otherwise have gone out. The only Node lockfile of this
+  # repository's own is the release tooling's, in
+  # .github/actions/semantic-release, so this job is also the audit of what
+  # every repo's release installs.
+  security-typescript:
+    name: security (release tooling)
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+    with:
+      language: typescript
+      sbom: false
+
+  # The stages before build (stages-test.yml: lint, unit, integration,
+  # contract and security, and the `test` gate over them) against each
+  # profile's fixture. A stage the profile has nothing for runs, says why in
+  # its summary and passes.
+  #
+  # api-service's integration stage runs against the Postgres service
+  # container the fleet's APIs use, and its fixture's integration test fails
+  # rather than skips without one, so the container is proven every run. No
+  # SBOM: it would be the fixture's, which nobody needs, and every call would
+  # upload it under the same artifact name.
+  stages:
+    name: stages (${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: python-service, postgres-image: "" }
+          - { profile: api-service, postgres-image: "pgvector/pgvector:pg16" }
+          - { profile: python-library, postgres-image: "" }
+          - { profile: astro-site, postgres-image: "" }
+          - { profile: npm-library, postgres-image: "" }
+          - { profile: terraform-infra, postgres-image: "" }
+          - { profile: shared-workflows, postgres-image: "" }
+    uses: ./.github/workflows/stages-test.yml
+    permissions:
+      contents: read
+    with:
+      profile: ${{ matrix.profile }}
+      working-directory: fixtures/${{ matrix.profile }}
+      postgres-image: ${{ matrix.postgres-image }}
+      postgres-database: fixture_test
+      sbom: false
+
+  # The shared-workflows profile's lint stage is the static analysis above,
+  # run on the fixture's workflows instead of this repository's.
+  fixture-workflows:
+    name: workflow checks (shared-workflows)
+    uses: ./.github/workflows/workflow-checks.yml
+    permissions:
+      contents: read
+    with:
+      working-directory: fixtures/shared-workflows
+
+  # The stages that run on a runner of their own against each fixture: the
+  # release stage, run twice on one commit, and for the Python fixtures the
+  # python-checks action as python-test.yml runs it, every check in one job,
+  # since the fleet's callers of python-test.yml still use it that way.
+  #
+  # That is the local action, not python-test.yml: python-test.yml runs the
+  # action from the published major, so it would test what is already
+  # released rather than this change. The integration tests are left out:
+  # they need the service container the integration stage starts.
+  fixture:
+    name: fixture (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: python-service, test: python-checks }
+          - { profile: api-service, test: python-checks }
+          - { profile: python-library, test: python-checks }
+          - { profile: astro-site, test: "" }
+          - { profile: npm-library, test: "" }
+          - { profile: terraform-infra, test: "" }
+          - { profile: shared-workflows, test: "" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Every check, as python-test.yml runs them
+        if: matrix.test == 'python-checks'
+        uses: ./.github/actions/python-checks
+        with:
+          working-directory: fixtures/${{ matrix.profile }}
+          typecheck: uv run mypy src/
+          pytest-args: --ignore=tests/integration --cov=src --cov-report=term-missing
+
+      # The same Node and the same lockfile the release action installs.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Install the locked release tooling
+        working-directory: .github/actions/semantic-release
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: A second release run on a released commit releases nothing
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: bash scripts/check-release-rerun.sh "fixtures/${PROFILE}" .github/actions/semantic-release
+
+  # The stages of each profile that no fixture job runs yet, each with the
+  # reason, as a notice on the run and a table in this job's summary. The
+  # stages before build are not listed: `stages` runs all of them for every
+  # profile, and each says itself when the profile has nothing for it.
+  pending:
+    name: not run yet (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: python-service, stages: "build evaluate-pre deploy verify evaluate-post" }
+          - { profile: api-service, stages: "build evaluate-pre deploy verify evaluate-post" }
+          - { profile: python-library, stages: "build evaluate-pre deploy verify evaluate-post" }
+          - { profile: astro-site, stages: "build evaluate-pre deploy verify evaluate-post" }
+          - { profile: npm-library, stages: "build evaluate-pre deploy verify evaluate-post" }
+          - { profile: terraform-infra, stages: "build evaluate-pre deploy verify evaluate-post" }
+          - { profile: shared-workflows, stages: "evaluate-pre deploy verify evaluate-post" }
+    steps:
+      - name: Name each stage not run, and why
+        env:
+          PROFILE: ${{ matrix.profile }}
+          STAGES: ${{ matrix.stages }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${PROFILE}: stages not run against the fixture yet"
+            echo
+            echo "| Stage | Why |"
+            echo "|---|---|"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          for stage in ${STAGES}; do
+            case "${stage}" in
+              deploy)
+                why="pipeline.yml has no deploy stage yet. Against a fixture it must deploy to nothing real, so it runs here only once it can." ;;
+              evaluate-pre|evaluate-post)
+                why="pipeline.yml has no ${stage} stage yet. Against a fixture it must run dry and post no evaluation, so it runs here only once it can." ;;
+              *)
+                why="pipeline.yml has no ${stage} stage yet; it runs here once it does." ;;
+            esac
+            echo "::notice title=${PROFILE}: ${stage} skipped::${why}"
+            echo "| \`${stage}\` | ${why} |" >> "${GITHUB_STEP_SUMMARY}"
+          done
+
+  # One result for the whole stage, so main's ruleset can require one check
+  # whose name does not change as jobs are added above. It runs whatever
+  # happened, and passes only if every job it needs passed.
+  gate:
+    name: gate
+    if: always()
+    needs: [workflow-checks, security-typescript, stages, fixture-workflows, fixture, pending]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every self-test job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "${NEEDS}"
+          failed="$(jq '[to_entries[] | select(.value.result != "success")] | length' <<< "${NEEDS}")"
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::${failed} self-test job(s) did not pass."
+            exit 1
+          fi

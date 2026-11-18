@@ -1,20 +1,49 @@
-# Checks on this repository's own workflow files, run on every change to
-# them. Not part of the pipeline consumers call: it reads only this
-# repository's .github/workflows.
+# Static analysis of this repository's own workflow files. Not part of the
+# pipeline consumers call: it reads only the .github directory of the
+# repository it is given.
+#
+# Called from self-test.yml, so it runs as part of ci.yml's `test` job on
+# every pull request and every push to main, and the release waits for it.
+# It has no path filter of its own: a required check that does not report
+# holds a pull request open for good.
 #
 # timeouts: every job that runs steps declares timeout-minutes, so a hung
 # step stops at a known limit instead of holding a runner for six hours.
+#
+# actionlint: syntax, expressions, contexts and the shell in run steps
+# (through shellcheck). Its configuration, and the reason for each finding
+# it ignores, is in .github/actionlint.yaml.
+#
+# zizmor: security. Fails on any finding of high severity. The medium and
+# low findings already here are printed, and do not fail the run.
+#
+# Every tool is pinned to one release and checked against that release's
+# SHA-256 before it runs. Dependabot does not move these: a version and its
+# hash are changed together, by hand.
 name: workflow-checks
 
 on:
-  pull_request:
-    paths: [".github/workflows/**", "scripts/check-workflow-timeouts.py"]
-  push:
-    branches: [main]
-    paths: [".github/workflows/**", "scripts/check-workflow-timeouts.py"]
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "The directory, within the checkout, holding the repository whose workflows to check. For this repository's own fixtures."
+        type: string
+        default: "."
 
 permissions:
   contents: read
+
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  # actionlint_1.7.12_linux_amd64.tar.gz, from the release's checksums file.
+  ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+  # shellcheck for actionlint, so its findings do not move when the runner
+  # image updates its own copy. The shellcheck-py wheel for manylinux x86_64.
+  SHELLCHECK_PY_VERSION: "0.11.0.1"
+  SHELLCHECK_PY_SHA256: "1b274df81de5b000ff78db433e7328b87e52e3c38481c60f8e488c3095beef05"
+  # The zizmor wheel for manylinux_2_28 x86_64.
+  ZIZMOR_VERSION: "1.32.0"
+  ZIZMOR_SHA256: "84a6acb975accc13408786a2bd274b572537ca19c933ebbc13e78f3988562071"
 
 jobs:
   timeouts:
@@ -22,6 +51,9 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -32,4 +64,91 @@ jobs:
       - name: Every job declares timeout-minutes
         run: |
           python -m pip install --quiet pyyaml
-          python scripts/check-workflow-timeouts.py
+          python "${GITHUB_WORKSPACE}/scripts/check-workflow-timeouts.py" .github/workflows
+
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install actionlint and shellcheck
+        run: |
+          set -euo pipefail
+          tools="${RUNNER_TEMP}/workflow-tools"
+          mkdir -p "${tools}"
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --retry 5 --retry-connrefused -o "${tools}/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${tools}/${archive}" | sha256sum --check --strict
+          tar -xzf "${tools}/${archive}" -C "${tools}" actionlint
+          python -m venv "${tools}/venv"
+          echo "shellcheck-py==${SHELLCHECK_PY_VERSION} --hash=sha256:${SHELLCHECK_PY_SHA256}" > "${tools}/requirements.txt"
+          "${tools}/venv/bin/pip" install --quiet --retries 5 --require-hashes --only-binary=:all: \
+            -r "${tools}/requirements.txt"
+          "${tools}/actionlint" -version
+          "${tools}/venv/bin/shellcheck" --version
+      # Style-level shellcheck notes (SC2129 and the like) are left out: they
+      # are a matter of taste rather than a fault, and a workflow is not
+      # failed for one. Warnings and errors still fail it. pyflakes is off
+      # because no step here runs under `shell: python`.
+      #
+      # The files are named rather than found: with no arguments actionlint
+      # lints the whole git repository's workflows, which for a fixture
+      # would be this repository's rather than the fixture's.
+      - name: actionlint
+        env:
+          SHELLCHECK_OPTS: --severity=warning
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tools="${RUNNER_TEMP}/workflow-tools"
+          files=(.github/workflows/*.yml .github/workflows/*.yaml)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No workflow files in .github/workflows to check."
+            exit 1
+          fi
+          "${tools}/actionlint" -color \
+            -shellcheck "${tools}/venv/bin/shellcheck" -pyflakes "" "${files[@]}"
+
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install zizmor
+        run: |
+          set -euo pipefail
+          tools="${RUNNER_TEMP}/workflow-tools"
+          python -m venv "${tools}/venv"
+          echo "zizmor==${ZIZMOR_VERSION} --hash=sha256:${ZIZMOR_SHA256}" > "${tools}/requirements.txt"
+          "${tools}/venv/bin/pip" install --quiet --retries 5 --require-hashes --only-binary=:all: \
+            -r "${tools}/requirements.txt"
+          "${tools}/venv/bin/zizmor" --version
+      # Offline: the audits that ask GitHub about each action (impostor
+      # commits, known-vulnerable actions) need a token and give a different
+      # answer from one day to the next, so a green run would not stay green
+      # on the same tree.
+      - name: Every finding, for the record
+        run: '"${RUNNER_TEMP}/workflow-tools/venv/bin/zizmor" --offline --no-exit-codes .github/'
+      - name: No finding of high severity
+        run: '"${RUNNER_TEMP}/workflow-tools/venv/bin/zizmor" --offline --min-severity high .github/'

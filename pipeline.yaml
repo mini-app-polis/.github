@@ -1,6 +1,6 @@
 # The canonical pipeline's settings that change over time (README, "The
-# canonical pipeline"). Conformance rules and the release reconciler read
-# them from here; nothing else restates them.
+# canonical pipeline"). Conformance rules, the release reconciler and the
+# pipeline's own actions read them from here; nothing else restates them.
 
 # The major every repository's caller pins: pipeline.yml@v<current_major>.
 current_major: 3
@@ -17,3 +17,9 @@ soak_days: 7
 # CD-042, CD-043) grade only these, so a repository is added here in the
 # same change that moves it. Missing or empty: none are graded.
 on_pipeline: []
+
+# The uv every stage installs. The fleet's repositories accept a range in
+# their `[tool.uv] required-version`; this is the one release inside it that
+# the pipeline runs, so every lock is checked and every environment built by
+# the same uv. It moves by hand, with that range when the range moves.
+uv_version: "0.13.9"

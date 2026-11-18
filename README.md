@@ -7,6 +7,7 @@ workflows, one per stage of a repo's `ci.yml` (ecosystem-standards CD-026):
 |---|---|
 | `security` | `security.yml` — the fleet's shared security controls |
 | `test` | `python-test.yml` — lock check, lint, format and tests for a uv repo |
+| `lint`, `unit`, `integration`, `contract`, `security`, gated by `test` | `stages-test.yml` — the canonical pipeline's stages before `build`, for any profile (see Test stages) |
 | `release` | `release.yml` — semantic-release from the fleet's locked tooling |
 | `deploy` | `lambda-deploy.yml` — build, prove and upload a cog's Lambda zip |
 | `evaluate` | `evaluate.yml` — ask for the repository to be evaluated |
@@ -92,7 +93,8 @@ separate workflows.
 | Integration tests | `integration` | every event | — | `build` |
 | Contract tests | `contract` | every event | — | `build` |
 | Security | `security` | every event | — | `build` |
-| Build | `build` | every event | `lint`, `unit`, `integration`, `contract`, `security` | everything after it |
+| Test gate | `test` | every event | `lint`, `unit`, `integration`, `contract`, `security` | `build` |
+| Build | `build` | every event | `test` | everything after it |
 | Pre-release evaluation | `evaluate-pre` | push to `main` | `build` | `release` |
 | Release | `release` | push to `main`, and `workflow_dispatch` with `ref` | `evaluate-pre` | `deploy` on `main` |
 | Deploy | `deploy` | push to `dev` (development), push to `main` when `release` published (production) | `build`, and `release` on `main` | `verify` |
@@ -104,7 +106,8 @@ that failed. A stage a profile has no use for still appears in the run
 and is skipped with its reason in the job summary, never removed. The
 required status check is the `test` job, a gate over `lint`, `unit`,
 `integration`, `contract` and `security`; its name does not change when
-stages are added.
+stages are added. Those six jobs are one reusable workflow,
+`stages-test.yml`, which `pipeline.yml` calls as one job (see Test stages).
 
 On `dev`, a commit is built, tested, deployed to development and verified
 there. On `main`, a commit is built and tested again, evaluated before
@@ -124,7 +127,8 @@ produces no second release, deploy or evaluation.
 
 | Stage | Inputs | Outputs and artifacts | Safe to re-run because |
 |---|---|---|---|
-| `lint`, `unit`, `integration`, `contract` | the commit; the profile's commands; for `integration`, the service containers the profile names; for `contract`, the contract suites the profile names and the development API | test reports in the job summary | they change nothing outside the run |
+| `lint`, `unit`, `integration`, `contract` | the commit; the profile's commands; for `integration`, the Postgres service container the caller names; for `contract`, the contract suite the caller names, at the release its lock holds, and the development API | what ran and its result in the job summary, or why the stage had nothing to run | `lint`, `unit` and `integration` change nothing outside the run; `contract` writes only fixed rows the development API upserts, so a second run converges on the first |
+| `test` | the results of `lint`, `unit`, `integration`, `contract` and `security` | a table of them in the job summary | it only reads them |
 | `security` | the commit; the profile's language and package manager | findings in the job summary | it changes nothing outside the run |
 | `build` | the commit; the profile's build | `artifact-name`, `artifact-digest`; the artifact (wheel, Lambda zip, container image or site bundle) and its SBOM, kept with the run | an artifact for this commit already in the run is reused, not rebuilt |
 | `evaluate-pre` | `repo`, `sha`, `phase: pre-release` | the evaluation id | the evaluator answers a repeated (repo, sha, phase) with the evaluation it already has |
@@ -140,7 +144,9 @@ Every job declares `timeout-minutes`. Network calls (registry pulls,
 package publish, deploys, API calls) retry with backoff. `release` and
 `deploy` run in per-repository concurrency groups that never cancel a run
 in progress; only the stages before `build` cancel superseded runs, and
-only off `main`. `workflow-checks.yml` fails a change to this repository
+only off `main`. `contract` is the exception among them when it runs a
+suite: it writes to the development API, so it waits in the one group
+every such run in the repository shares and is never cancelled partway. `workflow-checks.yml` fails a change to this repository
 that adds a job without `timeout-minutes`.
 
 ### Profiles
@@ -182,6 +188,115 @@ its caller that need the `pipeline` job:
 
 Anything else is drift, and the conformance rules report it.
 
+### Test stages
+
+`stages-test.yml` holds the stages before `build`: `lint`, `unit`,
+`integration`, `contract` and `security`, each a job of its own, and
+`test`, the gate over them. A `profile` job first resolves the profile
+into the tooling each stage runs, and fails on a profile it does not know.
+
+| Stage | Python profiles | Node profiles | `terraform-infra` | `shared-workflows` |
+|---|---|---|---|---|
+| `lint` | the `python-checks` action's lint checks: `uv lock --check`, `uv sync --locked`, `ruff check`, `ruff format --check`, the type check, Terraform fmt and validate of `terraform-dir` when set, and `facts check` when there is a `facts.yaml` | install from the lockfile (npm or pnpm), then the `typecheck` and `lint` scripts, each where `package.json` has it | `terraform fmt -check`, `init -backend=false` and `validate` | skipped: its lint is workflow static analysis, which the repository's own self-test runs |
+| `unit` | pytest, leaving out the `integration-tests` directory | the `unit-script` script; skipped when `package.json` has none | skipped | skipped |
+| `integration` | pytest on the `integration-tests` directory, with the Postgres service container when one is named; skipped when the directory does not exist | the `integration-script` script; skipped when `package.json` has none | skipped | skipped |
+| `contract` | the named contract suite against the development API; skipped when none is named | the same | the same | the same |
+| `security` | `security.yml`, Python with uv | `security.yml`, TypeScript | `security.yml`, Python with pip, which finds no dependencies and says so; the secret scan and static analysis still run | the same as `terraform-infra` |
+
+A skipped stage still runs: it writes why in its job summary and as a
+notice on the run, and passes. A stage that ran writes its result and the
+commands it ran to its summary, and `test` writes a table of every stage's
+result to its own.
+
+#### Inputs
+
+| Input | Default | Meaning |
+|---|---|---|
+| `profile` | required | The repository's profile, from the Profiles table |
+| `working-directory` | `.` | The directory, within the checkout, holding the repository. For this repository's fixtures; consumers leave it |
+| `timeout-minutes` | `30` | How long each stage's job may run |
+| `python-version` | `3.14` | Python profiles: the runtime the repository deploys to |
+| `typecheck` | `uv run mypy src/` | Python profiles: the type check `lint` runs (TEST-012) |
+| `unit-pytest-args` | `--cov=src --cov-report=term-missing` | Python profiles: appended to the `unit` pytest |
+| `integration-tests` | `tests/integration` | Python profiles: the integration tests' directory |
+| `integration-pytest-args` | empty | Python profiles: appended to the `integration` pytest |
+| `postgres-image` | empty | The `integration` stage's Postgres service container, by exact tag or digest (the fleet's APIs use `pgvector/pgvector:pg16`). Empty starts none; an image with no tag, or `:latest`, fails the stage |
+| `postgres-database` | `pipeline_test` | The container's database. It must end in `_test` |
+| `terraform-dir` | empty | A Python repository's Terraform directory, checked in `lint`; for `terraform-infra`, the directory to check (empty: the repository) |
+| `terraform-version` | `1.16.2` | Match what applies it from the workstation, so fmt agrees |
+| `node-version` | `22` | Node profiles: the Node release line |
+| `unit-script` | `test` | Node profiles: the script `unit` runs |
+| `integration-script` | `test:integration` | Node profiles: the script `integration` runs |
+| `contract-suite` | empty | `common-python-utils` for the fleet's shared contract suite; empty for none |
+| `contract-suite-version` | empty | The common-python-utils release whose suite runs. Empty: the one the repository's `uv.lock` holds. A repository with no such entry (a Node repository) sets it |
+| `contract-api-url` | `https://dev-api.kaianolevine.com` | The development API. A production host is refused |
+| `sbom` | `true` | Have `security` generate and retain a CycloneDX SBOM |
+
+| Secret | Meaning |
+|---|---|
+| `CONTRACT_SUITE_API_KEY` | The development API's contract-suite key (`dev_...`). Needed only when `contract-suite` is set; without it the stage fails rather than passing unrun |
+
+#### Integration databases
+
+With `postgres-image` set, `integration` starts that image as a service
+container and exports its address as both `TEST_DATABASE_URL` and
+`DATABASE_URL`:
+`postgresql://postgres:postgres@localhost:5432/<postgres-database>`. Those
+are the names the fleet's integration suites read, and the address passes
+their guards (local, database named `*_test`). An API whose suite defaults
+to its own database name passes that name as `postgres-database`
+(`kaianolevine_test`, `deejaytools_test`).
+
+#### The contract suite
+
+`contract-suite: common-python-utils` runs `contract/` from
+common-python-utils: every endpoint in the fleet's catalog, called through
+the typed client the cogs use, against the development API. The suite is
+not part of the library's wheel, but its sdist on PyPI ships it with the
+suite's own `uv.lock`, so the stage fetches the sdist of the release the
+repository's `uv.lock` holds, checks it against the hash that lock records,
+and runs `uv run pytest contract`. The suite is then the one written for
+the client this repository runs.
+
+It writes fixed rows to the development API, so it runs only with a
+development key, refuses a production host before anything is fetched (and
+the suite's own guards refuse one again), and waits in one concurrency
+group, `contract-dev-kaiano-api`, which no run cancels partway.
+
+#### uv
+
+Every stage installs the uv release `uv_version` in `pipeline.yaml`
+names, and nothing else states it. The `setup-uv` action and the
+`python-checks` action (and so `python-test.yml`) read it through
+`.github/actions/setup-uv/uv-version.sh`. A repository's
+`[tool.uv] required-version` is a range that must hold that release; one
+that does not fails at its first uv command, which is the signal to move
+one or the other.
+
+#### How pipeline.yml composes them
+
+`pipeline.yml` does not exist yet. When it does, it calls this workflow as
+one job, with `$/` so a caller pinned to a tag runs the stages from that
+same tag, and `build` needs it:
+
+```yaml
+jobs:
+  stages:
+    uses: $/.github/workflows/stages-test.yml
+    with:
+      profile: ${{ inputs.profile }}
+      # The profile's defaults, which the repository's inputs override:
+      # for api-service, postgres-image: pgvector/pgvector:pg16.
+    secrets:
+      CONTRACT_SUITE_API_KEY: ${{ secrets.CONTRACT_SUITE_API_KEY }}
+  build:
+    needs: stages
+```
+
+In a repository's run the gate then reports as `pipeline / stages / test`,
+the name its ruleset requires. Until then a repository may call
+`stages-test.yml` directly, as in the comment at the top of that file.
+
 ### Enforced and subscribed
 
 Two layers keep the pipeline whole.
@@ -221,11 +336,12 @@ before `build`, reuses the tag in `release`, and continues from there.
 
 The pipeline changes through this repository's own pull requests, which
 run workflow static analysis and the pipeline against one fixture
-repository per profile. A failing fixture blocks the release.
+repository per profile (see Testing the pipeline below). A failing fixture
+blocks the release.
 
 - **Protection.** `main` takes a change only by pull request, with this
-  repository's security checks passing: the `main` ruleset, declared in
-  infra. No review is required, since the organisation has one member who
+  repository's security checks and the self-test's `test / gate` passing:
+  the `main` ruleset, declared in infra. No review is required, since the organisation has one member who
   cannot approve their own pull request. `CODEOWNERS` names the owner of
   the workflow and action paths and `pipeline.yaml`. The release pushes
   its version commit and moves the major tag as the promote App, the
@@ -247,6 +363,115 @@ repository per profile. A failing fixture blocks the release.
   moved.
 - **Rollback.** Re-point the major tag at the previous release of that
   major. Callers pick it up on their next run with no change of their own.
+
+### Testing the pipeline
+
+`ci.yml`'s `test` job calls `self-test.yml`, on every pull request and every
+push to `main`. `release` needs `test`, so anything that fails there blocks
+the release. Nothing in it is path-filtered: a required check that never
+reports holds a pull request open for good.
+
+- **Static analysis.** `workflow-checks.yml` runs actionlint (with a pinned
+  shellcheck), zizmor and `scripts/check-workflow-timeouts.py` over
+  `.github`. Each tool is pinned to one release and checked against its
+  SHA-256 before it runs. zizmor runs offline and fails on any
+  high-severity finding; the medium and low findings already present are
+  printed and do not fail. actionlint fails on any error. The places it
+  misreads, and why, are in `.github/actionlint.yaml`; shellcheck's style
+  notes are left out.
+- **Fixtures.** `fixtures/<profile>/` holds one minimal repository per
+  profile in the Profiles table, with only what that profile's existing
+  stages need to run green. The `stages` job runs `stages-test.yml`
+  against each: every stage before `build`, ending in its `test` gate,
+  with the stages the profile has nothing for skipped in sight. Between
+  them the fixtures take every branch a stage has: `api-service` has an
+  integration test that needs the Postgres service container and fails
+  without it, `npm-library` has `lint` and `test` scripts and `astro-site`
+  has neither, `python-service` and `python-library` have no integration
+  tests. The `fixture` job runs the release stage twice on one commit,
+  and, for the Python fixtures, the local `python-checks` action with
+  every check in one job as `python-test.yml` runs it (not
+  `python-test.yml` itself, which runs the published action and so would
+  test what is already released). The `shared-workflows` fixture also
+  runs the static analysis above on its own workflows. Every later stage
+  of a profile that no job runs yet is named in the run, with its reason,
+  by the `not run yet` job, so a gap shows rather than passing in silence.
+- **No side effects.** A fixture never publishes a package, tags a fleet
+  repository, deploys or posts an evaluation. The release stage runs only
+  as a dry run, in a scratch repository whose one remote is a bare
+  repository beside it, with a `.releaserc.json` that lists no publishing
+  plugin. Python fixtures carry the `Private :: Do Not Upload` classifier
+  and Node fixtures are `private`, so a registry refuses them even if
+  something tried. No fixture names a contract suite, so `contract`, which
+  calls the development API, skips against every one, and a fixture needs
+  no secret and reaches no network beyond package registries. Deploy and
+  evaluation stages do not run against a fixture until they can do so with
+  no effect outside the run.
+- **One gate.** The `gate` job in `self-test.yml` passes only if every
+  other job there passed. It is the check `main` requires, and its name
+  does not change as fixtures or stages are added.
+
+`stages-test.yml`, `security.yml`, `workflow-checks.yml` and the
+`python-checks` action take a `working-directory` input for this: the directory, inside the checkout,
+holding the repository to check. Consumers leave it at its default, the
+checkout itself.
+
+#### Running a stage twice
+
+Every stage contract above says why a second run on the same commit
+changes nothing. Today the fixtures prove it for `release`:
+`scripts/check-release-rerun.sh` runs the release on a fixture's
+unreleased commit and sees the version it would cut, records that release
+as a tag, runs the release again on the same commit, and fails unless the
+second run finds nothing to release and the remote still holds one tag.
+The first run is what keeps the second from passing vacuously. `lint`,
+`unit` and `integration` change nothing outside the run, so running them
+twice is safe by construction. `contract` writes only fixed rows that the
+development API upserts; it is not run twice here because no fixture may
+reach that API.
+
+As each later stage lands it adds its own proof here, run twice against
+the fixtures in the same job:
+
+- `build` reuses the artifact already in the run for this commit, and the
+  second run reports the same digest.
+- `deploy` reads what the target runs first; against a fixture its target
+  is a stand-in that only records, and the second run must skip with the
+  version already there.
+- `verify` only reads, so it needs no more than to pass twice.
+- `evaluate-pre` and `evaluate-post` run dry against a fixture, and the
+  second request for the same (repo, sha, phase), or (repo, version,
+  phase), must be answered with the evaluation already recorded.
+- `release` from the reconciler, with `ref` set to a tag already on the
+  commit, finishes what is missing and cuts nothing.
+
+#### Pointing it at pipeline.yml
+
+Once `pipeline.yml` exists, the `stages`, `fixture` and `pending` jobs in
+`self-test.yml` become one matrix job over the profiles that calls it:
+
+```yaml
+  fixture:
+    name: fixture (${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [python-service, api-service, python-library, astro-site, npm-library, terraform-infra, shared-workflows]
+    uses: ./.github/workflows/pipeline.yml
+    with:
+      profile: ${{ matrix.profile }}
+      working-directory: fixtures/${{ matrix.profile }}
+```
+
+For that, `pipeline.yml` needs a `working-directory` input that every stage
+honours, as `stages-test.yml` does now (with the `postgres-image` the
+`stages` job passes `api-service` today becoming that profile's default), and every stage that
+reaches outside the run (release, deploy, evaluate) needs a mode the
+fixtures run it in that has no effect outside the run. A stage the profile
+has no use for is skipped with its reason, as the stages before `build`
+already are, which replaces the `pending` job. `gate` keeps its name and needs the new job.
+A new profile adds a directory under `fixtures/` and an entry in the
+matrix.
 
 ## Shared security workflow
 
@@ -286,6 +511,7 @@ the second is the directory inside it.
 | `gitleaks-version` | `8.28.0` | Pinned gitleaks release |
 | `syft-version` | `1.29.1` | Pinned syft release |
 | `self-test` | `false` | Also prove the GitHub advisory pass against known advisories. This repo's own CI turns it on; consumers leave it off |
+| `working-directory` | `.` | The directory, within the checkout, holding the repository to check. For this repo's fixtures; consumers leave it. The secret scan reads the whole checkout's history whatever it says |
 
 ### Advisory sources
 
@@ -450,13 +676,19 @@ asked, pytest, and `facts check` when the repo has a `facts.yaml`. It is the
 union of what the cogs ran inline, so adopting it removes no check a caller
 had. The checks live in the composite action
 `.github/actions/python-checks`, which the shared agent also runs on an
-agent's change before it opens a pull request.
+agent's change before it opens a pull request. Its uv is the release
+`pipeline.yaml` pins (see Test stages).
 
 ```yaml
 jobs:
   test:
     uses: mini-app-polis/.github/.github/workflows/python-test.yml@v3
 ```
+
+In the canonical pipeline, `stages-test.yml` takes this job's place. It
+runs the same checks through the same action, whose `stage` input splits
+them into `lint`, `unit` and `integration` jobs; `python-test.yml` runs
+them all in one job, as it always has.
 
 | Input | Default | Meaning |
 |---|---|---|
