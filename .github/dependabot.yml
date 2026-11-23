@@ -55,8 +55,16 @@ updates:
     # npm is replaced by npm-stub through `overrides` (see the README beside
     # the lockfile), so the lockfile holds a link with no version. Dependabot
     # cannot update a link, and an advisory against npm fails the whole run.
+    #
+    # A semantic-release major is taken on purpose, not as a Dependabot pull
+    # request: a major can require a newer Node than the release action's
+    # node-version input runs it under, so the move goes with that input.
+    # Dependabot's attempt at one has also failed the whole run when GitHub
+    # refused to create its pull request.
     ignore:
       - dependency-name: "npm"
+      - dependency-name: "semantic-release"
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "ci(deps)"
 
